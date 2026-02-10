@@ -1,0 +1,28 @@
+constraint:
+  name: injection_prevention
+  severity: CRITICAL
+  applies_when:
+    action:
+      - create
+      - read
+      - update
+      - delete
+    input_sources:
+      - user_input
+  rules:
+    - type: FORBID_PATTERN
+      pattern: "f\".*{.*}.*\" in execute|cursor|query"
+      message: "String interpolation in SQL queries detected — use parameterized queries"
+    - type: FORBID_PATTERN
+      pattern: "format(.*) in execute|cursor|query"
+      message: ".format() in SQL queries detected — use parameterized queries"
+    - type: FORBID_PATTERN
+      pattern: "% .* in execute|cursor|query"
+      message: "% formatting in SQL queries detected — use parameterized queries"
+    - type: REQUIRE_PATTERN
+      pattern: "parameterized_query|safe_query_builder|sqlalchemy"
+      message: "Database operations must use parameterized queries or an ORM"
+    - type: REQUIRE_WRAPPER
+      wrapper: safe_query_builder
+      on: database_access
+      message: "All database access must be wrapped with safe_query_builder"

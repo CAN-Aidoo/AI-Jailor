@@ -1,0 +1,679 @@
+# API Documentation — AI Jailer
+
+## API Overview
+
+AI Jailer exposes three API interfaces:
+
+1. **REST API** (primary): Cell management, execution, policies, audit queries. OpenAPI 3.1 spec.
+2. **gRPC API**: High-performance execution and streaming. Used by SDKs.
+3. **WebSocket API**: Interactive terminal sessions and live log streaming.
+
+Base URL: `https://api.aijailer.com/v1`
+
+## Authentication
+
+All API requests require authentication via one of:
+
+- **API Key**: `Authorization: Bearer aj_live_xxxxxxxxxxxx` — for server-to-server integration.
+- **JWT Token**: Short-lived token obtained via OAuth2 flow — for dashboard and CLI.
+- **mTLS**: Mutual TLS with client certificate — for enterprise integrations.
+
+API keys are scoped to a tenant and carry an associated role (owner, admin, operator, viewer, auditor).
+
+## Common Response Format
+
+All responses follow a consistent envelope:
+
+```json
+{
+  "data": { ... },
+  "meta": {
+    "request_id": "req_abc123",
+    "timestamp": "2025-01-15T10:30:00Z"
+  }
+}
+```
+
+Error responses:
+
+```json
+{
+  "error": {
+    "code": "cell_not_found",
+    "message": "Cell with ID 'cell_xyz' does not exist or is not accessible.",
+    "details": { ... }
+  },
+  "meta": {
+    "request_id": "req_abc123",
+    "timestamp": "2025-01-15T10:30:00Z"
+  }
+}
+```
+
+## REST API Endpoints
+
+---
+
+### Cells
+
+#### POST /v1/cells
+
+Create a new cell.
+
+**Request Body**:
+
+```json
+{
+  "name": "my-agent-session",
+  "image": "base-python",
+  "resources": {
+    "vcpus": 2,
+    "memory_mb": 1024,
+    "disk_mb": 5120,
+    "network_bandwidth_mbps": 100
+  },
+  "security_policy_id": "pol_restrictive_default",
+  "environment": {
+    "OPENAI_API_KEY": "sk-...",
+    "WORKSPACE": "/data/project"
+  },
+  "persistent_volume": {
+    "size_mb": 10240,
+    "mount_path": "/data"
+  },
+  "tags": {
+    "agent": "code-reviewer",
+    "project": "backend-api"
+  },
+  "auto_start": true,
+  "warm_pool": true
+}
+```
+
+**Response** (201 Created):
+
+```json
+{
+  "data": {
+    "id": "cell_abc123def456",
+    "name": "my-agent-session",
+    "status": "running",
+    "image": "base-python",
+    "resources": { ... },
+    "security_policy_id": "pol_restrictive_default",
+    "persistent_volume": {
+      "id": "vol_xyz789",
+      "size_mb": 10240,
+      "mount_path": "/data"
+    },
+    "network": {
+      "internal_ip": "10.100.5.23"
+    },
+    "tags": { ... },
+    "created_at": "2025-01-15T10:30:00Z",
+    "started_at": "2025-01-15T10:30:00.125Z"
+  }
+}
+```
+
+#### GET /v1/cells
+
+List cells for the authenticated tenant.
+
+**Query Parameters**:
+- `status` (optional): Filter by status (running, paused, stopped, etc.)
+- `tag` (optional, repeatable): Filter by tag (key=value)
+- `limit` (optional, default 50, max 200)
+- `cursor` (optional): Pagination cursor
+
+#### GET /v1/cells/{cell_id}
+
+Get cell details.
+
+#### POST /v1/cells/{cell_id}/start
+
+Start a stopped or ready cell.
+
+#### POST /v1/cells/{cell_id}/stop
+
+Stop a running cell. Persistent state is retained.
+
+**Request Body** (optional):
+
+```json
+{
+  "grace_period_seconds": 10
+}
+```
+
+#### POST /v1/cells/{cell_id}/pause
+
+Pause a running cell. Full VM state frozen in memory.
+
+#### POST /v1/cells/{cell_id}/resume
+
+Resume a paused cell.
+
+#### DELETE /v1/cells/{cell_id}
+
+Destroy a cell.
+
+**Query Parameters**:
+- `destroy_persistent` (optional, default false): Also destroy persistent volume.
+
+---
+
+### Execution
+
+#### POST /v1/cells/{cell_id}/exec
+
+Execute a command in a cell.
+
+**Request Body**:
+
+```json
+{
+  "command": "python3 -c \"print('hello world')\"",
+  "timeout_seconds": 30,
+  "user": "agent",
+  "working_directory": "/data/project",
+  "environment": {
+    "DEBUG": "true"
+  },
+  "stream": false
+}
+```
+
+**Response** (200 OK, non-streaming):
+
+```json
+{
+  "data": {
+    "execution_id": "exec_789xyz",
+    "exit_code": 0,
+    "stdout": "hello world\n",
+    "stderr": "",
+    "duration_ms": 142,
+    "resource_usage": {
+      "cpu_ms": 85,
+      "memory_peak_mb": 45
+    }
+  }
+}
+```
+
+**Response** (200 OK, streaming — `stream: true`):
+
+Server-Sent Events stream:
+
+```
+event: stdout
+data: {"text": "hello world\n"}
+
+event: stderr
+data: {"text": ""}
+
+event: exit
+data: {"exit_code": 0, "duration_ms": 142}
+```
+
+#### POST /v1/cells/{cell_id}/exec/script
+
+Execute a multi-line script.
+
+**Request Body**:
+
+```json
+{
+  "script": "#!/usr/bin/env python3\nimport os\nprint(os.listdir('/data'))",
+  "interpreter": "/usr/bin/python3",
+  "timeout_seconds": 60,
+  "stream": true
+}
+```
+
+#### POST /v1/cells/{cell_id}/exec/cancel/{execution_id}
+
+Cancel a running execution.
+
+---
+
+### File Operations
+
+#### POST /v1/cells/{cell_id}/files/upload
+
+Upload a file to a cell.
+
+**Request**: Multipart form data.
+- `path`: Destination path inside cell.
+- `file`: File content.
+- `mode` (optional): File permissions (e.g., "0644").
+
+#### GET /v1/cells/{cell_id}/files/download
+
+Download a file from a cell.
+
+**Query Parameters**:
+- `path`: Source path inside cell.
+
+**Response**: File content with appropriate Content-Type.
+
+#### GET /v1/cells/{cell_id}/files/list
+
+List files in a directory inside a cell.
+
+**Query Parameters**:
+- `path`: Directory path (default: "/").
+- `recursive` (optional, default false).
+
+**Response**:
+
+```json
+{
+  "data": {
+    "path": "/data/project",
+    "entries": [
+      {
+        "name": "main.py",
+        "type": "file",
+        "size": 1234,
+        "modified_at": "2025-01-15T10:35:00Z",
+        "permissions": "0644"
+      },
+      {
+        "name": "tests",
+        "type": "directory",
+        "modified_at": "2025-01-15T10:34:00Z",
+        "permissions": "0755"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### Snapshots
+
+#### POST /v1/cells/{cell_id}/snapshots
+
+Create a snapshot of a cell.
+
+**Request Body**:
+
+```json
+{
+  "name": "after-setup",
+  "description": "Cell state after environment setup and dependency install"
+}
+```
+
+**Response** (202 Accepted):
+
+```json
+{
+  "data": {
+    "id": "snap_abc123",
+    "cell_id": "cell_abc123def456",
+    "name": "after-setup",
+    "status": "creating",
+    "created_at": "2025-01-15T10:40:00Z"
+  }
+}
+```
+
+#### GET /v1/cells/{cell_id}/snapshots
+
+List snapshots for a cell.
+
+#### POST /v1/cells/{cell_id}/restore
+
+Restore a cell from a snapshot.
+
+**Request Body**:
+
+```json
+{
+  "snapshot_id": "snap_abc123"
+}
+```
+
+#### POST /v1/snapshots/{snapshot_id}/clone
+
+Create a new cell from a snapshot.
+
+**Request Body**:
+
+```json
+{
+  "name": "cloned-session",
+  "resources": { ... },
+  "security_policy_id": "pol_custom"
+}
+```
+
+---
+
+### Security Policies
+
+#### POST /v1/policies
+
+Create a security policy.
+
+**Request Body**:
+
+```json
+{
+  "name": "restricted-web-access",
+  "description": "Allow only specific API endpoints",
+  "network": {
+    "default": "deny",
+    "egress": [
+      {
+        "action": "allow",
+        "destinations": [
+          { "domain": "api.openai.com" },
+          { "domain": "api.anthropic.com" }
+        ],
+        "protocols": ["tcp"],
+        "ports": [443]
+      }
+    ]
+  },
+  "resources": {
+    "max_vcpus": 2,
+    "max_memory_mb": 2048,
+    "max_disk_mb": 10240,
+    "max_pids": 256,
+    "max_open_files": 1024
+  },
+  "filesystem": {
+    "writable_paths": ["/tmp", "/home/agent", "/data"],
+    "denied_paths": ["/etc/shadow", "/root"]
+  },
+  "syscalls": {
+    "blocked": ["mount", "ptrace", "kexec_load", "bpf"]
+  }
+}
+```
+
+#### GET /v1/policies
+
+List policies.
+
+#### GET /v1/policies/{policy_id}
+
+Get policy details.
+
+#### PUT /v1/policies/{policy_id}
+
+Update a policy. Creates a new version (policies are immutable; updates create a new version).
+
+#### DELETE /v1/policies/{policy_id}
+
+Deactivate a policy. Cells using it continue with the last active version.
+
+---
+
+### Audit Logs
+
+#### GET /v1/audit/events
+
+Query audit events.
+
+**Query Parameters**:
+- `cell_id` (optional): Filter by cell.
+- `event_type` (optional): Filter by type (execution, file_access, network, lifecycle, policy_violation).
+- `severity` (optional): Filter by severity (info, warning, critical).
+- `start_time` (required): Start of time range (ISO 8601).
+- `end_time` (required): End of time range (ISO 8601).
+- `limit` (optional, default 100, max 1000).
+- `cursor` (optional): Pagination cursor.
+
+**Response**:
+
+```json
+{
+  "data": {
+    "events": [
+      {
+        "id": "evt_abc123",
+        "cell_id": "cell_abc123def456",
+        "event_type": "execution",
+        "severity": "info",
+        "timestamp": "2025-01-15T10:35:00.123Z",
+        "details": {
+          "command": "pip install requests",
+          "exit_code": 0,
+          "duration_ms": 3400
+        }
+      },
+      {
+        "id": "evt_def456",
+        "cell_id": "cell_abc123def456",
+        "event_type": "network",
+        "severity": "warning",
+        "timestamp": "2025-01-15T10:35:05.456Z",
+        "details": {
+          "action": "blocked",
+          "destination": "evil-server.com",
+          "port": 443,
+          "protocol": "tcp",
+          "reason": "domain not in allow list"
+        }
+      }
+    ],
+    "next_cursor": "cur_xyz789"
+  }
+}
+```
+
+#### GET /v1/audit/export
+
+Export audit logs for compliance reporting.
+
+**Query Parameters**:
+- `cell_id` (optional)
+- `start_time` (required)
+- `end_time` (required)
+- `format`: "json" or "csv"
+
+**Response**: File download (Content-Disposition: attachment).
+
+---
+
+### Usage & Metering
+
+#### GET /v1/usage
+
+Get usage summary for the authenticated tenant.
+
+**Query Parameters**:
+- `start_time` (required)
+- `end_time` (required)
+- `granularity` (optional): "hourly", "daily", "monthly"
+- `group_by` (optional): "cell", "image", "tag"
+
+**Response**:
+
+```json
+{
+  "data": {
+    "period": {
+      "start": "2025-01-01T00:00:00Z",
+      "end": "2025-01-31T23:59:59Z"
+    },
+    "totals": {
+      "cpu_core_seconds": 1234567,
+      "memory_gb_seconds": 9876543,
+      "storage_gb_hours": 54321,
+      "network_egress_gb": 12.5,
+      "api_calls": 45678,
+      "cell_count": 89,
+      "snapshot_count": 23
+    }
+  }
+}
+```
+
+---
+
+### Webhooks
+
+#### POST /v1/webhooks
+
+Register a webhook endpoint.
+
+**Request Body**:
+
+```json
+{
+  "url": "https://my-service.com/webhooks/aijailer",
+  "events": [
+    "cell.created",
+    "cell.stopped",
+    "cell.destroyed",
+    "policy.violation",
+    "spending.threshold"
+  ],
+  "secret": "whsec_xxxxxxxxxxxxxxxx"
+}
+```
+
+**Webhook Payload**:
+
+```json
+{
+  "id": "whk_abc123",
+  "event": "policy.violation",
+  "timestamp": "2025-01-15T10:35:05.456Z",
+  "data": {
+    "cell_id": "cell_abc123def456",
+    "violation_type": "network_blocked",
+    "details": {
+      "destination": "evil-server.com",
+      "port": 443
+    }
+  },
+  "signature": "sha256=xxxxx"
+}
+```
+
+---
+
+## gRPC API
+
+The gRPC API mirrors the REST API with the following service definitions:
+
+```protobuf
+service CellService {
+  rpc CreateCell(CreateCellRequest) returns (Cell);
+  rpc GetCell(GetCellRequest) returns (Cell);
+  rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
+  rpc StartCell(CellActionRequest) returns (Cell);
+  rpc StopCell(StopCellRequest) returns (Cell);
+  rpc PauseCell(CellActionRequest) returns (Cell);
+  rpc ResumeCell(CellActionRequest) returns (Cell);
+  rpc DestroyCell(DestroyCellRequest) returns (Empty);
+}
+
+service ExecutionService {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc ExecuteStream(ExecuteRequest) returns (stream ExecuteEvent);
+  rpc CancelExecution(CancelRequest) returns (Empty);
+}
+
+service FileService {
+  rpc Upload(stream FileChunk) returns (UploadResponse);
+  rpc Download(DownloadRequest) returns (stream FileChunk);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+}
+
+service TerminalService {
+  rpc OpenTerminal(OpenTerminalRequest) returns (stream TerminalEvent);
+  rpc SendInput(stream TerminalInput) returns (Empty);
+}
+```
+
+## WebSocket API
+
+### Interactive Terminal
+
+**Endpoint**: `wss://api.aijailer.com/v1/cells/{cell_id}/terminal`
+
+**Connection**: Standard WebSocket upgrade with API key in header or query parameter.
+
+**Client → Server Messages**:
+
+```json
+{ "type": "input", "data": "ls -la\n" }
+{ "type": "resize", "cols": 120, "rows": 40 }
+{ "type": "ping" }
+```
+
+**Server → Client Messages**:
+
+```json
+{ "type": "output", "data": "total 24\ndrwxr-xr-x ..." }
+{ "type": "exit", "code": 0 }
+{ "type": "error", "message": "Cell is not running" }
+{ "type": "pong" }
+```
+
+### Live Log Streaming
+
+**Endpoint**: `wss://api.aijailer.com/v1/cells/{cell_id}/logs`
+
+**Query Parameters**:
+- `event_types`: Comma-separated list of event types to stream.
+- `severity_min`: Minimum severity level.
+
+**Server → Client Messages**:
+
+```json
+{
+  "type": "audit_event",
+  "event": {
+    "id": "evt_abc123",
+    "event_type": "execution",
+    "severity": "info",
+    "timestamp": "2025-01-15T10:35:00.123Z",
+    "details": { ... }
+  }
+}
+```
+
+## Rate Limits
+
+| Tier | API Calls/min | Cell Creates/min | Executions/min |
+|---|---|---|---|
+| Free | 60 | 5 | 30 |
+| Starter | 300 | 20 | 150 |
+| Pro | 1000 | 100 | 500 |
+| Enterprise | Custom | Custom | Custom |
+
+Rate limit headers returned on every response:
+
+```
+X-RateLimit-Limit: 300
+X-RateLimit-Remaining: 287
+X-RateLimit-Reset: 1705312260
+```
+
+## Error Codes
+
+| Code | HTTP Status | Description |
+|---|---|---|
+| `cell_not_found` | 404 | Cell does not exist or is not accessible |
+| `cell_not_running` | 409 | Operation requires a running cell |
+| `cell_limit_exceeded` | 429 | Tenant has reached maximum concurrent cells |
+| `execution_timeout` | 408 | Command exceeded its timeout |
+| `policy_violation` | 403 | Action blocked by security policy |
+| `resource_limit_exceeded` | 429 | Cell or tenant resource quota exceeded |
+| `snapshot_failed` | 500 | Snapshot creation failed |
+| `image_not_found` | 404 | Specified base image does not exist |
+| `invalid_policy` | 400 | Policy definition is invalid |
+| `spending_cap_reached` | 402 | Tenant spending cap exceeded |
+| `rate_limited` | 429 | Too many requests |
+| `unauthorized` | 401 | Invalid or missing authentication |
+| `forbidden` | 403 | Insufficient permissions for this action |

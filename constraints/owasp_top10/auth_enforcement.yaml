@@ -1,0 +1,16 @@
+constraint:
+  name: auth_enforcement
+  severity: CRITICAL
+  applies_when:
+    trust_boundary_crossing: true
+  rules:
+    - type: REQUIRE_PATTERN
+      pattern: "session_manager|jwt_handler|auth_middleware"
+      message: "Trust boundary crossing requires authentication"
+    - type: FORBID_PATTERN
+      pattern: "if password == |if secret == "
+      message: "Direct password comparison is forbidden — use constant-time comparison"
+    - type: REQUIRE_WRAPPER
+      wrapper: auth_middleware
+      on: trust_boundary
+      message: "All trust boundary crossings must use certified auth components"

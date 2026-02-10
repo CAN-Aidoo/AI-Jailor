@@ -1,0 +1,17 @@
+constraint:
+  name: output_encoding
+  severity: HIGH
+  applies_when:
+    output_targets:
+      - browser
+  rules:
+    - type: FORBID_PATTERN
+      pattern: "Markup(.*request|HTMLResponse(.*request|render(.*request"
+      message: "User input in HTML output without encoding — XSS risk"
+    - type: REQUIRE_PATTERN
+      pattern: "output_encoder|html_escape|markupsafe|bleach"
+      message: "Browser output requires context-aware encoding"
+    - type: REQUIRE_WRAPPER
+      wrapper: output_encoder
+      on: html_output
+      message: "All HTML output must use the output_encoder component"

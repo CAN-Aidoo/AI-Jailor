@@ -1,0 +1,19 @@
+constraint:
+  name: data_boundary
+  severity: HIGH
+  applies_when:
+    data_classification:
+      - pii
+      - phi
+      - pci
+  rules:
+    - type: REQUIRE_PATTERN
+      pattern: "audit_log|hipaa_audit_logger|pci_data_handler"
+      message: "Sensitive data handling requires audit logging"
+    - type: FORBID_PATTERN
+      pattern: "print(.*password|print(.*ssn|print(.*card"
+      message: "Sensitive data must not be logged to stdout"
+    - type: REQUIRE_WRAPPER
+      wrapper: data_boundary_enforcer
+      on: sensitive_data_access
+      message: "All sensitive data access must go through boundary enforcement"

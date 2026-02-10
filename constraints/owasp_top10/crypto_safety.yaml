@@ -1,0 +1,18 @@
+constraint:
+  name: crypto_safety
+  severity: CRITICAL
+  applies_when:
+    action:
+      - crypto
+      - auth
+  rules:
+    - type: FORBID_PATTERN
+      pattern: "md5|sha1|DES|RC4|ECB"
+      message: "Deprecated cryptographic algorithm detected"
+    - type: REQUIRE_PATTERN
+      pattern: "AES-256-GCM|Argon2id|Ed25519|bcrypt|scrypt"
+      message: "Only approved algorithms are permitted"
+    - type: REQUIRE_WRAPPER
+      wrapper: certified_crypto
+      on: crypto_operation
+      message: "All cryptographic operations must use certified_crypto component"

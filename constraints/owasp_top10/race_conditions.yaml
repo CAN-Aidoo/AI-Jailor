@@ -1,0 +1,14 @@
+constraint:
+  name: race_conditions
+  severity: MEDIUM
+  applies_when:
+    concurrency_model:
+      - async
+      - parallel
+  rules:
+    - type: REQUIRE_PATTERN
+      pattern: "asyncio.Lock|threading.Lock|mutex|semaphore"
+      message: "Shared mutable state in concurrent code requires locking"
+    - type: FORBID_PATTERN
+      pattern: "global .*=|globals()"
+      message: "Global mutable state in concurrent code creates race conditions"

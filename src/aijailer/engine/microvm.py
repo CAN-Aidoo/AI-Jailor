@@ -1,0 +1,182 @@
+"""MicroVM engine abstraction layer.
+
+This module defines the interface for managing Firecracker microVMs.
+In the MVP, operations are simulated. In production, this communicates
+with the Firecracker process via its REST API and vsock for cell agent
+communication.
+"""
+
+import uuid
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class VMStatus(str, Enum):
+    CREATING = "creating"
+    READY = "ready"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    DESTROYED = "destroyed"
+    ERROR = "error"
+
+
+@dataclass
+class VMConfig:
+    """Configuration for a new microVM."""
+
+    cell_id: uuid.UUID
+    image: str
+    vcpus: int = 1
+    memory_mb: int = 512
+    disk_mb: int = 2048
+    network_bandwidth_mbps: int = 100
+    environment: dict = field(default_factory=dict)
+    network_policy: dict = field(default_factory=dict)
+
+
+@dataclass
+class VMInfo:
+    """Runtime information about a microVM."""
+
+    cell_id: uuid.UUID
+    status: VMStatus
+    pid: int | None = None
+    internal_ip: str | None = None
+    vsock_path: str | None = None
+
+
+@dataclass
+class ExecResult:
+    """Result from executing a command inside a microVM."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_ms: int
+    cpu_ms: int = 0
+    memory_peak_mb: int = 0
+
+
+class MicroVMEngine(ABC):
+    """Abstract interface for MicroVM management."""
+
+    @abstractmethod
+    async def create_vm(self, config: VMConfig) -> VMInfo:
+        """Create and boot a new microVM."""
+
+    @abstractmethod
+    async def start_vm(self, cell_id: uuid.UUID) -> VMInfo:
+        """Start a stopped microVM."""
+
+    @abstractmethod
+    async def stop_vm(self, cell_id: uuid.UUID, grace_period: int = 10) -> None:
+        """Stop a running microVM."""
+
+    @abstractmethod
+    async def pause_vm(self, cell_id: uuid.UUID) -> None:
+        """Pause a running microVM (freeze VM state)."""
+
+    @abstractmethod
+    async def resume_vm(self, cell_id: uuid.UUID) -> None:
+        """Resume a paused microVM."""
+
+    @abstractmethod
+    async def destroy_vm(self, cell_id: uuid.UUID) -> None:
+        """Destroy a microVM and clean up all resources."""
+
+    @abstractmethod
+    async def exec_command(
+        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
+    ) -> ExecResult:
+        """Execute a command inside a microVM via the cell agent."""
+
+    @abstractmethod
+    async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
+        """Get current status and info for a microVM."""
+
+
+class SimulatedMicroVMEngine(MicroVMEngine):
+    """Simulated MicroVM engine for development and testing.
+
+    Tracks VM state in-memory without actually creating Firecracker processes.
+    This allows the full API and service layer to be tested without
+    requiring a Linux host with KVM support.
+    """
+
+    def __init__(self) -> None:
+        self._vms: dict[uuid.UUID, VMInfo] = {}
+        self._ip_counter = 10
+
+    def _next_ip(self) -> str:
+        self._ip_counter += 1
+        return f"10.100.0.{self._ip_counter}"
+
+    async def create_vm(self, config: VMConfig) -> VMInfo:
+        info = VMInfo(
+            cell_id=config.cell_id,
+            status=VMStatus.RUNNING,
+            pid=1000 + len(self._vms),
+            internal_ip=self._next_ip(),
+            vsock_path=f"/tmp/aijailer/{config.cell_id}.vsock",
+        )
+        self._vms[config.cell_id] = info
+        return info
+
+    async def start_vm(self, cell_id: uuid.UUID) -> VMInfo:
+        info = self._vms.get(cell_id)
+        if info:
+            info.status = VMStatus.RUNNING
+        else:
+            info = VMInfo(cell_id=cell_id, status=VMStatus.RUNNING, internal_ip=self._next_ip())
+            self._vms[cell_id] = info
+        return info
+
+    async def stop_vm(self, cell_id: uuid.UUID, grace_period: int = 10) -> None:
+        info = self._vms.get(cell_id)
+        if info:
+            info.status = VMStatus.STOPPED
+
+    async def pause_vm(self, cell_id: uuid.UUID) -> None:
+        info = self._vms.get(cell_id)
+        if info:
+            info.status = VMStatus.PAUSED
+
+    async def resume_vm(self, cell_id: uuid.UUID) -> None:
+        info = self._vms.get(cell_id)
+        if info:
+            info.status = VMStatus.RUNNING
+
+    async def destroy_vm(self, cell_id: uuid.UUID) -> None:
+        self._vms.pop(cell_id, None)
+
+    async def exec_command(
+        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
+    ) -> ExecResult:
+        """Simulate command execution."""
+        return ExecResult(
+            exit_code=0,
+            stdout=f"[simulated] {command}\n",
+            stderr="",
+            duration_ms=1,
+            cpu_ms=1,
+            memory_peak_mb=10,
+        )
+
+    async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
+        info = self._vms.get(cell_id)
+        if info is None:
+            return VMInfo(cell_id=cell_id, status=VMStatus.DESTROYED)
+        return info
+
+
+# Singleton for MVP
+_engine: MicroVMEngine | None = None
+
+
+def get_microvm_engine() -> MicroVMEngine:
+    global _engine
+    if _engine is None:
+        _engine = SimulatedMicroVMEngine()
+    return _engine

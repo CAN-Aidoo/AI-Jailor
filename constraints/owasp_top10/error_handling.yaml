@@ -1,0 +1,17 @@
+constraint:
+  name: error_handling
+  severity: MEDIUM
+  applies_when:
+    error_sensitivity:
+      - fail_closed
+      - fail_safe
+  rules:
+    - type: FORBID_PATTERN
+      pattern: "except:$|except Exception:.*pass"
+      message: "Bare except or swallowed exceptions detected"
+    - type: FORBID_PATTERN
+      pattern: "traceback.print_exc|print(.*traceback"
+      message: "Stack traces must not be exposed in production responses"
+    - type: REQUIRE_PATTERN
+      pattern: "try:.*except.*:.*log|raise"
+      message: "Errors must be logged or re-raised, never silently swallowed"
