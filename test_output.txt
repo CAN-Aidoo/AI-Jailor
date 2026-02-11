@@ -1,0 +1,99 @@
+﻿python : C:\Users\Clement Nana 
+Aidoo\anaconda3\Lib\site-packag
+es\pytest_asyncio\plugin.py:247
+: PytestDeprecationWarning: 
+The configuration option "async
+io_default_fixture_loop_scope" 
+is unset.
+At line:1 char:48
++ ... ct -Last 2; python -m 
+pytest tests/services/test_form
+al_verifier.py t ...
++                 ~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~
+    + CategoryInfo          :  
+   NotSpecified: (C:\Users\Cl  
+  emen...cope" is unset.:Str   
+ ing) [], RemoteException
+    + FullyQualifiedErrorId :  
+   NativeCommandError
+ 
+The event loop scope for 
+asynchronous fixtures will 
+default to the fixture caching 
+scope. Future versions of 
+pytest-asyncio will default 
+the loop scope for 
+asynchronous fixtures to 
+function scope. Set the 
+default fixture loop scope 
+explicitly in order to avoid 
+unexpected behavior in the 
+future. Valid fixture loop 
+scopes are: "function", 
+"class", "module", "package", 
+"session"
+
+  warnings.warn(PytestDeprecati
+onWarning(_DEFAULT_FIXTURE_LOOP
+_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.12.7, pytest-8.3.4, pluggy-1.5.0 -- C:\Users\Clement Nana Aidoo\anaconda3\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Clement Nana Aidoo\AI Jailor
+configfile: pyproject.toml
+plugins: anyio-4.8.0, Faker-37.0.0, langsmith-0.5.1, asyncio-1.3.0, cov-7.0.0, mockito-0.0.4
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 48 items
+
+tests/services/test_formal_verifier.py::TestBannedCalls::test_detects_eval PASSED [  2%]
+tests/services/test_formal_verifier.py::TestBannedCalls::test_detects_exec PASSED [  4%]
+tests/services/test_formal_verifier.py::TestBannedCalls::test_detects_os_system PASSED [  6%]
+tests/services/test_formal_verifier.py::TestBannedCalls::test_detects_pickle_loads PASSED [  8%]
+tests/services/test_formal_verifier.py::TestBannedCalls::test_allows_safe_code PASSED [ 10%]
+tests/services/test_formal_verifier.py::TestHardcodedSecrets::test_detects_hardcoded_password PASSED [ 12%]
+tests/services/test_formal_verifier.py::TestHardcodedSecrets::test_detects_api_key PASSED [ 14%]
+tests/services/test_formal_verifier.py::TestHardcodedSecrets::test_detects_private_key PASSED [ 16%]
+tests/services/test_formal_verifier.py::TestShellTrue::test_detects_shell_true PASSED [ 18%]
+tests/services/test_formal_verifier.py::TestShellTrue::test_allows_shell_false PASSED [ 20%]
+tests/services/test_formal_verifier.py::TestSqlConcat::test_detects_fstring_sql PASSED [ 22%]
+tests/services/test_formal_verifier.py::TestSqlConcat::test_detects_percent_format_sql PASSED [ 25%]
+tests/services/test_formal_verifier.py::TestRequiredComponents::test_warns_missing_component PASSED [ 27%]
+tests/services/test_formal_verifier.py::TestRequiredComponents::test_passes_with_imported_component PASSED [ 29%]
+tests/services/test_formal_verifier.py::TestPerformance::test_completes_under_100ms PASSED [ 31%]
+tests/services/test_formal_verifier.py::TestPerformance::test_handles_syntax_error PASSED [ 33%]
+tests/services/test_immune_system.py::TestImmuneMemory::test_store_and_recall PASSED [ 35%]
+tests/services/test_immune_system.py::TestImmuneMemory::test_find_by_cwe PASSED [ 37%]
+tests/services/test_immune_system.py::TestImmuneMemory::test_occurrence_counting PASSED [ 39%]
+tests/services/test_immune_system.py::TestImmuneMemory::test_match_code PASSED [ 41%]
+tests/services/test_immune_system.py::TestVulnerabilityAnalyzer::test_detects_sql_injection PASSED [ 43%]
+tests/services/test_immune_system.py::TestVulnerabilityAnalyzer::test_detects_command_injection PASSED [ 45%]
+tests/services/test_immune_system.py::TestVulnerabilityAnalyzer::test_clean_code_no_findings PASSED [ 47%]
+tests/services/test_immune_system.py::TestVulnerabilityAnalyzer::test_analyze_report PASSED [ 50%]
+tests/services/test_immune_system.py::TestConstraintGenerator::test_generates_yaml PASSED [ 52%]
+tests/services/test_immune_system.py::TestConstraintGenerator::test_low_severity_auto_approved PASSED [ 54%]
+tests/services/test_immune_system.py::TestConstraintGenerator::test_human_approval_workflow PASSED [ 56%]
+tests/services/test_immune_system.py::TestConstraintPropagator::test_publish_and_subscribe PASSED [ 58%]
+tests/services/test_immune_system.py::TestConstraintPropagator::test_multi_tenant_broadcast PASSED [ 60%]
+tests/services/test_immune_system.py::TestCVEFeed::test_poll_returns_entries PASSED [ 62%]
+tests/services/test_immune_system.py::TestCVEFeed::test_convert_to_patterns PASSED [ 64%]
+tests/services/test_immune_system.py::TestCVEFeed::test_rate_limiting PASSED [ 66%]
+tests/services/test_immune_system.py::TestTelemetry::test_record_and_stats PASSED [ 68%]
+tests/services/test_immune_system.py::TestTelemetry::test_block_rate PASSED [ 70%]
+tests/services/test_immune_system.py::TestTelemetry::test_component_usage PASSED [ 72%]
+tests/services/test_constraint_engine.py::TestConstraintEngineBasic::test_engine_initializes PASSED [ 75%]
+tests/services/test_constraint_engine.py::TestConstraintEngineBasic::test_safe_read_intent_passes PASSED [ 77%]
+tests/services/test_constraint_engine.py::TestConstraintEngineBasic::test_pii_requires_auth PASSED [ 79%]
+tests/services/test_constraint_engine.py::TestConstraintEngineBasic::test_pci_requires_compliance PASSED [ 81%]
+tests/services/test_constraint_engine.py::TestConstraintEngineBasic::test_trust_boundary_crossing PASSED [ 83%]
+tests/services/test_constraint_engine.py::TestConstraintEngineActions::test_delete_action_constrained PASSED [ 85%]
+tests/services/test_constraint_engine.py::TestConstraintEngineActions::test_payment_action_requires_pci PASSED [ 87%]
+tests/services/test_constraint_engine.py::TestConstraintEngineActions::test_crypto_action PASSED [ 89%]
+tests/services/test_constraint_engine.py::TestConstraintEngineActions::test_file_io_action PASSED [ 91%]
+tests/services/test_constraint_engine.py::TestConstraintEngineReload::test_reload_constraints PASSED [ 93%]
+tests/services/test_constraint_engine.py::TestConstraintEngineReload::test_constraint_count PASSED [ 95%]
+tests/services/test_constraint_engine.py::TestConstraintResult::test_safe_result PASSED [ 97%]
+tests/services/test_constraint_engine.py::TestConstraintResult::test_blocked_result PASSED [100%]
+
+============================= 48 passed in 1.34s ==============================
