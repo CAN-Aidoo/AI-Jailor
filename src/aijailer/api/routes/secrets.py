@@ -12,7 +12,12 @@ from aijailer.core.exceptions import AiJailerError
 from aijailer.db.base import get_db
 from aijailer.schemas.common import ApiResponse
 from aijailer.schemas.secrets import CreateSecretRequest, SecretResponse, UpdateSecretRequest
-from aijailer.secretstore.keys import IntegrityError, KeyUnavailableError, SecretStoreError
+from aijailer.secretstore.keys import (
+    IntegrityError,
+    KeyNotFoundError,
+    KeyUnavailableError,
+    SecretStoreError,
+)
 from aijailer.secretstore.runtime import get_secret_store
 from aijailer.secretstore.store import (
     ConflictError,
@@ -45,7 +50,7 @@ def _api_error(exc: SecretStoreError) -> AiJailerError:
         return AiJailerError(str(exc), code="secret_conflict")
     if isinstance(exc, LimitError):
         return AiJailerError(str(exc), code="secret_limit")
-    if isinstance(exc, (KeyUnavailableError, IntegrityError)):
+    if isinstance(exc, (KeyUnavailableError, KeyNotFoundError, IntegrityError)):
         return AiJailerError("secret store failure", code="secret_store_unavailable")
     if isinstance(exc, ValidationError) or type(exc) is SecretStoreError:
         return AiJailerError(str(exc), code="invalid_secret")

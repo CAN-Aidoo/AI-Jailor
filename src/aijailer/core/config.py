@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     # store is DISABLED (API returns 503, brokers get no secrets); there is no insecure default.
     secrets_master_keys: str = Field(default="", alias="SECRETS_MASTER_KEYS")
     secrets_primary_key_id: str = Field(default="", alias="SECRETS_PRIMARY_KEY_ID")
+    # AWS KMS (preferred for production): key id/ARN/alias of a symmetric customer-managed key.
+    # Credentials come from the standard AWS chain (instance/pod role); never from this config.
+    # If SECRETS_MASTER_KEYS is also set, those keys stay as decrypt-only fallback so existing rows
+    # can be migrated with SecretStore.rewrap_all.
+    secrets_kms_key_id: str = Field(default="", alias="SECRETS_KMS_KEY_ID")
+    # Extra key ARNs accepted for DECRYPT only (previous keys after a manual key rotation).
+    secrets_kms_allowed_key_ids: str = Field(default="", alias="SECRETS_KMS_ALLOWED_KEY_IDS")
+    secrets_kms_region: str = Field(default="", alias="SECRETS_KMS_REGION")
+    secrets_kms_endpoint_url: str = Field(default="", alias="SECRETS_KMS_ENDPOINT_URL")
+    # How long an unwrapped data key may be cached (0 disables). Also the delay before disabling
+    # the KMS key takes effect on this process: it is the kill-switch latency.
+    secrets_kms_cache_ttl_seconds: float = Field(default=300.0, alias="SECRETS_KMS_CACHE_TTL_SECONDS", ge=0)
     attestation_key: str = Field(default="", alias="ATTESTATION_KEY")
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 60

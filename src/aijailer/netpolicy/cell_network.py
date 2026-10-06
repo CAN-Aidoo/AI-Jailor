@@ -233,15 +233,22 @@ class CellNetwork:
 
     async def _refresh_locked(self, tenant_id: uuid.UUID | None, fail_closed: bool) -> int:
         n = 0
+        # Secrets are per tenant: resolve (DB read + key-service unwraps) once per tenant per
+        # refresh, not once per cell. A failure is remembered too, so an outage costs one attempt.
+        resolved: dict[uuid.UUID, list[SecretBinding] | Exception] = {}
         for cid, proxy in list(self._proxies.items()):
             tid = self._tenants.get(cid)
             if tid is None or (tenant_id is not None and tid != tenant_id):
                 continue
-            try:
-                secrets = await self._secrets.secrets_for(tid, cid)
-            except Exception as exc:
+            if tid not in resolved:
+                try:
+                    resolved[tid] = await self._secrets.secrets_for(tid, cid)
+                except Exception as exc:
+                    resolved[tid] = exc
+            secrets = resolved[tid]
+            if isinstance(secrets, Exception):
                 logger.error("cell.network.secret_refresh_failed", cell_id=str(cid),
-                             error=str(exc), fail_closed=fail_closed)
+                             error=str(secrets), fail_closed=fail_closed)
                 if not fail_closed:
                     continue
                 secrets = []

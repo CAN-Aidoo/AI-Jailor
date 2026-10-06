@@ -18,8 +18,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aijailer.agentsec.egress import SecretBinding
 from aijailer.models.audit import EventType, Severity
 from aijailer.models.tenant_secret import TenantSecret
-from aijailer.secretstore.envelope import Sealed, build_aad, open_sealed, rewrap, seal
-from aijailer.secretstore.keys import KeyProvider, SecretStoreError
+from aijailer.secretstore.envelope import (
+    Sealed,
+    build_aad,
+    context_for,
+    open_sealed,
+    rewrap,
+    seal,
+)
+from aijailer.secretstore.keys import (
+    IntegrityError,
+    KeyNotFoundError,
+    KeyProvider,
+    SecretStoreError,
+)
 from aijailer.secretstore.validation import (
     validate_hosts,
     validate_name,
@@ -124,7 +136,8 @@ class SecretStore:
             TenantSecret.tenant_id == tenant_id, TenantSecret.name == name))).first()
         if exists:
             raise ConflictError("a secret with this name already exists (rotate it instead)")
-        s = seal(raw, build_aad(tenant_id, name, 1, hosts, exp), self._kp)
+        s = await seal(raw, build_aad(tenant_id, name, 1, hosts, exp), self._kp,
+                       context_for(tenant_id, name))
         row = TenantSecret(tenant_id=tenant_id, name=name, version=1, hosts=hosts,
                            expires_at_epoch=exp, ciphertext=s.ciphertext, nonce=s.nonce,
                            wrapped_dek=s.wrapped_dek, key_id=s.key_id, created_by=actor)
@@ -144,8 +157,8 @@ class SecretStore:
         if value is None and hosts is None and expires_at is None and not clear_expiry:
             raise SecretStoreError("nothing to update")
         old_aad = _aad(row)
-        raw = validate_value(value) if value is not None else open_sealed(
-            _sealed(row), old_aad, self._kp)
+        raw = validate_value(value) if value is not None else await open_sealed(
+            _sealed(row), old_aad, self._kp, context_for(tenant_id, name))
         new_hosts = validate_hosts(hosts) if hosts is not None else list(row.hosts)
         new_exp = row.expires_at_epoch
         if clear_expiry:
@@ -153,7 +166,8 @@ class SecretStore:
         if expires_at is not None:
             new_exp = self._check_expiry(expires_at)
         version = row.version + 1
-        s = seal(raw, build_aad(tenant_id, name, version, new_hosts, new_exp), self._kp)
+        s = await seal(raw, build_aad(tenant_id, name, version, new_hosts, new_exp), self._kp,
+                       context_for(tenant_id, name))
         row.version, row.hosts, row.expires_at_epoch = version, new_hosts, new_exp
         row.ciphertext, row.nonce, row.wrapped_dek, row.key_id = (
             s.ciphertext, s.nonce, s.wrapped_dek, s.key_id)
@@ -202,12 +216,19 @@ class SecretStore:
             if r.expires_at_epoch is not None and r.expires_at_epoch <= now:
                 continue
             try:
-                value = open_sealed(_sealed(r), _aad(r), self._kp).decode("utf-8")
-            except SecretStoreError as exc:
+                value = (await open_sealed(_sealed(r), _aad(r), self._kp,
+                                           context_for(r.tenant_id, r.name))).decode("utf-8")
+            except (IntegrityError, KeyNotFoundError) as exc:
+                # Permanent for THIS row (tampered, or wrapped under a key we no longer have):
+                # never used, reported, and the other rows are unaffected.
+                kind = "integrity_failure" if isinstance(exc, IntegrityError) else "key_missing"
                 logger.error("secrets.unusable", tenant_id=str(tenant_id), name=r.name,
-                             error=str(exc))
-                await self._event(tenant_id, "integrity_failure", r.name, None, error=str(exc))
+                             kind=kind, error=str(exc))
+                await self._event(tenant_id, kind, r.name, None, error=str(exc))
                 continue
+            # KeyUnavailableError (key service outage) is deliberately NOT caught: it says nothing
+            # about the data, so it must not look like "no secrets" to the caller, which keeps its
+            # previous state (periodic refresh) or fails closed (change-triggered refresh).
             out.append(SecretBinding(r.name, value, tuple(r.hosts), not_after=r.expires_at_epoch))
         return out
 
@@ -216,11 +237,12 @@ class SecretStore:
         """Migrate every row's data key to the primary KEK without decrypting any value.
         Run after introducing a new primary; retire the old key once ``remaining`` is 0."""
         done = failed = 0
+        primary = await self._kp.primary_key_id()
         rows = (await self._db.execute(select(TenantSecret).where(
-            TenantSecret.key_id != self._kp.primary_id).limit(batch))).scalars().all()
+            TenantSecret.key_id != primary).limit(batch))).scalars().all()
         for r in rows:
             try:
-                s = rewrap(_sealed(r), _aad(r), self._kp)
+                s = await rewrap(_sealed(r), _aad(r), self._kp, context_for(r.tenant_id, r.name))
             except SecretStoreError as exc:
                 failed += 1
                 logger.error("secrets.rewrap_failed", name=r.name, error=str(exc))
@@ -229,5 +251,5 @@ class SecretStore:
             done += 1
         await self._db.commit()
         remaining = (await self._db.execute(select(func.count()).select_from(TenantSecret).where(
-            TenantSecret.key_id != self._kp.primary_id))).scalar_one()
+            TenantSecret.key_id != primary))).scalar_one()
         return {"rewrapped": done, "failed": failed, "remaining": remaining}

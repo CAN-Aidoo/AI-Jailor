@@ -647,3 +647,28 @@ async def test_network_get_bandwidth_reports_kernel_state_or_none():
     assert await n.get_bandwidth(cid) == Bandwidth(3000, 4000)
     links.actual[cid] = Bandwidth(1000, 1000)                         # kernel diverged
     assert await n.get_bandwidth(cid) == Bandwidth(1000, 1000)        # reported as it IS
+
+
+@pytest.mark.asyncio
+async def test_refresh_resolves_secrets_once_per_tenant_not_once_per_cell():
+    n, sec = mk_secret_net()
+    calls = []
+    orig = sec.secrets_for
+
+    async def counting(tenant_id, cell_id):
+        calls.append(tenant_id)
+        return await orig(tenant_id, cell_id)
+    sec.secrets_for = counting
+    t1, t2 = uuid.uuid4(), uuid.uuid4()
+    for t in (t1, t1, t1, t2):
+        await n.provision(uuid.uuid4(), t, POLICY)
+    calls.clear()
+    assert await n.refresh_secrets() == 4
+    assert sorted(map(str, calls)) == sorted(map(str, [t1, t2]))     # 2 resolves for 4 cells
+    # an outage is also attempted once per tenant, and applied to every cell of that tenant
+    async def down(tenant_id, cell_id):
+        calls.append(tenant_id)
+        raise ConnectionError("kms down")
+    sec.secrets_for = down
+    calls.clear()
+    assert await n.refresh_secrets(t1, fail_closed=True) == 3 and calls == [t1]

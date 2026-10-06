@@ -22,7 +22,14 @@ class SecretStoreError(Exception):
 
 
 class KeyUnavailableError(SecretStoreError):
-    """The KEK needed to unwrap a data key is not configured (or was removed)."""
+    """The key service could not be reached or refused (outage, throttling, IAM, disabled key).
+    Treated as TRANSIENT: callers keep their previous state instead of concluding anything about
+    the stored data."""
+
+
+class KeyNotFoundError(SecretStoreError):
+    """The row names a KEK this deployment does not know (retired before migration, or a
+    tampered key id). PERMANENT for that row: it is skipped, other rows are unaffected."""
 
 
 class IntegrityError(SecretStoreError):
@@ -30,10 +37,17 @@ class IntegrityError(SecretStoreError):
 
 
 class KeyProvider(Protocol):
-    primary_id: str
+    """Async because real implementations call a network service (AWS KMS, Vault Transit).
 
-    def wrap(self, dek: bytes, aad: bytes) -> tuple[str, bytes]: ...
-    def unwrap(self, key_id: str, wrapped: bytes, aad: bytes) -> bytes: ...
+    ``aad`` binds the wrapped key to its row; ``context`` is the human-readable part of that
+    binding (tenant id, secret name) that a KMS can log and use in key-policy conditions.
+    Both must be presented identically on unwrap."""
+
+    async def primary_key_id(self) -> str: ...
+    async def wrap(self, dek: bytes, aad: bytes, context: dict[str, str]) -> tuple[str, bytes]: ...
+    async def unwrap(self, key_id: str, wrapped: bytes, aad: bytes,
+                     context: dict[str, str]) -> bytes: ...
+    def owns(self, key_id: str) -> bool: ...
 
 
 class LocalKeyProvider:
@@ -83,17 +97,56 @@ class LocalKeyProvider:
         """Helper for operators: a fresh base64 master key."""
         return base64.urlsafe_b64encode(os.urandom(KEY_BYTES)).decode()
 
-    def wrap(self, dek: bytes, aad: bytes) -> tuple[str, bytes]:
-        nonce = os.urandom(NONCE_BYTES)
+    async def primary_key_id(self) -> str:
+        return self.primary_id
+
+    def owns(self, key_id: str) -> bool:
+        return key_id in self._keys
+
+    async def wrap(self, dek: bytes, aad: bytes, context: dict[str, str] | None = None
+                   ) -> tuple[str, bytes]:
+        nonce = os.urandom(NONCE_BYTES)  # context is already part of the AAD
         return self.primary_id, nonce + self._keys[self.primary_id].encrypt(nonce, dek, aad)
 
-    def unwrap(self, key_id: str, wrapped: bytes, aad: bytes) -> bytes:
+    async def unwrap(self, key_id: str, wrapped: bytes, aad: bytes,
+                     context: dict[str, str] | None = None) -> bytes:
         aead = self._keys.get(key_id)
         if aead is None:
-            raise KeyUnavailableError(f"master key {key_id!r} is not configured")
+            raise KeyNotFoundError(f"master key {key_id!r} is not configured")
         if len(wrapped) < NONCE_BYTES + 16:
             raise IntegrityError("wrapped key is truncated")
         try:
             return aead.decrypt(wrapped[:NONCE_BYTES], wrapped[NONCE_BYTES:], aad)
         except InvalidTag:
             raise IntegrityError("wrapped key failed authentication") from None
+
+
+class ChainedKeyProvider:
+    """New wraps go to ``primary``; unwraps are routed to whichever provider owns the row's key id.
+
+    This is the migration path: keep the old (e.g. local) provider as a decrypt-only fallback,
+    run ``SecretStore.rewrap_all`` to move every row to the primary, then drop the fallback."""
+
+    def __init__(self, primary: KeyProvider, *fallbacks: KeyProvider) -> None:
+        self._primary, self._all = primary, [primary, *fallbacks]
+
+    async def primary_key_id(self) -> str:
+        return await self._primary.primary_key_id()
+
+    def owns(self, key_id: str) -> bool:
+        return any(p.owns(key_id) for p in self._all)
+
+    async def wrap(self, dek: bytes, aad: bytes, context: dict[str, str]) -> tuple[str, bytes]:
+        return await self._primary.wrap(dek, aad, context)
+
+    async def unwrap(self, key_id: str, wrapped: bytes, aad: bytes,
+                     context: dict[str, str]) -> bytes:
+        for p in self._all:
+            if p.owns(key_id):
+                return await p.unwrap(key_id, wrapped, aad, context)
+        raise KeyNotFoundError(f"no configured key provider owns key {key_id!r}")
+
+    async def check(self) -> None:
+        for p in self._all:
+            if hasattr(p, "check"):
+                await p.check()

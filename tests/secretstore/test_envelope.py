@@ -5,7 +5,7 @@ import pytest
 
 from aijailer.secretstore.envelope import build_aad, open_sealed, rewrap, seal
 from aijailer.secretstore.keys import (
-    IntegrityError, KeyUnavailableError, LocalKeyProvider, SecretStoreError)
+    IntegrityError, KeyNotFoundError, LocalKeyProvider, SecretStoreError)
 from aijailer.secretstore.validation import (
     ValidationError, validate_host, validate_hosts, validate_name, validate_value)
 
@@ -22,16 +22,18 @@ def aad(**kw):
     return build_aad(**base)
 
 
-def test_roundtrip_and_ciphertext_does_not_contain_plaintext():
+@pytest.mark.asyncio
+async def test_roundtrip_and_ciphertext_does_not_contain_plaintext():
     p = prov("k1")
-    s = seal(b"ghp_supersecret", aad(), p)
+    s = await seal(b"ghp_supersecret", aad(), p)
     assert b"ghp_supersecret" not in s.ciphertext + s.wrapped_dek
-    assert open_sealed(s, aad(), p) == b"ghp_supersecret"
+    assert await open_sealed(s, aad(), p) == b"ghp_supersecret"
 
 
-def test_every_seal_uses_fresh_key_and_nonce():
+@pytest.mark.asyncio
+async def test_every_seal_uses_fresh_key_and_nonce():
     p = prov("k1")
-    a, b = seal(b"same", aad(), p), seal(b"same", aad(), p)
+    a, b = await seal(b"same", aad(), p), await seal(b"same", aad(), p)
     assert a.ciphertext != b.ciphertext and a.nonce != b.nonce and a.wrapped_dek != b.wrapped_dek
 
 
@@ -39,50 +41,55 @@ def test_every_seal_uses_fresh_key_and_nonce():
     dict(tenant_id=uuid.uuid4()), dict(name="other"), dict(version=2),
     dict(hosts=["evil.example"]), dict(hosts=["api.github.com", "evil.example"]),
     dict(expires_at=9999999999.0)])
-def test_any_bound_metadata_change_fails_closed(change):
+@pytest.mark.asyncio
+async def test_any_bound_metadata_change_fails_closed(change):
     p = prov("k1")
-    s = seal(b"v", aad(), p)
+    s = await seal(b"v", aad(), p)
     with pytest.raises(IntegrityError):
-        open_sealed(s, aad(**change), p)
+        await open_sealed(s, aad(**change), p)
 
 
-def test_host_order_is_irrelevant_to_binding():
+@pytest.mark.asyncio
+async def test_host_order_is_irrelevant_to_binding():
     p = prov("k1")
-    s = seal(b"v", aad(hosts=["a.test", "b.test"]), p)
-    assert open_sealed(s, aad(hosts=["b.test", "a.test"]), p) == b"v"
+    s = await seal(b"v", aad(hosts=["a.test", "b.test"]), p)
+    assert await open_sealed(s, aad(hosts=["b.test", "a.test"]), p) == b"v"
 
 
-def test_bit_flips_anywhere_are_detected():
+@pytest.mark.asyncio
+async def test_bit_flips_anywhere_are_detected():
     p = prov("k1")
-    s = seal(b"value", aad(), p)
+    s = await seal(b"value", aad(), p)
     for field in ("ciphertext", "wrapped_dek", "nonce"):
         raw = bytearray(getattr(s, field))
         raw[len(raw) // 2] ^= 1
         bad = type(s)(**{**s.__dict__, field: bytes(raw)})
         with pytest.raises(IntegrityError):
-            open_sealed(bad, aad(), p)
+            await open_sealed(bad, aad(), p)
 
 
-def test_wrong_or_missing_master_key():
-    s = seal(b"v", aad(), prov("k1"))
-    with pytest.raises(KeyUnavailableError):
-        open_sealed(s, aad(), prov("k2"))                       # k1 removed
+@pytest.mark.asyncio
+async def test_wrong_or_missing_master_key():
+    s = await seal(b"v", aad(), prov("k1"))
+    with pytest.raises(KeyNotFoundError):
+        await open_sealed(s, aad(), prov("k2"))                       # k1 removed
     other = LocalKeyProvider({"k1": os.urandom(32)}, "k1")      # same id, different key material
     with pytest.raises(IntegrityError):
-        open_sealed(s, aad(), other)
+        await open_sealed(s, aad(), other)
 
 
-def test_kek_rotation_rewraps_without_touching_ciphertext():
+@pytest.mark.asyncio
+async def test_kek_rotation_rewraps_without_touching_ciphertext():
     k1, k2 = os.urandom(32), os.urandom(32)
-    s = seal(b"v", aad(), LocalKeyProvider({"k1": k1}, "k1"))
+    s = await seal(b"v", aad(), LocalKeyProvider({"k1": k1}, "k1"))
     both = LocalKeyProvider({"k1": k1, "k2": k2}, "k2")
-    assert open_sealed(s, aad(), both) == b"v"                  # old key still readable
-    r = rewrap(s, aad(), both)
+    assert await open_sealed(s, aad(), both) == b"v"                  # old key still readable
+    r = await rewrap(s, aad(), both)
     assert r.key_id == "k2" and r.ciphertext == s.ciphertext and r.nonce == s.nonce
     only_new = LocalKeyProvider({"k2": k2}, "k2")               # old key retired
-    assert open_sealed(r, aad(), only_new) == b"v"
-    with pytest.raises(KeyUnavailableError):
-        open_sealed(s, aad(), only_new)                         # un-migrated row is detected
+    assert await open_sealed(r, aad(), only_new) == b"v"
+    with pytest.raises(KeyNotFoundError):
+        await open_sealed(s, aad(), only_new)                         # un-migrated row is detected
 
 
 def test_provider_config_parsing_and_validation():

@@ -39,16 +39,23 @@ class Sealed:
     key_id: str
 
 
-def seal(plaintext: bytes, aad: bytes, provider: KeyProvider) -> Sealed:
+def context_for(tenant_id: uuid.UUID, name: str) -> dict[str, str]:
+    """The readable part of the binding, for KMS encryption context / audit / key policies."""
+    return {"tenant_id": str(tenant_id), "secret_name": name}
+
+
+async def seal(plaintext: bytes, aad: bytes, provider: KeyProvider,
+               context: dict[str, str] | None = None) -> Sealed:
     dek = AESGCM.generate_key(bit_length=256)
     nonce = os.urandom(NONCE_BYTES)
     ct = AESGCM(dek).encrypt(nonce, plaintext, aad)
-    key_id, wrapped = provider.wrap(dek, aad)
+    key_id, wrapped = await provider.wrap(dek, aad, context or {})
     return Sealed(ct, nonce, wrapped, key_id)
 
 
-def open_sealed(s: Sealed, aad: bytes, provider: KeyProvider) -> bytes:
-    dek = provider.unwrap(s.key_id, s.wrapped_dek, aad)
+async def open_sealed(s: Sealed, aad: bytes, provider: KeyProvider,
+                      context: dict[str, str] | None = None) -> bytes:
+    dek = await provider.unwrap(s.key_id, s.wrapped_dek, aad, context or {})
     if len(dek) != KEY_BYTES:
         raise IntegrityError("unwrapped key has wrong length")
     try:
@@ -58,9 +65,10 @@ def open_sealed(s: Sealed, aad: bytes, provider: KeyProvider) -> bytes:
             from None
 
 
-def rewrap(s: Sealed, aad: bytes, provider: KeyProvider) -> Sealed:
+async def rewrap(s: Sealed, aad: bytes, provider: KeyProvider,
+                 context: dict[str, str] | None = None) -> Sealed:
     """Re-wrap the data key under the provider's primary KEK. The value is never decrypted and
     the ciphertext/nonce are unchanged."""
-    dek = provider.unwrap(s.key_id, s.wrapped_dek, aad)
-    key_id, wrapped = provider.wrap(dek, aad)
+    dek = await provider.unwrap(s.key_id, s.wrapped_dek, aad, context or {})
+    key_id, wrapped = await provider.wrap(dek, aad, context or {})
     return Sealed(s.ciphertext, s.nonce, wrapped, key_id)
