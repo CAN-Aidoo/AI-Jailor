@@ -349,3 +349,17 @@ L2 segment, so the firewall (`iifname "aj*"`, guest/host /30, source match) and 
 `setup_link` waits until both veth ends are operationally UP (carrier changes are applied asynchronously, up to
 ~1 s, and the bridge will not forward until then), recovers a stale namespace left by a crash, and rolls back
 completely on any failure. TAP is persistent and owned by the jailer uid so Firecracker attaches unprivileged.
+
+### Bandwidth shaping (`netpolicy/shaping.py`)
+
+Both limits are **egress** shapers (they queue, so TCP backs off on delay rather than loss):
+
+| direction | where | note |
+|---|---|---|
+| download (host -> guest) | host veth `aj<id>` egress | root namespace |
+| upload (guest -> host) | `vc0` egress inside the cell namespace | outside the guest, unreachable from it |
+
+`tbf`, burst = 100 ms of traffic (min 32 KiB), queue bounded by 50 ms latency. Range 64 kbit/s to 10 Gbit/s,
+`None` = unlimited per direction. `cell.network_bandwidth_mbps` is applied symmetrically at provisioning;
+if shaping fails the whole network is rolled back. Because the broker is the cell's only path off the box,
+bounding this link bounds the cell's total network use. Applied with netlink (no `tc` binary).

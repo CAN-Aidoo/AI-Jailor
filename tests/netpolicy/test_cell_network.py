@@ -21,8 +21,15 @@ class FakeNft:
 
 
 class FakeLinks:
-    def __init__(self, fail_setup=False, fail_teardown=False):
+    def __init__(self, fail_setup=False, fail_teardown=False, fail_shape=False):
         self.fail_setup, self.fail_teardown, self.up = fail_setup, fail_teardown, set()
+        self.fail_shape, self.shaped = fail_shape, []
+
+    async def set_bandwidth(self, cell, bw):
+        if self.fail_shape:
+            raise OSError("tbf unsupported")
+        LOG.append("shape")
+        self.shaped.append((cell.cell_id, bw))
 
     async def setup(self, cell):
         if self.fail_setup:
@@ -223,3 +230,63 @@ async def test_runtime_installs_ruleset_and_aborts_startup_on_failure(monkeypatc
     class NoNic:
         needs_network = False
     assert await runtime.start_network_runtime(NoNic()) is None
+
+
+from aijailer.netpolicy.shaping import Bandwidth, tbf_params  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_bandwidth_applied_after_link_and_before_proxy():
+    n, _, links = mk()
+    cid = uuid.uuid4()
+    await n.provision(cid, uuid.uuid4(), POLICY, Bandwidth(8000, 4000))
+    assert LOG.index("link:up") < LOG.index("shape") < LOG.index("proxy:start")
+    assert links.shaped == [(cid, Bandwidth(8000, 4000))]
+
+
+@pytest.mark.asyncio
+async def test_no_bandwidth_means_no_shaping_call():
+    n, _, links = mk()
+    await n.provision(uuid.uuid4(), uuid.uuid4(), POLICY)
+    assert links.shaped == []
+
+
+@pytest.mark.asyncio
+async def test_shaping_failure_rolls_back_whole_network():
+    links = FakeLinks(fail_shape=True)
+    n, mgr, _ = mk(links=links)
+    with pytest.raises(OSError, match="tbf"):
+        await n.provision(uuid.uuid4(), uuid.uuid4(), POLICY, Bandwidth(1000, 1000))
+    assert mgr.cells == [] and links.up == set() and n.provisioned == set()
+    assert not FakeProxy.instances  # proxy never started: a cell never runs unshaped
+
+
+@pytest.mark.asyncio
+async def test_hot_update_bandwidth():
+    n, _, links = mk()
+    cid = uuid.uuid4()
+    await n.provision(cid, uuid.uuid4(), POLICY, Bandwidth(1000, 1000))
+    await n.set_bandwidth(cid, Bandwidth(2000, None))
+    assert links.shaped[-1] == (cid, Bandwidth(2000, None))
+    with pytest.raises(LookupError):
+        await n.set_bandwidth(uuid.uuid4(), Bandwidth(1000, 1000))
+    await n.deprovision(cid)
+    with pytest.raises(LookupError):  # gone after teardown
+        await n.set_bandwidth(cid, Bandwidth(1000, 1000))
+
+
+def test_bandwidth_validation():
+    assert Bandwidth.symmetric_mbps(100) == Bandwidth(100_000, 100_000)
+    assert Bandwidth.symmetric_mbps(0) == Bandwidth() == Bandwidth.symmetric_mbps(None)
+    for bad in (0, 63, -5, 10_000_001, 1.5, "10", True):
+        with pytest.raises(ValueError):
+            Bandwidth(down_kbit=bad)
+        with pytest.raises(ValueError):
+            Bandwidth(up_kbit=bad)
+
+
+def test_tbf_params_burst_floor_and_scaling():
+    low = tbf_params(64)
+    assert low["rate"] == "64kbit" and low["burst"] == 32 * 1024  # floor
+    hi = tbf_params(1_000_000)  # 1 Gbit/s -> 100 ms of traffic
+    assert hi["burst"] == 12_500_000 and hi["latency"] == "50ms"

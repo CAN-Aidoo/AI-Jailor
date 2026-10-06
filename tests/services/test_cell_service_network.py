@@ -10,6 +10,7 @@ from aijailer.models.tenant import Tenant
 from aijailer.netpolicy import runtime
 from aijailer.netpolicy.cell_network import Provisioned
 from aijailer.netpolicy.nft import CellNet, LinkInfo
+from aijailer.netpolicy.shaping import Bandwidth
 from aijailer.services import cell_service
 from aijailer.services.cell_service import CellService
 
@@ -56,7 +57,9 @@ class FakeCellNetwork:
         self.log, self.live, self.fail = log, set(), False
         self.policies = {}
 
-    async def provision(self, cell_id, tenant_id, policy):
+    async def provision(self, cell_id, tenant_id, policy, bandwidth=None):
+        self.bandwidths = getattr(self, "bandwidths", {})
+        self.bandwidths[cell_id] = bandwidth
         self.log.append("net:provision")
         if self.fail:
             raise OSError("nft unavailable")
@@ -106,6 +109,8 @@ async def test_create_builds_network_before_vm_and_passes_it_through(env):
     assert cfg.network.netns_path == f"/run/netns/aj{cell.id.hex[:12]}"
     assert cfg.environment["http_proxy"] == "http://10.200.0.1:3128" and cfg.environment["A"] == "1"
     assert cell.internal_ip == "10.200.0.2"
+    # the cell's configured network_bandwidth_mbps (10 here) becomes symmetric shaping
+    assert net.bandwidths[cell.id] == Bandwidth(10_000, 10_000)
 
 
 @pytest.mark.asyncio

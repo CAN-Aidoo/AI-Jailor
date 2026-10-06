@@ -21,6 +21,7 @@ from aijailer.engine.microvm import VMConfig, VMNetwork, get_microvm_engine
 from aijailer.models.audit import EventType, Severity
 from aijailer.models.cell import Cell
 from aijailer.models.tenant import Tenant
+from aijailer.netpolicy.shaping import Bandwidth
 from aijailer.netpolicy.runtime import get_cell_network, network_required, remember_tenant
 from aijailer.services.audit_service import get_audit_service
 
@@ -54,7 +55,9 @@ class CellService:
             return None
         remember_tenant(cell.id, cell.tenant_id)
         policy = (cell.effective_policy or {}).get("network")
-        return await self._network.provision(cell.id, cell.tenant_id, policy)
+        return await self._network.provision(
+            cell.id, cell.tenant_id, policy,
+            Bandwidth.symmetric_mbps(cell.network_bandwidth_mbps))
 
     async def _deprovision_network(self, cell_id: uuid.UUID) -> None:
         if self._network is None:

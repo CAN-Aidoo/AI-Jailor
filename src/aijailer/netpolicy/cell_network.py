@@ -22,6 +22,7 @@ import structlog
 from aijailer.agentsec.egress import EgressBroker, EgressRule, SecretBinding
 from aijailer.agentsec.proxy import CellProxy
 from aijailer.netpolicy.nft import CellNet, LinkInfo, NetPolicyManager
+from aijailer.netpolicy.shaping import Bandwidth
 
 logger = structlog.get_logger(__name__)
 
@@ -38,6 +39,7 @@ class NoSecrets:
 class LinkOps(Protocol):
     async def setup(self, cell: CellNet) -> LinkInfo | None: ...
     async def teardown(self, ifname: str) -> None: ...
+    async def set_bandwidth(self, cell: CellNet, bw: Bandwidth) -> None: ...
 
 
 class NetnsLinkOps:
@@ -53,6 +55,13 @@ class NetnsLinkOps:
     async def teardown(self, ifname: str) -> None:
         from aijailer.netpolicy.link import ateardown_link
         await ateardown_link(ifname)
+
+    async def set_bandwidth(self, cell: CellNet, bw: Bandwidth) -> None:
+        import asyncio
+
+        from aijailer.netpolicy.link import netns_name
+        from aijailer.netpolicy.shaping import apply_shaping
+        await asyncio.to_thread(apply_shaping, cell.ifname, netns_name(cell), bw)
 
 
 TapLinkOps = NetnsLinkOps  # backwards-compatible name
@@ -118,6 +127,7 @@ class CellNetwork:
         self._proxies: dict[uuid.UUID, CellProxy] = {}
         self._tenants: dict[uuid.UUID, uuid.UUID] = {}
         self._links_up: set[uuid.UUID] = set()
+        self._nets: dict[uuid.UUID, CellNet] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -129,7 +139,8 @@ class CellNetwork:
         return set(self._proxies)
 
     async def provision(self, cell_id: uuid.UUID, tenant_id: uuid.UUID,
-                        network_policy: dict | None) -> Provisioned:
+                        network_policy: dict | None,
+                        bandwidth: Bandwidth | None = None) -> Provisioned:
         async with self._lock:
             if cell_id in self._proxies:
                 raise RuntimeError(f"network for cell {cell_id} already provisioned")
@@ -140,6 +151,10 @@ class CellNetwork:
                 net = await self._mgr.register(cell_id)
                 link = await self._links.setup(net)
                 self._links_up.add(cell_id)
+                # A cell never runs without its bandwidth limit: failure rolls everything back.
+                if bandwidth is not None:
+                    await self._links.set_bandwidth(net, bandwidth)
+                    self._nets[cell_id] = net
                 sink = (lambda ev, c=cell_id: self._audit(c, ev)) if self._audit else None
                 proxy = self._proxy_factory(str(cell_id), str(net.host_ip), net.broker_port,
                                             broker, audit=sink)
@@ -155,6 +170,16 @@ class CellNetwork:
             env = {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
                    "NO_PROXY": ""}
             return Provisioned(net, link, url, env, skipped)
+
+    async def set_bandwidth(self, cell_id: uuid.UUID, bandwidth: Bandwidth) -> None:
+        """Hot-update a running cell's limits (resource limits are adjustable without restart)."""
+        async with self._lock:
+            net = self._nets.get(cell_id) or next(
+                (c for c in self._mgr.cells if c.cell_id == cell_id), None)
+            if net is None or cell_id not in self._proxies:
+                raise LookupError(f"no provisioned network for cell {cell_id}")
+            await self._links.set_bandwidth(net, bandwidth)
+            self._nets[cell_id] = net
 
     async def deprovision(self, cell_id: uuid.UUID) -> list[str]:
         """Returns the list of errors encountered (empty on a clean teardown)."""
@@ -193,6 +218,7 @@ class CellNetwork:
         # On error the /30 stays reserved: leaking an address is safer than reusing a
         # subnet that may still be attached to a live interface.
         self._tenants.pop(cell_id, None)
+        self._nets.pop(cell_id, None)
         return errors
 
     async def reconcile(self, live_cells: set[uuid.UUID]) -> list[uuid.UUID]:

@@ -58,6 +58,9 @@ r.addr("add",index=i,address="{cell.guest_ip}",prefixlen={cell.prefix})
 r.link("set",index=i,state="up"); r.link("set",index=1,state="up")
 """)
 
+    async def set_bandwidth(self, cell, bw):
+        pass  # shaping is verified separately (test_netns_shaping)
+
     async def teardown(self, ifname):
         await asyncio.to_thread(self._teardown, ifname)
 
