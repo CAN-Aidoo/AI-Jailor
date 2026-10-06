@@ -10,19 +10,53 @@ import uuid
 from datetime import datetime, timezone
 
 from aijailer.models.audit import AuditEvent, EventType, Severity
+from aijailer.services.attestation import (
+    Ed25519Signer,
+    Signer,
+    canonical_json,
+    make_statement,
+    sign_statement,
+    verify_envelope,
+)
 
 
 class AuditService:
     """In-memory audit event store for MVP. Production uses ClickHouse."""
 
-    def __init__(self) -> None:
+    def __init__(self, signer: Signer | None = None) -> None:
         self._events: list[AuditEvent] = []
         self._last_hash: dict[str, str] = {}  # per (tenant_id, cell_id) chain
+        self._signer = signer or Ed25519Signer.generate()
+        self._checkpoints: dict[str, list[dict]] = {}
 
-    def _compute_hash(self, event: AuditEvent, previous_hash: str) -> str:
-        """Compute tamper-evident hash for an event."""
-        data = f"{event.id}{event.tenant_id}{event.cell_id}{event.event_type}{event.timestamp}{previous_hash}"
-        return hashlib.sha256(data.encode()).hexdigest()
+    @property
+    def public_key(self):
+        return self._signer.public_key
+
+    @staticmethod
+    def _compute_hash(event: AuditEvent, previous_hash: str) -> str:
+        """Hash EVERY field (details, severity, actor...) so any edit is detectable."""
+        body = event.model_dump(mode="json", exclude={"event_hash"})
+        body["previous_hash"] = previous_hash
+        return hashlib.sha256(canonical_json(body)).hexdigest()
+
+    def checkpoint(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> dict:
+        """Sign (head hash, length) so deletion of recent events is detectable.
+
+        A bare hash chain cannot detect truncation or a full rebuild by someone
+        with write access; a signed checkpoint held elsewhere (like a
+        transparency-log signed tree head) can.
+        """
+        key = f"{tenant_id}:{cell_id}"
+        n = sum(1 for e in self._events if e.tenant_id == tenant_id and e.cell_id == cell_id)
+        statement = make_statement(
+            f"audit-chain/{key}", self._last_hash.get(key, "").ljust(64, "0"),
+            "https://aijailer.dev/attestation/audit-checkpoint/v1",
+            {"chain": key, "length": n, "head": self._last_hash.get(key, "")},
+        )
+        cp = sign_statement(statement, self._signer)
+        self._checkpoints.setdefault(key, []).append(cp)
+        return cp
 
     async def record_event(
         self,
@@ -87,18 +121,30 @@ class AuditService:
         return results
 
     async def verify_chain(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> bool:
-        """Verify hash chain integrity for a (tenant, cell) pair."""
+        """Verify chain integrity AND consistency with every signed checkpoint."""
+        key = f"{tenant_id}:{cell_id}"
         chain_events = [
-            e
-            for e in self._events
-            if e.tenant_id == tenant_id and e.cell_id == cell_id
+            e for e in self._events if e.tenant_id == tenant_id and e.cell_id == cell_id
         ]
         prev_hash = ""
+        hashes: list[str] = []
         for event in chain_events:
-            expected = self._compute_hash(event, prev_hash)
-            if event.event_hash != expected:
+            if event.previous_hash != prev_hash:
+                return False
+            if event.event_hash != self._compute_hash(event, prev_hash):
                 return False
             prev_hash = event.event_hash
+            hashes.append(prev_hash)
+        for cp in self._checkpoints.get(key, []):
+            stmt = verify_envelope(cp, self.public_key)
+            if stmt is None:
+                return False
+            pred = stmt["predicate"]
+            n = pred["length"]
+            if n > len(hashes):
+                return False  # events were deleted after the checkpoint
+            if n and hashes[n - 1] != pred["head"]:
+                return False  # history was rewritten
         return True
 
 

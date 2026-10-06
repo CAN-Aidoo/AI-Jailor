@@ -163,3 +163,32 @@ class TestConstraintResult:
         assert result.safe is False
         assert result.reason == "PII access without authentication"
         assert len(result.violated_constraints) == 1
+
+
+class TestZ3UnsatCore:
+    """The Z3 path must name the exact violated rules."""
+
+    def _intent(self, **kw):
+        from aijailer.schemas.intent import (ActionType, AuthRequirement, CodeIntent, DataClass,
+                                             ErrorClass, InputSource, OutputTarget)
+        base = dict(action=ActionType.CREATE, data_classification=[DataClass.PII],
+                    auth_context=AuthRequirement.SESSION, trust_boundary_crossing=True,
+                    input_sources=[InputSource.USER_INPUT], output_targets=[OutputTarget.DATABASE],
+                    error_sensitivity=ErrorClass.FAIL_CLOSED)
+        base.update(kw)
+        return CodeIntent(**base)
+
+    def test_compliant_plan_is_safe(self):
+        from aijailer.services.constraint_engine import ConstraintEngine, GenerationPlan
+        plan = GenerationPlan(accesses_database=True, uses_parameterized_query=True,
+                              has_audit_logging=True, has_auth=True)
+        assert ConstraintEngine().check_with_z3(self._intent(), plan).safe
+
+    def test_core_names_exact_failures(self):
+        from aijailer.services.constraint_engine import ConstraintEngine, GenerationPlan
+        plan = GenerationPlan(accesses_database=True, uses_parameterized_query=False,
+                              has_audit_logging=False, has_auth=True)
+        res = ConstraintEngine().check_with_z3(self._intent(), plan)
+        assert not res.safe
+        assert set(res.violated_constraints) == {"sql_injection_prevention",
+                                                  "pii_requires_audit_logging"}

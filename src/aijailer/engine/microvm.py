@@ -92,12 +92,21 @@ class MicroVMEngine(ABC):
     ) -> ExecResult:
         """Execute a command inside a microVM via the cell agent."""
 
+    async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
+        """Pause + dump memory/device state. Optional capability."""
+        raise NotImplementedError(f"{type(self).__name__} does not support snapshots")
+
+    async def restore_vm(self, config: "VMConfig", snapshot_dir: str) -> "VMInfo":
+        raise NotImplementedError(f"{type(self).__name__} does not support restore")
+
     @abstractmethod
     async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
         """Get current status and info for a microVM."""
 
 
 class SimulatedMicroVMEngine(MicroVMEngine):
+    isolation = "none"
+
     """Simulated MicroVM engine for development and testing.
 
     Tracks VM state in-memory without actually creating Firecracker processes.
@@ -171,12 +180,34 @@ class SimulatedMicroVMEngine(MicroVMEngine):
         return info
 
 
-# Singleton for MVP
+class EngineUnavailable(RuntimeError):
+    """The configured isolation backend cannot provide real isolation here."""
+
+
 _engine: MicroVMEngine | None = None
+
+
+def build_engine(backend: str, environment: str) -> MicroVMEngine:
+    """Select an engine. Fails CLOSED: never silently downgrades isolation."""
+    if backend == "simulated":
+        if environment != "dev":
+            raise EngineUnavailable(
+                "ENGINE_BACKEND=simulated provides no isolation and is only allowed "
+                "when AIJAILER_ENV=dev"
+            )
+        return SimulatedMicroVMEngine()
+    if backend == "firecracker":
+        from aijailer.engine.firecracker import FirecrackerEngine
+
+        return FirecrackerEngine()
+    raise EngineUnavailable(f"unknown engine backend '{backend}'")
 
 
 def get_microvm_engine() -> MicroVMEngine:
     global _engine
     if _engine is None:
-        _engine = SimulatedMicroVMEngine()
+        from aijailer.core.config import get_settings
+
+        s = get_settings()
+        _engine = build_engine(s.engine_backend, s.environment)
     return _engine

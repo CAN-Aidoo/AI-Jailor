@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     # Redis
     redis: RedisSettings = RedisSettings()
 
+    # Environment gate: the simulated engine provides NO isolation and is refused
+    # unless environment == "dev".
+    environment: str = Field(default="dev", alias="AIJAILER_ENV")
+    engine_backend: str = Field(default="simulated", alias="ENGINE_BACKEND")
+    jailer_binary: str = Field(default="/usr/bin/jailer", alias="JAILER_BINARY")
+    jailer_uid: int = Field(default=10000, alias="JAILER_UID")
+    jailer_gid: int = Field(default=10000, alias="JAILER_GID")
+    jailer_chroot_base: str = Field(default="/srv/jailer", alias="JAILER_CHROOT_BASE")
+    agent_vsock_port: int = 5000
+    # off | observe (log containment tier) | enforce (block code the gate flags)
+    execution_gate_mode: str = Field(default="observe", alias="EXECUTION_GATE_MODE")
+
     # MicroVM Engine
     firecracker_binary: str = Field(
         default="/usr/bin/firecracker", alias="FIRECRACKER_BINARY"

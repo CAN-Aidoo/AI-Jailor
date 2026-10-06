@@ -75,6 +75,12 @@ AI Jailer provides microVM-based isolation where every agent session runs in its
 | Auth | JWT + API Keys + mTLS | Multi-layer authentication |
 | Metering | Custom collector → TimescaleDB | Usage-based billing data |
 
+## Project Status (honest)
+
+- Control plane (API, auth, policies, audit, constraint engine, certified components, taint/verification): implemented and tested (186 tests).
+- Firecracker data plane: controller implemented and unit-tested against a fake VMM; **not yet validated on real KVM hardware**. The simulated engine is refused outside `AIJAILER_ENV=dev`.
+- See [RESEARCH_ALIGNMENT.md](./RESEARCH_ALIGNMENT.md) for what we adopt from existing standards (Firecracker, in-toto/DSSE, Cedar, K8s agent-sandbox) versus build (flow control, egress broker, execution gate).
+
 ## Documentation Index
 
 | Document | Description |
@@ -91,6 +97,7 @@ AI Jailer provides microVM-based isolation where every agent session runs in its
 | [SDK_SPECIFICATION.md](./SDK_SPECIFICATION.md) | Client SDK design for Python, Node, Go |
 | [NETWORKING.md](./NETWORKING.md) | Network isolation and policy enforcement |
 | [DEPLOYMENT.md](./DEPLOYMENT.md) | Infrastructure and deployment architecture |
+| [RESEARCH_ALIGNMENT.md](./RESEARCH_ALIGNMENT.md) | Build-vs-adopt decisions, research alignment, roadmap |
 
 ## Key Design Principles
 

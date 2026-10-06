@@ -241,35 +241,44 @@ class ConstraintEngine:
         solver.add(has_error_handling == plan.has_error_handling)
         solver.add(uses_approved_crypto == plan.uses_approved_crypto)
 
-        # Add security constraints (implications)
-        # Rule: user input + DB access → must use parameterized queries
-        solver.add(Implies(And(has_user_input, accesses_database), uses_parameterized_query))
+        # Security rules as NAMED, tracked assertions so an UNSAT result yields an
+        # unsat core that names exactly which requirements the plan fails.
+        rules = {
+            "sql_injection_prevention": Implies(And(has_user_input, accesses_database),
+                                                uses_parameterized_query),
+            "pii_requires_audit_logging": Implies(handles_pii, has_audit_logging),
+            "phi_requires_audit_logging": Implies(handles_phi, has_audit_logging),
+            "auth_enforcement": Implies(crosses_trust_boundary, has_auth),
+            "output_encoding": Implies(outputs_to_browser, has_output_encoding),
+            "crypto_safety": Implies(is_crypto_action, uses_approved_crypto),
+            "error_handling": has_error_handling,
+        }
+        # Z3 yields ONE core per UNSAT call. To report every violated rule, drop the
+        # rules in each core and re-solve until the remainder is satisfiable.
+        active = dict(rules)
+        violated: list[str] = []
+        while True:
+            solver.push()
+            for name, expr in active.items():
+                solver.assert_and_track(expr, Bool(f"rule::{name}"))
+            result = solver.check()
+            core = sorted(str(c).removeprefix("rule::") for c in solver.unsat_core()) \
+                if result != sat else []
+            solver.pop()
+            if result == sat:
+                break
+            if not core:  # facts alone are contradictory; cannot attribute to a rule
+                violated.append("unsatisfiable_facts")
+                break
+            violated.extend(core)
+            for name in core:
+                active.pop(name, None)
 
-        # Rule: PII/PHI handling → must have audit logging
-        solver.add(Implies(handles_pii, has_audit_logging))
-        solver.add(Implies(handles_phi, has_audit_logging))
-
-        # Rule: trust boundary crossing → must have auth
-        solver.add(Implies(crosses_trust_boundary, has_auth))
-
-        # Rule: browser output → must have output encoding
-        solver.add(Implies(outputs_to_browser, has_output_encoding))
-
-        # Rule: crypto action → must use approved algorithms
-        solver.add(Implies(is_crypto_action, uses_approved_crypto))
-
-        # Rule: always require error handling
-        solver.add(has_error_handling)
-
-        # Check satisfiability
-        if solver.check() == sat:
+        if not violated:
             return ConstraintResult.SAFE()
-        else:
-            return ConstraintResult.BLOCKED(
-                reason="Generation plan violates security constraints. "
-                "The proposed code structure cannot satisfy all required security properties.",
-                violated=["z3_unsat"],
-            )
+        violated = sorted(violated)
+        return ConstraintResult.BLOCKED(
+            reason="Generation plan violates: " + ", ".join(violated), violated=violated)
 
 
 # Singleton
