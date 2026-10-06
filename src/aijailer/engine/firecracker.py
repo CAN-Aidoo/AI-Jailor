@@ -157,15 +157,18 @@ async def agent_exec(vsock_uds: str, port: int, command: str, timeout: int,
     )
 
 
-def jailer_argv(settings, vm_id: str, mem_mib: int, vcpus: int) -> list[str]:
-    """Official jailer invocation (chroot, cgroups v2, non-root uid, own netns)."""
+def jailer_argv(settings, vm_id: str, mem_mib: int, vcpus: int,
+                netns_path: str | None = None) -> list[str]:
+    """Official jailer invocation (chroot, cgroups v2, non-root uid, own PID ns, and, when the
+    cell has a NIC, the cell's dedicated network namespace so the VMM sees no host network)."""
+    netns = ["--netns", netns_path] if netns_path else []
     return [
         settings.jailer_binary, "--id", vm_id, "--exec-file", settings.firecracker_binary,
         "--uid", str(settings.jailer_uid), "--gid", str(settings.jailer_gid),
         "--chroot-base-dir", settings.jailer_chroot_base, "--cgroup-version", "2",
         "--cgroup", f"cpu.max={vcpus * 100000} 100000",
         "--cgroup", f"memory.max={(mem_mib + 64) * 1024 * 1024}",
-        "--new-pid-ns", "--", "--api-sock", "api.sock",
+        *netns, "--new-pid-ns", "--", "--api-sock", "api.sock",
     ]
 
 
@@ -255,7 +258,11 @@ class FirecrackerEngine(MicroVMEngine):
         cid = self._next_cid
         self._next_cid += 1
         fc_config = self._build_config(config, cell_dir, cid)
-        argv = jailer_argv(self.settings, str(config.cell_id), config.memory_mb, config.vcpus)
+        if config.network is not None and not config.network.netns_path:
+            raise EngineUnavailable(
+                "refusing to attach a NIC outside a dedicated network namespace")
+        argv = jailer_argv(self.settings, str(config.cell_id), config.memory_mb, config.vcpus,
+                           config.network.netns_path if config.network else None)
         pid = await self._spawner(argv)
         sock = str(cell_dir / "api.sock")
         deadline = time.monotonic() + 5

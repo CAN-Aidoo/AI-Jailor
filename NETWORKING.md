@@ -336,3 +336,16 @@ Verified with real packets in network namespaces (`tests/netpolicy/`).
 `NETWORK_ENFORCEMENT=auto|required|off`: engines that attach a NIC (Firecracker) can never run with `off`.
 The simulated engine has no NIC and gets none. Egress comes from the cell's network policy
 (domains and single IPs over TCP; CIDR/UDP rules are skipped and reported, never widened).
+
+### Per-cell namespace (jailer `--netns`)
+
+```
+ root netns                         cell netns /run/netns/aj<id>  (jailer --netns)
+ aj<id> host_ip  <-- veth pair -->  vc0 --[ br0 ]-- tap0 <--> Firecracker/guest
+```
+The VMM runs inside its own namespace and sees only `tap0`, the bridge and the veth peer: a compromised VMM
+has no route to host services, other cells' links or the internet. The bridge makes guest NIC and host veth one
+L2 segment, so the firewall (`iifname "aj*"`, guest/host /30, source match) and the broker apply unchanged.
+`setup_link` waits until both veth ends are operationally UP (carrier changes are applied asynchronously, up to
+~1 s, and the bridge will not forward until then), recovers a stale namespace left by a crash, and rolls back
+completely on any failure. TAP is persistent and owned by the jailer uid so Firecracker attaches unprivileged.

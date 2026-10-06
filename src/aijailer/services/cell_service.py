@@ -134,8 +134,11 @@ class CellService:
                 disk_mb=disk_mb,
                 network_bandwidth_mbps=network_bandwidth_mbps,
                 environment={**environment, **(provisioned.env if provisioned else {})},
-                network=VMNetwork(provisioned.net.ifname, str(provisioned.net.guest_ip),
-                                  str(provisioned.net.host_ip), provisioned.net.prefix)
+                network=VMNetwork(
+                    provisioned.link.tap_name if provisioned.link else provisioned.net.ifname,
+                    str(provisioned.net.guest_ip), str(provisioned.net.host_ip),
+                    provisioned.net.prefix,
+                    provisioned.link.netns_path if provisioned.link else None)
                 if provisioned else None,
             )
             vm_info = await self.engine.create_vm(vm_config)

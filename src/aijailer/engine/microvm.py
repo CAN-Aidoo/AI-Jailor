@@ -30,6 +30,7 @@ class VMNetwork:
     guest_ip: str
     host_ip: str
     prefix: int = 30
+    netns_path: str | None = None  # the VMM must run inside this namespace (jailer --netns)
 
 
 @dataclass

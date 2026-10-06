@@ -9,7 +9,7 @@ from aijailer.engine.microvm import MicroVMEngine, VMInfo, VMStatus
 from aijailer.models.tenant import Tenant
 from aijailer.netpolicy import runtime
 from aijailer.netpolicy.cell_network import Provisioned
-from aijailer.netpolicy.nft import CellNet
+from aijailer.netpolicy.nft import CellNet, LinkInfo
 from aijailer.services import cell_service
 from aijailer.services.cell_service import CellService
 
@@ -64,7 +64,9 @@ class FakeCellNetwork:
         self.policies[cell_id] = policy
         net = CellNet(cell_id, "aj" + cell_id.hex[:12], ipaddress.IPv4Address("10.200.0.1"),
                       ipaddress.IPv4Address("10.200.0.2"), 30, 3128)
-        return Provisioned(net, "http://10.200.0.1:3128", {"http_proxy": "http://10.200.0.1:3128"})
+        link = LinkInfo("tap0", f"/run/netns/{net.ifname}")
+        return Provisioned(net, link, "http://10.200.0.1:3128",
+                           {"http_proxy": "http://10.200.0.1:3128"})
 
     async def deprovision(self, cell_id):
         self.log.append("net:deprovision")
@@ -100,6 +102,8 @@ async def test_create_builds_network_before_vm_and_passes_it_through(env):
     assert log[:2] == ["net:provision", "vm:create"] and cell.status == "running"
     cfg = eng.configs[cell.id]
     assert cfg.network.guest_ip == "10.200.0.2" and cfg.network.host_ip == "10.200.0.1"
+    assert cfg.network.tap_name == "tap0"  # TAP lives inside the cell's own namespace
+    assert cfg.network.netns_path == f"/run/netns/aj{cell.id.hex[:12]}"
     assert cfg.environment["http_proxy"] == "http://10.200.0.1:3128" and cfg.environment["A"] == "1"
     assert cell.internal_ip == "10.200.0.2"
 

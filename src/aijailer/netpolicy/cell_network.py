@@ -21,7 +21,7 @@ import structlog
 
 from aijailer.agentsec.egress import EgressBroker, EgressRule, SecretBinding
 from aijailer.agentsec.proxy import CellProxy
-from aijailer.netpolicy.nft import CellNet, NetPolicyManager
+from aijailer.netpolicy.nft import CellNet, LinkInfo, NetPolicyManager
 
 logger = structlog.get_logger(__name__)
 
@@ -36,23 +36,26 @@ class NoSecrets:
 
 
 class LinkOps(Protocol):
-    async def setup(self, cell: CellNet) -> None: ...
+    async def setup(self, cell: CellNet) -> LinkInfo | None: ...
     async def teardown(self, ifname: str) -> None: ...
 
 
-class TapLinkOps:
-    """Production link plumbing: persistent TAP owned by the jailer user."""
+class NetnsLinkOps:
+    """Production link plumbing: per-cell netns + TAP (owned by the jailer user) + veth."""
 
     def __init__(self, uid: int, gid: int) -> None:
         self._uid, self._gid = uid, gid
 
-    async def setup(self, cell: CellNet) -> None:
+    async def setup(self, cell: CellNet) -> LinkInfo:
         from aijailer.netpolicy.link import asetup_link
-        await asetup_link(cell, self._uid, self._gid)
+        return await asetup_link(cell, self._uid, self._gid)
 
     async def teardown(self, ifname: str) -> None:
         from aijailer.netpolicy.link import ateardown_link
         await ateardown_link(ifname)
+
+
+TapLinkOps = NetnsLinkOps  # backwards-compatible name
 
 
 def broker_from_policy(network_policy: dict | None, secrets: list[SecretBinding],
@@ -96,6 +99,7 @@ def broker_from_policy(network_policy: dict | None, secrets: list[SecretBinding]
 @dataclass
 class Provisioned:
     net: CellNet
+    link: LinkInfo | None
     proxy_url: str
     env: dict = field(default_factory=dict)
     skipped_rules: list[str] = field(default_factory=list)
@@ -134,7 +138,7 @@ class CellNetwork:
             net = None
             try:
                 net = await self._mgr.register(cell_id)
-                await self._links.setup(net)
+                link = await self._links.setup(net)
                 self._links_up.add(cell_id)
                 sink = (lambda ev, c=cell_id: self._audit(c, ev)) if self._audit else None
                 proxy = self._proxy_factory(str(cell_id), str(net.host_ip), net.broker_port,
@@ -150,7 +154,7 @@ class CellNetwork:
                         guest_ip=str(net.guest_ip), skipped=skipped)
             env = {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
                    "NO_PROXY": ""}
-            return Provisioned(net, url, env, skipped)
+            return Provisioned(net, link, url, env, skipped)
 
     async def deprovision(self, cell_id: uuid.UUID) -> list[str]:
         """Returns the list of errors encountered (empty on a clean teardown)."""

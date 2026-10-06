@@ -158,11 +158,11 @@ async def test_nic_and_static_ip_only_when_network_given(env):
     holder = {}
     eng = await make_engine(tmp, holder)
     a, b = uuid.uuid4(), uuid.uuid4()
-    net = VMNetwork("ajtap0000001", "10.200.0.2", "10.200.0.1", 30)
+    net = VMNetwork("tap0", "10.200.0.2", "10.200.0.1", 30, "/run/netns/ajcell1")
     await eng.create_vm(VMConfig(cell_id=a, image="base-python", network=net))
     await eng.create_vm(VMConfig(cell_id=b, image="base-python"))  # no network -> no NIC at all
     with_net = {c[1]: c[2] for c in holder[str(a)].calls}
-    assert with_net["/network-interfaces/eth0"]["host_dev_name"] == "ajtap0000001"
+    assert with_net["/network-interfaces/eth0"]["host_dev_name"] == "tap0"
     assert with_net["/network-interfaces/eth0"]["guest_mac"].startswith("02:")
     assert "ip=10.200.0.2::10.200.0.1:255.255.255.252::eth0:off" in with_net["/boot-source"]["boot_args"]
     assert not any(p.startswith("/network-interfaces") for _, p, _ in holder[str(b)].calls)
@@ -187,3 +187,42 @@ async def test_exec_passes_cell_environment_to_agent(env):
                                  environment={"http_proxy": "http://10.200.0.1:3128"}))
     await eng.exec_command(cid, "true")
     assert seen["env"] == {"http_proxy": "http://10.200.0.1:3128"}
+
+
+def test_jailer_argv_joins_cell_netns_only_when_given():
+    s = Settings()
+    with_ns = fc.jailer_argv(s, "abc", 512, 1, "/run/netns/ajcell1")
+    i = with_ns.index("--netns")
+    assert with_ns[i + 1] == "/run/netns/ajcell1" and i < with_ns.index("--")
+    assert "--netns" not in fc.jailer_argv(s, "abc", 512, 1)
+
+
+@pytest.mark.asyncio
+async def test_nic_without_netns_is_refused(env):
+    from aijailer.engine.microvm import VMNetwork
+    tmp, _ = env
+    eng = await make_engine(tmp, {})
+    cfg = VMConfig(cell_id=uuid.uuid4(), image="base-python",
+                   network=VMNetwork("tap0", "10.200.0.2", "10.200.0.1", 30, None))
+    with pytest.raises(EngineUnavailable, match="dedicated network namespace"):
+        await eng.create_vm(cfg)
+
+
+@pytest.mark.asyncio
+async def test_create_passes_netns_to_jailer(env):
+    from aijailer.engine.microvm import VMNetwork
+    tmp, _ = env
+    argvs = []
+
+    async def spawner(argv):
+        argvs.append(argv)
+        cell = argv[argv.index("--id") + 1]
+        fake = FakeFirecracker(os.path.join(str(tmp), "cells", cell, "api.sock"))
+        await fake.start()
+        return 0
+
+    eng = fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"))
+    await eng.create_vm(VMConfig(cell_id=uuid.uuid4(), image="base-python",
+                                 network=VMNetwork("tap0", "10.200.0.2", "10.200.0.1", 30,
+                                                   "/run/netns/ajcell1")))
+    assert argvs[0][argvs[0].index("--netns") + 1] == "/run/netns/ajcell1"

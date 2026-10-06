@@ -5,7 +5,7 @@ import uuid
 
 from aijailer.core.config import get_settings
 from aijailer.models.audit import EventType, Severity
-from aijailer.netpolicy.cell_network import CellNetwork, TapLinkOps
+from aijailer.netpolicy.cell_network import CellNetwork, NetnsLinkOps
 from aijailer.netpolicy.nft import NetAllocator, NetPolicyManager
 
 _network: CellNetwork | None = None
@@ -52,7 +52,7 @@ def get_cell_network() -> CellNetwork:
     if _network is None:
         s = get_settings()
         mgr = NetPolicyManager(allocator=NetAllocator(s.cell_net_pool), broker_port=s.broker_port)
-        _network = CellNetwork(mgr, TapLinkOps(s.jailer_uid, s.jailer_gid), audit=_audit_sink)
+        _network = CellNetwork(mgr, NetnsLinkOps(s.jailer_uid, s.jailer_gid), audit=_audit_sink)
     return _network
 
 

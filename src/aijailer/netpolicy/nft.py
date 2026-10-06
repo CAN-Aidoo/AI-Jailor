@@ -94,6 +94,14 @@ class CellNet:
         return str(ipaddress.ip_network(f"{self.host_ip}/{self.prefix}", strict=False))
 
 
+@dataclass(frozen=True)
+class LinkInfo:
+    """Where the VMM must attach: the TAP's name and the network namespace it lives in."""
+
+    tap_name: str
+    netns_path: str
+
+
 def base_ruleset() -> str:
     """Static ruleset. Atomic: delete+recreate in one transaction."""
     return f"""add table {FAMILY} {TABLE}
