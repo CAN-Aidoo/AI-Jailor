@@ -17,10 +17,11 @@ from aijailer.core.exceptions import (
     CellNotRunningError,
     InvalidStateTransitionError,
 )
-from aijailer.engine.microvm import VMConfig, get_microvm_engine
+from aijailer.engine.microvm import VMConfig, VMNetwork, get_microvm_engine
 from aijailer.models.audit import EventType, Severity
 from aijailer.models.cell import Cell
 from aijailer.models.tenant import Tenant
+from aijailer.netpolicy.runtime import get_cell_network, network_required, remember_tenant
 from aijailer.services.audit_service import get_audit_service
 
 logger = structlog.get_logger(__name__)
@@ -38,10 +39,29 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 
 
 class CellService:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, network=None):
         self.db = db
         self.engine = get_microvm_engine()
         self.audit = get_audit_service()
+        # Network enforcement is mandatory for engines that attach a NIC (fail closed);
+        # the simulator has no NIC, so it gets none.
+        self._net_required = network_required(self.engine)
+        self._network = (network or get_cell_network()) if self._net_required else None
+
+    async def _provision_network(self, cell: Cell):
+        """Build the cell's firewalled link + broker. Raises (and cleans up) on failure."""
+        if self._network is None:
+            return None
+        remember_tenant(cell.id, cell.tenant_id)
+        policy = (cell.effective_policy or {}).get("network")
+        return await self._network.provision(cell.id, cell.tenant_id, policy)
+
+    async def _deprovision_network(self, cell_id: uuid.UUID) -> None:
+        if self._network is None:
+            return
+        errors = await self._network.deprovision(cell_id)
+        if errors:
+            logger.error("cell.network.teardown_incomplete", cell_id=str(cell_id), errors=errors)
 
     async def create_cell(
         self,
@@ -101,8 +121,11 @@ class CellService:
 
         logger.info("cell.creating", cell_id=str(cell.id), image=image, tenant_id=str(tenant_id))
 
-        # Boot MicroVM
+        # Network first, VM second: a cell is never booted without its enforced link, and a
+        # failed network build never leaves a VM behind.
+        provisioned = None
         try:
+            provisioned = await self._provision_network(cell)
             vm_config = VMConfig(
                 cell_id=cell.id,
                 image=image,
@@ -110,7 +133,10 @@ class CellService:
                 memory_mb=memory_mb,
                 disk_mb=disk_mb,
                 network_bandwidth_mbps=network_bandwidth_mbps,
-                environment=environment,
+                environment={**environment, **(provisioned.env if provisioned else {})},
+                network=VMNetwork(provisioned.net.ifname, str(provisioned.net.guest_ip),
+                                  str(provisioned.net.host_ip), provisioned.net.prefix)
+                if provisioned else None,
             )
             vm_info = await self.engine.create_vm(vm_config)
             cell.internal_ip = vm_info.internal_ip
@@ -131,6 +157,11 @@ class CellService:
             cell.status = "error"
             cell.error_message = str(e)
             logger.error("cell.create_failed", cell_id=str(cell.id), error=str(e))
+            try:  # a half-created VM must not survive, and the network must be torn down
+                await self.engine.destroy_vm(cell.id)
+            except Exception:
+                logger.exception("cell.create_cleanup_vm_failed", cell_id=str(cell.id))
+            await self._deprovision_network(cell.id)
 
         # Audit
         await self.audit.record_event(
@@ -202,9 +233,17 @@ class CellService:
 
     async def start_cell(self, cell_id: uuid.UUID, tenant_id: uuid.UUID) -> Cell:
         cell = await self.get_cell(cell_id, tenant_id)
+        was_stopped = cell.status == "stopped"
         await self._transition(cell, "start", "running")
         cell.started_at = datetime.now(timezone.utc)
-        await self.engine.start_vm(cell_id)
+        if was_stopped:  # network is torn down on stop; rebuild before the VM runs again
+            await self._provision_network(cell)
+        try:
+            await self.engine.start_vm(cell_id)
+        except Exception:
+            if was_stopped:
+                await self._deprovision_network(cell_id)
+            raise
 
         await self.audit.record_event(
             tenant_id=tenant_id,
@@ -219,7 +258,11 @@ class CellService:
     ) -> Cell:
         cell = await self.get_cell(cell_id, tenant_id)
         await self._transition(cell, "stop", "stopping")
-        await self.engine.stop_vm(cell_id, grace_period=grace_period_seconds)
+        try:
+            await self.engine.stop_vm(cell_id, grace_period=grace_period_seconds)
+        finally:
+            # Stopped VMs hold no network. Even if the stop call failed, revoke access.
+            await self._deprovision_network(cell_id)
         cell.status = "stopped"
         cell.stopped_at = datetime.now(timezone.utc)
 
@@ -265,7 +308,10 @@ class CellService:
     ) -> None:
         cell = await self.get_cell(cell_id, tenant_id)
         await self._transition(cell, "destroy", "destroying")
-        await self.engine.destroy_vm(cell_id)
+        try:
+            await self.engine.destroy_vm(cell_id)
+        finally:
+            await self._deprovision_network(cell_id)
         cell.status = "destroyed"
         cell.destroyed_at = datetime.now(timezone.utc)
 

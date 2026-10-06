@@ -22,6 +22,16 @@ class VMStatus(str, Enum):
     ERROR = "error"
 
 
+@dataclass(frozen=True)
+class VMNetwork:
+    """The cell's one controlled link (see netpolicy/). Absent => the VM gets NO NIC."""
+
+    tap_name: str
+    guest_ip: str
+    host_ip: str
+    prefix: int = 30
+
+
 @dataclass
 class VMConfig:
     """Configuration for a new microVM."""
@@ -34,6 +44,7 @@ class VMConfig:
     network_bandwidth_mbps: int = 100
     environment: dict = field(default_factory=dict)
     network_policy: dict = field(default_factory=dict)
+    network: VMNetwork | None = None
 
 
 @dataclass
@@ -63,6 +74,9 @@ class ExecResult:
 
 class MicroVMEngine(ABC):
     """Abstract interface for MicroVM management."""
+
+    isolation = "unknown"
+    needs_network = False  # True when the engine attaches a real NIC that must be firewalled
 
     @abstractmethod
     async def create_vm(self, config: VMConfig) -> VMInfo:

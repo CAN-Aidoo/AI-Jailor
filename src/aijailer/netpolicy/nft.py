@@ -186,6 +186,7 @@ class NetPolicyManager:
         self._alloc = allocator or NetAllocator()
         self._port = broker_port
         self._cells: dict[uuid.UUID, CellNet] = {}
+        self._revoked: dict[uuid.UUID, CellNet] = {}
         self._lock = asyncio.Lock()
         self._installed = False
 
@@ -218,15 +219,27 @@ class NetPolicyManager:
             self._cells[cell_id] = cell
             return cell
 
-    async def unregister(self, cell_id: uuid.UUID) -> None:
+    async def revoke(self, cell_id: uuid.UUID) -> CellNet | None:
+        """Remove the cell's access NOW but keep its /30 reserved. Two-phase teardown:
+        the address must not be handed to a new cell while the old TAP still carries it."""
         async with self._lock:
             cell = self._cells.get(cell_id)
             if cell is None:
-                return
-            # Remove access FIRST; only then free the address for reuse.
+                return None
             await self._nft.run(_del_elements(cell))
             del self._cells[cell_id]
+            self._revoked[cell_id] = cell
+            return cell
+
+    async def release(self, cell_id: uuid.UUID) -> None:
+        """Free the /30 for reuse. Call only after the link is gone."""
+        async with self._lock:
+            self._revoked.pop(cell_id, None)
             self._alloc.release(cell_id)
+
+    async def unregister(self, cell_id: uuid.UUID) -> None:
+        await self.revoke(cell_id)
+        await self.release(cell_id)
 
     async def verify(self) -> list[str]:
         """Return human-readable drift between registry and live kernel state."""

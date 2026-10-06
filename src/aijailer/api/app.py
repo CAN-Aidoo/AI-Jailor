@@ -52,9 +52,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # In-memory stores for MVP
     app.state.rate_limit_store = {}
 
+    # Host network enforcement: required for engines that attach a NIC. Failing to install
+    # the firewall aborts startup (fail closed).
+    from aijailer.engine.microvm import get_microvm_engine
+    from aijailer.netpolicy.runtime import start_network_runtime
+
+    net_runtime = await start_network_runtime(get_microvm_engine())
+
     yield
 
     # Shutdown
+    if net_runtime is not None:
+        await net_runtime.stop()
     app.state.rate_limit_store.clear()
     logger.info("app.shutdown")
 

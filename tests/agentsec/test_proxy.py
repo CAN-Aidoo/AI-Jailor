@@ -17,6 +17,14 @@ from aijailer.agentsec.proxy import CellProxy
 SECRET = "ghp_SUPERSECRET123"
 
 
+def _san(host: str):
+    import ipaddress
+    try:
+        return x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        return x509.DNSName(host)
+
+
 def make_cert(host: str):
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
@@ -25,7 +33,7 @@ def make_cert(host: str):
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
             .not_valid_before(now - datetime.timedelta(minutes=1))
             .not_valid_after(now + datetime.timedelta(days=1))
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+            .add_extension(x509.SubjectAlternativeName([_san(host)]), critical=False)
             .sign(key, hashes.SHA256()))
     d = tempfile.mkdtemp()
     cp, kp = f"{d}/c.pem", f"{d}/k.pem"

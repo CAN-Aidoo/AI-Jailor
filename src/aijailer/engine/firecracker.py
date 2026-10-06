@@ -63,6 +63,8 @@ class FirecrackerAPI:
             await self._call("PUT", f"/drives/{d['drive_id']}", d)
         await self._call("PUT", "/machine-config", cfg["machine-config"])
         await self._call("PUT", "/vsock", cfg["vsock"])
+        for nic in cfg.get("network-interfaces", []):
+            await self._call("PUT", f"/network-interfaces/{nic['iface_id']}", nic)
 
     async def start(self) -> None:
         await self._call("PUT", "/actions", {"action_type": "InstanceStart"})
@@ -141,10 +143,11 @@ async def agent_get_file(vsock_uds: str, port: int, path: str) -> bytes:
 
 
 async def agent_exec(vsock_uds: str, port: int, command: str, timeout: int,
-                     user: str) -> ExecResult:
-    resp = await agent_request(
-        vsock_uds, port, {"op": "exec", "cmd": command, "timeout": timeout, "user": user},
-        timeout + 5)
+                     user: str, env: dict | None = None) -> ExecResult:
+    req = {"op": "exec", "cmd": command, "timeout": timeout, "user": user}
+    if env:
+        req["env"] = env
+    resp = await agent_request(vsock_uds, port, req, timeout + 5)
     return ExecResult(
         exit_code=int(resp["exit_code"]), stdout=resp.get("stdout", ""),
         stderr=resp.get("stderr", ""), duration_ms=int(resp.get("duration_ms", 0)),
@@ -177,6 +180,7 @@ async def _default_spawner(argv: list[str]) -> int:
 
 class FirecrackerEngine(MicroVMEngine):
     isolation = "hardware-kvm"
+    needs_network = True
 
     def __init__(self, spawner: Spawner | None = None, kvm_path: str = "/dev/kvm",
                  api_factory: Callable[[str], FirecrackerAPI] = FirecrackerAPI,
@@ -198,11 +202,29 @@ class FirecrackerEngine(MicroVMEngine):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         return path
 
+    @staticmethod
+    def _mac(guest_ip: str) -> str:
+        """Locally administered, derived from the (unique) guest IP."""
+        o = [int(x) for x in guest_ip.split(".")]
+        return "02:aa:%02x:%02x:%02x:%02x" % tuple(o)
+
     def _build_config(self, config: VMConfig, cell_dir: Path, cid: int) -> dict:
+        boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/aijailer-agent"
+        nics: list[dict] = []
+        net = config.network
+        if net is not None:
+            import ipaddress
+            mask = ipaddress.ip_network(f"{net.host_ip}/{net.prefix}", strict=False).netmask
+            # Static address, default route = the host's link end (where the broker listens);
+            # no DHCP, no DNS (names are resolved by the broker).
+            boot_args += f" ip={net.guest_ip}::{net.host_ip}:{mask}::eth0:off"
+            nics.append({"iface_id": "eth0", "host_dev_name": net.tap_name,
+                         "guest_mac": self._mac(net.guest_ip)})
         return {
+            "network-interfaces": nics,
             "boot-source": {
                 "kernel_image_path": self.settings.kernel_image_path,
-                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/aijailer-agent",
+                "boot_args": boot_args,
             },
             "drives": [{
                 "drive_id": "rootfs",
@@ -245,8 +267,10 @@ class FirecrackerEngine(MicroVMEngine):
         await api.configure(fc_config)
         await api.start()
         info = VMInfo(cell_id=config.cell_id, status=VMStatus.RUNNING, pid=pid,
+                      internal_ip=config.network.guest_ip if config.network else None,
                       vsock_path=fc_config["vsock"]["uds_path"])
-        self._vms[config.cell_id] = {"info": info, "api": api, "cid": cid, "dir": cell_dir}
+        self._vms[config.cell_id] = {"info": info, "api": api, "cid": cid, "dir": cell_dir,
+                                     "env": dict(config.environment or {})}
         return info
 
     def _vm(self, cell_id: uuid.UUID) -> dict:
@@ -320,7 +344,7 @@ class FirecrackerEngine(MicroVMEngine):
         if vm["info"].status != VMStatus.RUNNING:
             raise RuntimeError(f"cell is {vm['info'].status.value}, cannot exec")
         return await self._agent_call(vm["info"].vsock_path, self.settings.agent_vsock_port,
-                                      command, timeout, user)
+                                      command, timeout, user, env=vm["env"])
 
     async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
         vm = self._vms.get(cell_id)

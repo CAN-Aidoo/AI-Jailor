@@ -149,3 +149,41 @@ def test_simulated_refused_outside_dev():
     assert build_engine("simulated", "dev").isolation == "none"
     with pytest.raises(EngineUnavailable):
         build_engine("bogus", "dev")
+
+
+@pytest.mark.asyncio
+async def test_nic_and_static_ip_only_when_network_given(env):
+    from aijailer.engine.microvm import VMNetwork
+    tmp, _ = env
+    holder = {}
+    eng = await make_engine(tmp, holder)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    net = VMNetwork("ajtap0000001", "10.200.0.2", "10.200.0.1", 30)
+    await eng.create_vm(VMConfig(cell_id=a, image="base-python", network=net))
+    await eng.create_vm(VMConfig(cell_id=b, image="base-python"))  # no network -> no NIC at all
+    with_net = {c[1]: c[2] for c in holder[str(a)].calls}
+    assert with_net["/network-interfaces/eth0"]["host_dev_name"] == "ajtap0000001"
+    assert with_net["/network-interfaces/eth0"]["guest_mac"].startswith("02:")
+    assert "ip=10.200.0.2::10.200.0.1:255.255.255.252::eth0:off" in with_net["/boot-source"]["boot_args"]
+    assert not any(p.startswith("/network-interfaces") for _, p, _ in holder[str(b)].calls)
+    assert "ip=" not in {c[1]: c[2] for c in holder[str(b)].calls}["/boot-source"]["boot_args"]
+    assert (await eng.get_vm_info(a)).internal_ip == "10.200.0.2"
+
+
+@pytest.mark.asyncio
+async def test_exec_passes_cell_environment_to_agent(env):
+    tmp, _ = env
+    holder, seen = {}, {}
+    eng = await make_engine(tmp, holder)
+
+    async def fake_agent(uds, port, cmd, timeout, user, env=None):
+        seen["env"] = env
+        from aijailer.engine.microvm import ExecResult
+        return ExecResult(0, "", "", 1)
+
+    eng._agent_call = fake_agent
+    cid = uuid.uuid4()
+    await eng.create_vm(VMConfig(cell_id=cid, image="base-python",
+                                 environment={"http_proxy": "http://10.200.0.1:3128"}))
+    await eng.exec_command(cid, "true")
+    assert seen["env"] == {"http_proxy": "http://10.200.0.1:3128"}

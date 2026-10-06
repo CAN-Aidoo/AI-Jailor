@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     jailer_gid: int = Field(default=10000, alias="JAILER_GID")
     jailer_chroot_base: str = Field(default="/srv/jailer", alias="JAILER_CHROOT_BASE")
     agent_vsock_port: int = 5000
+    # auto: enforce iff the engine attaches a real NIC | required: refuse engines that can't
+    # be firewalled | off: never provision (only valid for engines with no network)
+    network_enforcement: str = Field(default="auto", alias="NETWORK_ENFORCEMENT")
+    cell_net_pool: str = Field(default="10.200.0.0/16", alias="CELL_NET_POOL")
+    broker_port: int = Field(default=3128, alias="BROKER_PORT")
     # off | observe (log containment tier) | enforce (block code the gate flags)
     execution_gate_mode: str = Field(default="observe", alias="EXECUTION_GATE_MODE")
 

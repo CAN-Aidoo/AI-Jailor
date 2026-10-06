@@ -322,3 +322,17 @@ prefix `aj*` so an unregistered or stale cell interface is **denied, never open*
 The broker listens per cell on `host_ip:broker_port` (`agentsec/proxy.py`); cell identity is the listener,
 not a source address. Cell-side config: static IP via kernel cmdline, `http_proxy=http://<host_ip>:<port>`.
 Verified with real packets in network namespaces (`tests/netpolicy/`).
+
+### Lifecycle (implemented in `CellService` + `netpolicy/cell_network.py`)
+
+| event | network action |
+|---|---|
+| create | firewall entry -> TAP + address + sysctl hardening -> per-cell proxy -> **then** boot VM with NIC, static `ip=` and `http_proxy` env. Any failure: undo in reverse, no VM is booted |
+| stop / destroy | revoke firewall -> stop proxy -> delete TAP -> release /30 (address stays reserved if a step failed) |
+| start (from stopped) | rebuild as for create |
+| pause / resume | unchanged (VM frozen, link kept) |
+| service start | install ruleset; refuse to start if it fails; watchdog verifies/repairs |
+
+`NETWORK_ENFORCEMENT=auto|required|off`: engines that attach a NIC (Firecracker) can never run with `off`.
+The simulated engine has no NIC and gets none. Egress comes from the cell's network policy
+(domains and single IPs over TCP; CIDR/UDP rules are skipped and reported, never widened).

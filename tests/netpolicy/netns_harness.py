@@ -246,4 +246,5 @@ print(buf.split(b"\\r\\n")[0].decode()+"|"+buf.split(b"\\r\\n\\r\\n",1)[-1].deco
     os._exit(0)
 
 
-main()
+if __name__ == "__main__":
+    main()
