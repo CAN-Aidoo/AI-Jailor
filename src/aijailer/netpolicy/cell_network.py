@@ -42,6 +42,7 @@ class LinkOps(Protocol):
     async def setup(self, cell: CellNet) -> LinkInfo | None: ...
     async def teardown(self, ifname: str) -> None: ...
     async def set_bandwidth(self, cell: CellNet, bw: Bandwidth) -> None: ...
+    async def get_bandwidth(self, cell: CellNet) -> Bandwidth: ...
 
 
 class NetnsLinkOps:
@@ -59,11 +60,14 @@ class NetnsLinkOps:
         await ateardown_link(ifname)
 
     async def set_bandwidth(self, cell: CellNet, bw: Bandwidth) -> None:
-        import asyncio
-
         from aijailer.netpolicy.link import netns_name
         from aijailer.netpolicy.shaping import apply_shaping
         await asyncio.to_thread(apply_shaping, cell.ifname, netns_name(cell), bw)
+
+    async def get_bandwidth(self, cell: CellNet) -> Bandwidth:
+        from aijailer.netpolicy.link import netns_name
+        from aijailer.netpolicy.shaping import read_shaping
+        return await asyncio.to_thread(read_shaping, cell.ifname, netns_name(cell))
 
 
 TapLinkOps = NetnsLinkOps  # backwards-compatible name
@@ -113,7 +117,8 @@ class LiveCell:
 
     tenant_id: uuid.UUID
     network_policy: dict | None = None
-    bandwidth_mbps: int | None = None
+    # The limits this cell must have, from the DB. None => leave shaping alone.
+    bandwidth: Bandwidth | None = None
 
 
 @dataclass
@@ -122,13 +127,15 @@ class SweepReport:
     adopted: list[uuid.UUID] = field(default_factory=list)
     stale_removed: list[uuid.UUID] = field(default_factory=list)
     orphans_removed: list[str] = field(default_factory=list)
+    shaping_repaired: list[uuid.UUID] = field(default_factory=list)  # kernel limits != DB
     broken: list[uuid.UUID] = field(default_factory=list)   # live per DB but network unusable
     errors: list[str] = field(default_factory=list)
     aborted: str | None = None
 
     @property
     def changed(self) -> bool:
-        return bool(self.adopted or self.stale_removed or self.orphans_removed or self.broken)
+        return bool(self.adopted or self.stale_removed or self.orphans_removed or self.broken
+                    or self.shaping_repaired)
 
 
 # Refuse to remove more than this many networks in one sweep when it is also more than half of
@@ -192,7 +199,7 @@ class CellNetwork:
                 # A cell never runs without its bandwidth limit: failure rolls everything back.
                 if bandwidth is not None:
                     await self._links.set_bandwidth(net, bandwidth)
-                    self._nets[cell_id] = net
+                self._nets[cell_id] = net
                 sink = (lambda ev, c=cell_id: self._audit(c, ev)) if self._audit else None
                 proxy = self._proxy_factory(str(cell_id), str(net.host_ip), net.broker_port,
                                             broker, audit=sink)
@@ -242,6 +249,14 @@ class CellNetwork:
             proxy.replace_broker(broker)
             n += 1
         return n
+
+    async def get_bandwidth(self, cell_id: uuid.UUID) -> Bandwidth | None:
+        """What the kernel is enforcing for this cell right now (None if no network)."""
+        async with self._lock:
+            net = self._nets.get(cell_id)
+            if net is None or cell_id not in self._proxies:
+                return None
+            return await self._links.get_bandwidth(net)
 
     async def set_bandwidth(self, cell_id: uuid.UUID, bandwidth: Bandwidth) -> None:
         """Hot-update a running cell's limits (resource limits are adjustable without restart)."""
@@ -385,6 +400,19 @@ class CellNetwork:
                 ipaddress.ip_network(f"{a[0]}/{a[1]}", strict=False)
                 for n, a in state.veths.items()
                 if a is not None and discovery.is_cell_name(n) and n not in gone | mine})
+            # Shaping drift: someone cleared/changed a qdisc, or a DB write succeeded after the
+            # kernel apply failed (or the reverse). The DB is the source of truth.
+            for cid in report.kept:
+                want = live[cid].bandwidth
+                net = self._nets.get(cid)
+                if want is None or net is None:
+                    continue
+                try:
+                    if await self._links.get_bandwidth(net) != want:
+                        await self._links.set_bandwidth(net, want)
+                        report.shaping_repaired.append(cid)
+                except Exception as exc:
+                    report.errors.append(f"shaping check {cid}: {exc}")
             # Eventual consistency for secret changes made while a node was unreachable.
             await self._refresh_locked(None, fail_closed=False)
             return report
@@ -408,8 +436,8 @@ class CellNetwork:
             broker, skipped = broker_from_policy(
                 lc.network_policy, await self._secrets.secrets_for(lc.tenant_id, cid),
                 self._resolver)
-            if lc.bandwidth_mbps:  # re-assert the limit: do not trust what survived
-                await self._links.set_bandwidth(net, Bandwidth.symmetric_mbps(lc.bandwidth_mbps))
+            if lc.bandwidth is not None:  # re-assert the limit: do not trust what survived
+                await self._links.set_bandwidth(net, lc.bandwidth)
             sink = (lambda ev, c=cid: self._audit(c, ev)) if self._audit else None
             proxy = self._proxy_factory(str(cid), str(net.host_ip), net.broker_port, broker,
                                         audit=sink)

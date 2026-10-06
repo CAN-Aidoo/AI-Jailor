@@ -22,6 +22,7 @@ from sqlalchemy import select
 
 from aijailer.models.cell import Cell
 from aijailer.netpolicy.cell_network import CellNetwork, LiveCell, SweepReport
+from aijailer.netpolicy.shaping import effective_bandwidth
 
 logger = structlog.get_logger(__name__)
 
@@ -53,10 +54,11 @@ class NetworkReconciler:
         async with self._sessions() as db:
             rows = await db.execute(select(
                 Cell.id, Cell.tenant_id, Cell.status, Cell.effective_policy,
-                Cell.network_bandwidth_mbps, Cell.updated_at))
-            for cid, tenant, status, policy, mbps, updated in rows:
+                Cell.network_bandwidth_mbps, Cell.updated_at, Cell.bandwidth_override))
+            for cid, tenant, status, policy, mbps, updated, override in rows:
                 if status in LIVE_STATUSES:
-                    live[cid] = LiveCell(tenant, (policy or {}).get("network"), mbps)
+                    live[cid] = LiveCell(tenant, (policy or {}).get("network"),
+                                         effective_bandwidth(mbps, override))
                 elif status in PROTECTED_STATUSES:
                     if updated is not None and updated.tzinfo is None:
                         updated = updated.replace(tzinfo=UTC)  # SQLite returns naive UTC

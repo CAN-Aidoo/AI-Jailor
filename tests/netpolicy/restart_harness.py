@@ -17,7 +17,7 @@ from aijailer.netpolicy import link  # noqa: E402
 from aijailer.netpolicy.cell_network import CellNetwork, LiveCell, NetnsLinkOps  # noqa: E402
 from aijailer.netpolicy.discovery import scan_host  # noqa: E402
 from aijailer.netpolicy.nft import NetAllocator, NetPolicyManager, ifname_for  # noqa: E402
-from aijailer.netpolicy.shaping import Bandwidth, read_shaping  # noqa: E402
+from aijailer.netpolicy.shaping import Bandwidth, apply_shaping, read_shaping  # noqa: E402
 
 PORT = 3128
 POOL = "10.95.0.0/24"
@@ -90,7 +90,8 @@ def main():
         give_guest_addr(nets[k])
     res["before_sweep_live1_probe"] = probe(nets["live1"], PORT)   # no proxy, no tuple
 
-    live = {ids["live1"]: LiveCell(tenant, POLICY, 8), ids["live2"]: LiveCell(tenant, POLICY, 4)}
+    live = {ids["live1"]: LiveCell(tenant, POLICY, Bandwidth(8000, 8000)),
+            ids["live2"]: LiveCell(tenant, POLICY, Bandwidth(4000, 4000))}
     rep = run(B.sweep(live, {ids["creating"]}, grace=120))
     res["adopted"] = sorted(str(c) for c in rep.adopted) == sorted(str(ids[k]) for k in ("live1", "live2"))
     res["orphans_removed"] = sorted(rep.orphans_removed) == sorted(
@@ -128,6 +129,20 @@ def main():
                        {ids["creating"]}, grace=120))
     res["second_sweep_noop"] = (not rep2.adopted and not rep2.orphans_removed
                                 and not rep2.broken and len(rep2.kept) == 2)
+
+    # ---- shaping drift: kernel limits cleared / DB value changed -> sweep restores the DB's ----
+    n2 = nets["live2"].ifname
+    apply_shaping(n2, n2, Bandwidth())                       # someone removes both qdiscs
+    res["live2_cleared"] = [read_shaping(n2, n2).down_kbit, read_shaping(n2, n2).up_kbit]
+    rep3 = run(B.sweep(live, {ids["creating"]}, grace=120))
+    res["drift_repaired"] = [str(c) for c in rep3.shaping_repaired] == [str(ids["live2"])]
+    res["drift_restored"] = [read_shaping(n2, n2).down_kbit, read_shaping(n2, n2).up_kbit]
+    live[ids["live1"]] = LiveCell(tenant, POLICY, Bandwidth(2000, 6000))   # API changed the DB
+    rep4 = run(B.sweep(live, {ids["creating"]}, grace=120))
+    n1 = nets["live1"].ifname
+    res["db_change_applied"] = ([str(c) for c in rep4.shaping_repaired] == [str(ids["live1"])]
+                                and [read_shaping(n1, n1).down_kbit,
+                                     read_shaping(n1, n1).up_kbit] == [2000, 6000])
 
     # ---- an adopted cell can be torn down by the new process ----
     errs = run(B.deprovision(ids["live1"]))

@@ -53,6 +53,15 @@ class Bandwidth:
         return cls(mbps * 1000, mbps * 1000)
 
 
+def effective_bandwidth(mbps: int | None, override: dict | None) -> Bandwidth:
+    """What a cell must be limited to: its per-direction override if one is set, otherwise the
+    symmetric default from ``network_bandwidth_mbps``. The override is stored as
+    ``{"down_kbit": int, "up_kbit": int}``."""
+    if override:
+        return Bandwidth(override.get("down_kbit"), override.get("up_kbit"))
+    return Bandwidth.symmetric_mbps(mbps)
+
+
 def tbf_params(kbit: int) -> dict:
     burst = max(MIN_BURST, int(kbit * 1000 / 8 * BURST_SECONDS))
     return {"rate": f"{kbit}kbit", "burst": burst, "latency": LATENCY}

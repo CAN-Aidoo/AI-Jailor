@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     default_memory_mb: int = 512
     default_disk_mb: int = 2048
     default_network_bandwidth_mbps: int = 100
+    # Hard ceiling for any cell's per-direction limit (create and change). "Unlimited" is not
+    # expressible: raise this instead (shaping supports up to 10000).
+    max_cell_bandwidth_mbps: int = Field(default=10000, alias="MAX_CELL_BANDWIDTH_MBPS", ge=1, le=10000)
 
     # CodeImmune: Secure Code Generation
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")

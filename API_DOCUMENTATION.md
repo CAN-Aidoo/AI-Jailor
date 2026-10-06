@@ -698,3 +698,20 @@ Inside a cell, send the placeholder instead of the secret, e.g. through the cell
 `hosts` are exact names, `*.suffix` (two or more labels after `*.`) or IPv4 literals; a secret is only ever sent to them.
 Changes apply to running cells immediately. Errors: 400 `invalid_secret`, 404 `secret_not_found`, 409 `secret_conflict`,
 429 `secret_limit` (100 per tenant), 503 `secret_store_unavailable` (no `SECRETS_MASTER_KEYS`).
+
+
+## Cell bandwidth (`/v1/cells/{id}/bandwidth`)
+
+```
+GET    /v1/cells/{id}/bandwidth   configured (database) and enforced (kernel read-back) limits
+PUT    /v1/cells/{id}/bandwidth   {"down_kbit": 4000, "up_kbit": 16000}   owner/admin
+DELETE /v1/cells/{id}/bandwidth   drop the override, back to resources.network_bandwidth_mbps   owner/admin
+```
+
+`down_kbit` is host -> guest, `up_kbit` is guest -> host. Both are required integers; `null` (unlimited) is rejected.
+Range: 64 kbit/s up to `MAX_CELL_BANDWIDTH_MBPS` (default 10000, also applied when creating a cell).
+Running/paused/ready cells are changed immediately; stopped cells keep the override for their next start;
+creating/stopping/destroying/destroyed/error cells return 409.
+Response: `{configured: {down_kbit, up_kbit}, source: "default"|"override", enforced: {...}|null, min_kbit, max_kbit}`
+(`enforced` is null when the cell currently has no network). Errors: 400 `invalid_bandwidth`, 404, 409 `invalid_state_transition`,
+502 `bandwidth_apply_failed` (nothing was persisted), 503 `cell_network_unavailable`.

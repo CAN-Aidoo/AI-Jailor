@@ -380,3 +380,8 @@ Safety: unreadable DB -> no changes; a sweep removing more than 5 networks **and
 (`aborted` in the report, logged); names not matching `^aj[0-9a-f]{12}$` are never touched, even if the scanner returns
 them; subnets of resources we cannot adopt stay reserved so a new cell can never share a /30 with them.
 After a restart the freshly installed ruleset has no tuples, so cells are cut off (fail closed) until the first sweep adopts them.
+
+Changing limits at runtime (`PUT /v1/cells/{id}/bandwidth`): applied to the kernel first, then persisted, so a failed apply
+never leaves the database claiming a limit the cell does not have. If the persist fails after a successful apply, or anyone
+alters the qdiscs by hand, the reconciler compares `read_shaping` with the database every sweep and restores the database's
+value (`shaping_repaired` in the sweep report). The database is the single source of truth.

@@ -28,6 +28,9 @@ class Cell(Base):
     memory_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
     disk_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=2048)
     network_bandwidth_mbps: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    # Per-direction override set via the API: {"down_kbit": int, "up_kbit": int}. NULL => use the
+    # symmetric network_bandwidth_mbps default.
+    bandwidth_override: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # Security
     security_policy_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)

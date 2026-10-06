@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from aijailer.models.cell import Cell
 from aijailer.models.tenant import Tenant
 from aijailer.netpolicy.cell_network import SweepReport
+from aijailer.netpolicy.shaping import Bandwidth
 from aijailer.netpolicy.reconciler import NetworkReconciler
 
 
@@ -52,7 +53,7 @@ async def test_status_classification_and_cell_details(world):
     assert protected == {ids["creating"], ids["stopping"], ids["destroying"]}
     assert grace == 77
     lc = live[ids["running"]]
-    assert lc.tenant_id == tenant.id and lc.bandwidth_mbps == 25
+    assert lc.tenant_id == tenant.id and lc.bandwidth == Bandwidth(25_000, 25_000)
     assert lc.network_policy == {"egress": [{"destinations": [{"domain": "a.test"}]}]}
     # stopped / destroyed / error cells are neither live nor protected -> must have no network
     for s in ("stopped", "destroyed", "error"):
@@ -138,6 +139,7 @@ async def test_runtime_starts_reconciler_inline_and_stops_it(world, monkeypatch)
         async def setup(self, cell): ...
         async def teardown(self, ifname): ...
         async def set_bandwidth(self, cell, bw): ...
+        async def get_bandwidth(self, cell): ...
 
     from aijailer.netpolicy import discovery
     sessions, ids, _ = world

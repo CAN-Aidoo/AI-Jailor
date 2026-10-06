@@ -71,6 +71,18 @@ class FakeCellNetwork:
         return Provisioned(net, link, "http://10.200.0.1:3128",
                            {"http_proxy": "http://10.200.0.1:3128"})
 
+    async def set_bandwidth(self, cell_id, bw):
+        self.log.append("net:set_bandwidth")
+        if cell_id not in self.live:
+            raise LookupError("no network")
+        if getattr(self, "fail_shape", False):
+            raise OSError("tbf boom")
+        self.actual = getattr(self, "actual", {})
+        self.actual[cell_id] = bw
+
+    async def get_bandwidth(self, cell_id):
+        return getattr(self, "actual", {}).get(cell_id)
+
     async def deprovision(self, cell_id):
         self.log.append("net:deprovision")
         self.live.discard(cell_id)

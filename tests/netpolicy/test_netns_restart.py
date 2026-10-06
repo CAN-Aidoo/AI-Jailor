@@ -58,3 +58,9 @@ def test_no_subnet_collisions_and_idempotent_sweeps(r):
 def test_adopted_cell_is_fully_manageable_and_nothing_leaks(r):
     assert r["adopted_teardown"] is True
     assert r["clean_exit"] is True
+
+
+def test_shaping_drift_is_detected_and_repaired_from_the_database(r):
+    assert r["live2_cleared"] == [None, None]          # the tamper really removed the limits
+    assert r["drift_repaired"] is True and r["drift_restored"] == [4000, 4000]
+    assert r["db_change_applied"] is True              # a bandwidth change made via the API sticks

@@ -23,13 +23,17 @@ class FakeNft:
 class FakeLinks:
     def __init__(self, fail_setup=False, fail_teardown=False, fail_shape=False):
         self.fail_setup, self.fail_teardown, self.up = fail_setup, fail_teardown, set()
-        self.fail_shape, self.shaped = fail_shape, []
+        self.fail_shape, self.shaped, self.actual = fail_shape, [], {}
 
     async def set_bandwidth(self, cell, bw):
         if self.fail_shape:
             raise OSError("tbf unsupported")
         LOG.append("shape")
         self.shaped.append((cell.cell_id, bw))
+        self.actual[cell.cell_id] = bw
+
+    async def get_bandwidth(self, cell):
+        return self.actual.get(cell.cell_id, Bandwidth())
 
     async def setup(self, cell):
         if self.fail_setup:
@@ -332,14 +336,14 @@ def mk_sweep(state_fn, pool="10.50.0.0/24", links=None, clock=None):
     return n, mgr, links
 
 
-LIVE = LiveCell(uuid.uuid4(), POLICY, 10)
+LIVE = LiveCell(uuid.uuid4(), POLICY, Bandwidth(10_000, 10_000))
 
 
 @pytest.mark.asyncio
 async def test_sweep_adopts_live_cell_after_restart():
     cid = uuid.uuid4()
     n, mgr, links = mk_sweep(lambda: host_state(cid))
-    rep = await n.sweep({cid: LiveCell(uuid.uuid4(), POLICY, 10)}, set())
+    rep = await n.sweep({cid: LiveCell(uuid.uuid4(), POLICY, Bandwidth(10_000, 10_000))}, set())
     assert rep.adopted == [cid] and rep.broken == [] and not rep.changed is False
     assert n.provisioned == {cid}
     net = mgr.cells[0]
@@ -596,3 +600,50 @@ async def test_sweep_refreshes_secrets_for_eventual_consistency():
     sec.by_tenant[t] = [SecretBinding("gh", "tok", ("api.github.com",))]
     await n.sweep({cid: LiveCell(t, POLICY, None)}, set())
     assert can_inject(FakeProxy.instances[0])
+
+
+# ----------------------------------------------------------------- shaping drift repair
+@pytest.mark.asyncio
+async def test_sweep_repairs_shaping_that_differs_from_the_database():
+    n, _, links = mk_sweep(lambda: host_state())
+    cid, t = uuid.uuid4(), uuid.uuid4()
+    await n.provision(cid, t, POLICY, Bandwidth(8000, 8000))
+    n._scan = lambda: host_state(cid)
+    want = Bandwidth(8000, 8000)
+    rep = await n.sweep({cid: LiveCell(t, POLICY, want)}, set())
+    assert rep.shaping_repaired == [] and rep.kept == [cid]          # in sync: no churn
+    links.actual[cid] = Bandwidth()                                   # someone cleared the qdiscs
+    rep = await n.sweep({cid: LiveCell(t, POLICY, want)}, set())
+    assert rep.shaping_repaired == [cid] and links.actual[cid] == want and rep.changed
+    new = Bandwidth(2000, 6000)                                       # DB says something new
+    rep = await n.sweep({cid: LiveCell(t, POLICY, new)}, set())
+    assert rep.shaping_repaired == [cid] and links.actual[cid] == new
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_shaping_alone_when_db_has_no_opinion_and_survives_errors():
+    n, _, links = mk_sweep(lambda: host_state())
+    cid, t = uuid.uuid4(), uuid.uuid4()
+    await n.provision(cid, t, POLICY, Bandwidth(8000, 8000))
+    n._scan = lambda: host_state(cid)
+    links.actual[cid] = Bandwidth(100, 100)
+    rep = await n.sweep({cid: LiveCell(t, POLICY, None)}, set())      # bandwidth=None
+    assert rep.shaping_repaired == [] and links.actual[cid] == Bandwidth(100, 100)
+
+    async def boom(cell):
+        raise OSError("netlink hiccup")
+    links.get_bandwidth = boom
+    rep = await n.sweep({cid: LiveCell(t, POLICY, Bandwidth(8000, 8000))}, set())
+    assert rep.shaping_repaired == [] and any("shaping check" in e for e in rep.errors)
+    assert rep.kept == [cid]                                          # the rest of the sweep ran
+
+
+@pytest.mark.asyncio
+async def test_network_get_bandwidth_reports_kernel_state_or_none():
+    n, _, links = mk_sweep(lambda: host_state())
+    cid = uuid.uuid4()
+    assert await n.get_bandwidth(cid) is None                         # no network
+    await n.provision(cid, uuid.uuid4(), POLICY, Bandwidth(3000, 4000))
+    assert await n.get_bandwidth(cid) == Bandwidth(3000, 4000)
+    links.actual[cid] = Bandwidth(1000, 1000)                         # kernel diverged
+    assert await n.get_bandwidth(cid) == Bandwidth(1000, 1000)        # reported as it IS
