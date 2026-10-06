@@ -71,7 +71,7 @@ r.link("set",index=i,state="up"); r.link("set",index=1,state="up")
 
 
 class Secrets:
-    def secrets_for(self, tenant_id, cell_id):
+    async def secrets_for(self, tenant_id, cell_id):
         return [SecretBinding("gh", SECRET, ("127.0.0.1",))]
 
 

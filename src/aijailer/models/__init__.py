@@ -13,3 +13,4 @@ from aijailer.models import security_certificate  # noqa: F401
 from aijailer.models import snapshot  # noqa: F401
 from aijailer.models import tenant  # noqa: F401
 from aijailer.models import webhook  # noqa: F401
+from aijailer.models import tenant_secret  # noqa: F401

@@ -115,6 +115,11 @@ class CellProxy:
         self._ct, self._idle, self._total = connect_timeout, idle_timeout, total_timeout
         self._server: asyncio.base_events.Server | None = None
 
+    def replace_broker(self, broker: EgressBroker) -> None:
+        """Atomically swap policy/secrets. Requests already past evaluation keep the old broker;
+        every later request sees the new one (this is how a revoked secret stops working)."""
+        self._broker = broker
+
     @property
     def port(self) -> int:
         return self._server.sockets[0].getsockname()[1] if self._server else self._port

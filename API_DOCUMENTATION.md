@@ -677,3 +677,24 @@ X-RateLimit-Reset: 1705312260
 | `rate_limited` | 429 | Too many requests |
 | `unauthorized` | 401 | Invalid or missing authentication |
 | `forbidden` | 403 | Insufficient permissions for this action |
+
+
+## Secrets (`/v1/secrets`)
+
+Write-only credentials the egress broker injects into outbound requests, so a cell never holds them.
+Roles: owner/admin write; owner/admin/auditor read metadata. Values are never returned.
+
+```
+POST   /v1/secrets        {"name":"gh","value":"ghp_...","hosts":["api.github.com"],"expires_at":null}
+GET    /v1/secrets        metadata list
+GET    /v1/secrets/{name} metadata
+PUT    /v1/secrets/{name} {"value":"..."} (rotate) and/or {"hosts":[...]} / {"expires_at":...} / {"clear_expiry":true}
+DELETE /v1/secrets/{name}
+```
+
+Response (`value` is never present): `name, version, hosts, expires_at, created_at, updated_at, rotated_at, placeholder`.
+Inside a cell, send the placeholder instead of the secret, e.g. through the cell's `http_proxy`:
+`GET http://api.github.com/user` with header `Authorization: Bearer {{secret:gh}}`.
+`hosts` are exact names, `*.suffix` (two or more labels after `*.`) or IPv4 literals; a secret is only ever sent to them.
+Changes apply to running cells immediately. Errors: 400 `invalid_secret`, 404 `secret_not_found`, 409 `secret_conflict`,
+429 `secret_limit` (100 per tenant), 503 `secret_store_unavailable` (no `SECRETS_MASTER_KEYS`).

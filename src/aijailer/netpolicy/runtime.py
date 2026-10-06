@@ -47,12 +47,20 @@ def network_required(engine) -> bool:
     return False
 
 
+def peek_cell_network() -> CellNetwork | None:
+    """The singleton if it exists; never creates it (used by change hooks)."""
+    return _network
+
+
 def get_cell_network() -> CellNetwork:
     global _network
     if _network is None:
+        from aijailer.db.base import async_session_factory
+        from aijailer.secretstore.runtime import DbSecretProvider
         s = get_settings()
         mgr = NetPolicyManager(allocator=NetAllocator(s.cell_net_pool), broker_port=s.broker_port)
-        _network = CellNetwork(mgr, NetnsLinkOps(s.jailer_uid, s.jailer_gid), audit=_audit_sink)
+        _network = CellNetwork(mgr, NetnsLinkOps(s.jailer_uid, s.jailer_gid), audit=_audit_sink,
+                               secrets=DbSecretProvider(async_session_factory))
     return _network
 
 

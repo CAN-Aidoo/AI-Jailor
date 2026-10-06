@@ -44,6 +44,7 @@ class SecretBinding:
     name: str
     value: str
     hosts: tuple                    # hosts allowed to receive this secret
+    not_after: float | None = None  # epoch seconds; the broker refuses to use it afterwards
 
 
 @dataclass
@@ -85,6 +86,10 @@ class EgressBroker:
     def _default_resolver(host: str) -> list[str]:
         import socket
         return sorted({ai[4][0] for ai in socket.getaddrinfo(host, None)})
+
+    def _now(self) -> float:
+        import time
+        return time.time()
 
     def secret_value(self, name: str) -> str | None:
         """For response redaction only; never returned to callers outside the broker."""
@@ -141,6 +146,8 @@ class EgressBroker:
                 sec = self._secrets.get(m.group(1))
                 if sec is None:
                     raise FlowViolation(f"unknown secret '{m.group(1)}'")
+                if sec.not_after is not None and self._now() >= sec.not_after:
+                    raise FlowViolation(f"secret '{sec.name}' has expired")
                 if not any(EgressRule(h).matches(_host, 443, "GET") or h == _host
                            for h in sec.hosts):
                     raise FlowViolation(f"secret '{sec.name}' is not bound to {_host}")

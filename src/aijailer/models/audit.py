@@ -15,6 +15,7 @@ class EventType(str, Enum):
     POLICY_VIOLATION = "policy_violation"
     API_CALL = "api_call"
     RESOURCE_ALERT = "resource_alert"
+    SECRET = "secret"
 
 
 class Severity(str, Enum):

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -18,6 +19,7 @@ from aijailer.api.routes import (
     cells,
     execution,
     policies,
+    secrets as secrets_route,
     audit,
     files,
     snapshots,
@@ -118,6 +120,15 @@ def create_app() -> FastAPI:
     )
 
     # --- Exception handlers ---
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        """Same shape as FastAPI's default 422, minus ``input``/``ctx``: pydantic reports the
+        WHOLE request body for a missing field, which would echo secrets (secret values, cell
+        environment variables) into responses, proxies and error trackers."""
+        errors = [{"type": e.get("type"), "loc": list(e.get("loc", [])), "msg": e.get("msg")}
+                  for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": errors})
+
     @app.exception_handler(AiJailerError)
     async def aijailer_error_handler(request: Request, exc: AiJailerError):
         status_map = {
@@ -136,6 +147,11 @@ def create_app() -> FastAPI:
             "unauthorized": 401,
             "forbidden": 403,
             "invalid_policy": 400,
+            "secret_not_found": 404,
+            "secret_conflict": 409,
+            "secret_limit": 429,
+            "invalid_secret": 400,
+            "secret_store_unavailable": 503,
             "internal_error": 500,
         }
         status_code = status_map.get(exc.code, 500)
@@ -214,6 +230,7 @@ def create_app() -> FastAPI:
     app.include_router(cells.router)
     app.include_router(execution.router)
     app.include_router(policies.router)
+    app.include_router(secrets_route.router)
     app.include_router(audit.router)
     app.include_router(files.router)
     app.include_router(snapshots.router)

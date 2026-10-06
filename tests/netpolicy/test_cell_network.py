@@ -52,6 +52,9 @@ class FakeProxy:
         self.started = self.stopped = False
         FakeProxy.instances.append(self)
 
+    def replace_broker(self, broker):
+        self.broker = broker
+
     async def start(self):
         if getattr(FakeProxy, "fail_start", False):
             raise OSError("bind failed")
@@ -498,3 +501,98 @@ def test_allocator_external_blocks_both_fresh_and_released_slots():
     assert a.allocate(c2) != s1
     a.set_external([])
     assert a.allocate(uuid.uuid4()) == s1
+
+
+# ----------------------------------------------------------------- secret refresh
+from aijailer.agentsec.egress import SecretBinding  # noqa: E402
+
+
+class DictSecrets:
+    def __init__(self):
+        self.by_tenant, self.fail = {}, False
+
+    async def secrets_for(self, tenant_id, cell_id):
+        if self.fail:
+            raise ConnectionError("db down")
+        return list(self.by_tenant.get(tenant_id, []))
+
+
+def mk_secret_net():
+    sec = DictSecrets()
+    mgr = NetPolicyManager(runner=FakeNft(), allocator=NetAllocator("10.60.0.0/24"))
+    return CellNetwork(mgr, FakeLinks(), secrets=sec, proxy_factory=FakeProxy), sec
+
+
+def can_inject(proxy, name="gh", host="api.github.com"):
+    from aijailer.agentsec.egress import EgressRequest
+    proxy.broker._resolver = lambda h: ["140.82.112.5"]
+    return proxy.broker.evaluate(EgressRequest(
+        "GET", host, 443, "/", {"Authorization": "{{secret:%s}}" % name})).allowed
+
+
+@pytest.mark.asyncio
+async def test_provisioning_uses_the_tenants_secrets():
+    n, sec = mk_secret_net()
+    t1, t2 = uuid.uuid4(), uuid.uuid4()
+    sec.by_tenant[t1] = [SecretBinding("gh", "tok1", ("api.github.com",))]
+    await n.provision(uuid.uuid4(), t1, POLICY)
+    await n.provision(uuid.uuid4(), t2, POLICY)
+    a, b = FakeProxy.instances
+    assert can_inject(a) and not can_inject(b)            # tenant isolation at the broker
+
+
+@pytest.mark.asyncio
+async def test_rotation_and_revocation_reach_running_cells():
+    n, sec = mk_secret_net()
+    t = uuid.uuid4()
+    await n.provision(uuid.uuid4(), t, POLICY)
+    p = FakeProxy.instances[0]
+    assert not can_inject(p)
+    sec.by_tenant[t] = [SecretBinding("gh", "tok", ("api.github.com",))]
+    assert await n.refresh_secrets(t) == 1 and can_inject(p)      # created -> usable at once
+    sec.by_tenant[t] = []
+    await n.refresh_secrets(t)
+    assert not can_inject(p)                                       # revoked -> unusable at once
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_scoped_to_the_tenant():
+    n, sec = mk_secret_net()
+    t1, t2 = uuid.uuid4(), uuid.uuid4()
+    await n.provision(uuid.uuid4(), t1, POLICY)
+    await n.provision(uuid.uuid4(), t2, POLICY)
+    sec.by_tenant[t1] = [SecretBinding("gh", "x", ("api.github.com",))]
+    sec.by_tenant[t2] = [SecretBinding("gh", "y", ("api.github.com",))]
+    assert await n.refresh_secrets(t1) == 1
+    a, b = FakeProxy.instances
+    assert can_inject(a) and not can_inject(b)
+
+
+@pytest.mark.asyncio
+async def test_store_outage_fails_closed_on_change_but_keeps_state_on_periodic_refresh():
+    n, sec = mk_secret_net()
+    t = uuid.uuid4()
+    sec.by_tenant[t] = [SecretBinding("gh", "tok", ("api.github.com",))]
+    await n.provision(uuid.uuid4(), t, POLICY)
+    p = FakeProxy.instances[0]
+    assert can_inject(p)
+    sec.fail = True
+    await n.refresh_secrets(None, fail_closed=False)               # periodic: outage tolerated
+    assert can_inject(p)
+    await n.refresh_secrets(t, fail_closed=True)                   # change-triggered: no stale secret
+    assert not can_inject(p)
+    sec.fail = False
+    await n.refresh_secrets(t)                                     # recovers
+    assert can_inject(p)
+
+
+@pytest.mark.asyncio
+async def test_sweep_refreshes_secrets_for_eventual_consistency():
+    n, sec = mk_secret_net()
+    t = uuid.uuid4()
+    cid = uuid.uuid4()
+    await n.provision(cid, t, POLICY)
+    n._scan = lambda: host_state(cid)
+    sec.by_tenant[t] = [SecretBinding("gh", "tok", ("api.github.com",))]
+    await n.sweep({cid: LiveCell(t, POLICY, None)}, set())
+    assert can_inject(FakeProxy.instances[0])

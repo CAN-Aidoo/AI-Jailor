@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # Security
     api_key_header: str = "Authorization"
     jwt_secret: str = Field(default="change-me-in-production", alias="JWT_SECRET")
+    # Tenant secret store: "id:base64key[,id2:base64key2]" (32 raw bytes each). Unset => the secret
+    # store is DISABLED (API returns 503, brokers get no secrets); there is no insecure default.
+    secrets_master_keys: str = Field(default="", alias="SECRETS_MASTER_KEYS")
+    secrets_primary_key_id: str = Field(default="", alias="SECRETS_PRIMARY_KEY_ID")
     attestation_key: str = Field(default="", alias="ATTESTATION_KEY")
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 60

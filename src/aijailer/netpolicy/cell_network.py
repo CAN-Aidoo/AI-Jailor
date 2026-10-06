@@ -30,11 +30,11 @@ logger = structlog.get_logger(__name__)
 
 
 class SecretProvider(Protocol):
-    def secrets_for(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> list[SecretBinding]: ...
+    async def secrets_for(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> list[SecretBinding]: ...
 
 
 class NoSecrets:
-    def secrets_for(self, tenant_id, cell_id) -> list[SecretBinding]:
+    async def secrets_for(self, tenant_id, cell_id) -> list[SecretBinding]:
         return []
 
 
@@ -164,6 +164,7 @@ class CellNetwork:
         self._tenants: dict[uuid.UUID, uuid.UUID] = {}
         self._links_up: set[uuid.UUID] = set()
         self._nets: dict[uuid.UUID, CellNet] = {}
+        self._policies: dict[uuid.UUID, dict | None] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -181,7 +182,8 @@ class CellNetwork:
             if cell_id in self._proxies:
                 raise RuntimeError(f"network for cell {cell_id} already provisioned")
             broker, skipped = broker_from_policy(
-                network_policy, self._secrets.secrets_for(tenant_id, cell_id), self._resolver)
+                network_policy, await self._secrets.secrets_for(tenant_id, cell_id),
+                self._resolver)
             net = None
             try:
                 net = await self._mgr.register(cell_id)
@@ -200,6 +202,7 @@ class CellNetwork:
                 raise
             self._proxies[cell_id] = proxy
             self._tenants[cell_id] = tenant_id
+            self._policies[cell_id] = network_policy
             self._since[cell_id] = self._clock()
             url = f"http://{net.host_ip}:{net.broker_port}"
             logger.info("cell.network.provisioned", cell_id=str(cell_id), ifname=net.ifname,
@@ -207,6 +210,38 @@ class CellNetwork:
             env = {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
                    "NO_PROXY": ""}
             return Provisioned(net, link, url, env, skipped)
+
+    async def refresh_secrets(self, tenant_id: uuid.UUID | None = None,
+                              fail_closed: bool = False) -> int:
+        """Rebuild running cells' brokers from the current secret store (all cells, or one
+        tenant's). Called on every secret write so a rotation or revocation takes effect for
+        requests that start after this returns.
+
+        ``fail_closed``: if the store cannot be read, install a broker with NO secrets rather than
+        keep serving a possibly-revoked one (used for change-triggered refreshes). Periodic
+        refreshes keep the existing broker on failure so an outage does not break every cell.
+        Returns the number of cells updated."""
+        async with self._lock:
+            return await self._refresh_locked(tenant_id, fail_closed)
+
+    async def _refresh_locked(self, tenant_id: uuid.UUID | None, fail_closed: bool) -> int:
+        n = 0
+        for cid, proxy in list(self._proxies.items()):
+            tid = self._tenants.get(cid)
+            if tid is None or (tenant_id is not None and tid != tenant_id):
+                continue
+            try:
+                secrets = await self._secrets.secrets_for(tid, cid)
+            except Exception as exc:
+                logger.error("cell.network.secret_refresh_failed", cell_id=str(cid),
+                             error=str(exc), fail_closed=fail_closed)
+                if not fail_closed:
+                    continue
+                secrets = []
+            broker, _ = broker_from_policy(self._policies.get(cid), secrets, self._resolver)
+            proxy.replace_broker(broker)
+            n += 1
+        return n
 
     async def set_bandwidth(self, cell_id: uuid.UUID, bandwidth: Bandwidth) -> None:
         """Hot-update a running cell's limits (resource limits are adjustable without restart)."""
@@ -257,6 +292,7 @@ class CellNetwork:
         self._tenants.pop(cell_id, None)
         self._nets.pop(cell_id, None)
         self._since.pop(cell_id, None)
+        self._policies.pop(cell_id, None)
         return errors
 
     async def reconcile(self, live_cells: set[uuid.UUID]) -> list[uuid.UUID]:
@@ -349,6 +385,8 @@ class CellNetwork:
                 ipaddress.ip_network(f"{a[0]}/{a[1]}", strict=False)
                 for n, a in state.veths.items()
                 if a is not None and discovery.is_cell_name(n) and n not in gone | mine})
+            # Eventual consistency for secret changes made while a node was unreachable.
+            await self._refresh_locked(None, fail_closed=False)
             return report
 
     async def _adopt(self, cid: uuid.UUID, lc: LiveCell, state: discovery.HostNetState,
@@ -368,7 +406,8 @@ class CellNetwork:
             await self._mgr.adopt(net)
             self._links_up.add(cid)
             broker, skipped = broker_from_policy(
-                lc.network_policy, self._secrets.secrets_for(lc.tenant_id, cid), self._resolver)
+                lc.network_policy, await self._secrets.secrets_for(lc.tenant_id, cid),
+                self._resolver)
             if lc.bandwidth_mbps:  # re-assert the limit: do not trust what survived
                 await self._links.set_bandwidth(net, Bandwidth.symmetric_mbps(lc.bandwidth_mbps))
             sink = (lambda ev, c=cid: self._audit(c, ev)) if self._audit else None
@@ -389,6 +428,7 @@ class CellNetwork:
             return
         self._proxies[cid] = proxy
         self._tenants[cid] = lc.tenant_id
+        self._policies[cid] = lc.network_policy
         self._nets[cid] = net
         self._since[cid] = self._clock()
         report.adopted.append(cid)
