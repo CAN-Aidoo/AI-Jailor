@@ -20,7 +20,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from aijailer.agentsec.flow import FlowViolation, Label, Labeled, combine_all
+from aijailer.agentsec.flow import FlowViolation, Label, combine_all
 
 _PLACEHOLDER = re.compile(r"\{\{secret:([A-Za-z0-9_.-]+)\}\}")
 _METADATA_HOSTS = {"metadata.google.internal", "metadata", "instance-data"}
@@ -30,7 +30,7 @@ _METADATA_HOSTS = {"metadata.google.internal", "metadata", "instance-data"}
 class EgressRule:
     host: str                       # "api.github.com" or "*.github.com"
     ports: tuple = (443,)
-    methods: tuple = ("GET", "POST", "PUT", "PATCH", "DELETE")
+    methods: tuple = ("GET", "POST", "PUT", "PATCH", "DELETE", "CONNECT")
 
     def matches(self, host: str, port: int, method: str) -> bool:
         h = host.lower().rstrip(".")
@@ -85,6 +85,11 @@ class EgressBroker:
     def _default_resolver(host: str) -> list[str]:
         import socket
         return sorted({ai[4][0] for ai in socket.getaddrinfo(host, None)})
+
+    def secret_value(self, name: str) -> str | None:
+        """For response redaction only; never returned to callers outside the broker."""
+        sec = self._secrets.get(name)
+        return sec.value if sec else None
 
     def _ip_permitted(self, ip: ipaddress._BaseAddress) -> bool:
         if any(ip in net for net in self._allow_private):

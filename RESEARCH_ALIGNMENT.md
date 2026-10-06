@@ -46,6 +46,7 @@ only into the parts nobody else covers.
 | Constraint engine | Z3 path now reports *every* violated rule by name via iterated unsat cores (was a generic "z3_unsat"). |
 | Engine | Real Firecracker API client, per-cell rootfs copy (base never writable), unique vsock CIDs, jailer argv (non-root, cgroup v2, PID ns), vsock agent protocol, pause/resume/snapshot. Verified against a fake Firecracker API and agent; **not yet exercised on a real KVM host.** |
 | Agent security | Flow labels + egress broker (new). |
+| Network enforcement | `netpolicy/` + `agentsec/proxy.py`: a cell's only link is a /30 TAP to the host; nftables (static ruleset, per-cell set elements, atomic) accepts exactly `(iface, guest_ip, host_ip, broker_port)` and drops everything else, forwards nothing to/from cells, and blocks host-initiated connections into cells. Per-cell proxy bound to the cell's link address: CONNECT allowlist, or plaintext-to-broker with broker-originated TLS, credential injection and response redaction. Drift watchdog. **Verified with real packets** in network namespaces (veth + nftables): broker reachable; other host ports, internet (even with `ip_forward=1`), spoofed source, cell-to-cell, host-to-cell all blocked; unregister revokes access; end-to-end credential injection never exposes the secret to the cell or the audit log. |
 | Guest agent | `guest-agent/` (Go, static, PID 1): framed-JSON vsock protocol (exec/ping/put_file/get_file), uid drop + no_new_privs, process-group kill, orphan reaping, output/frame caps, symlink-safe files; Go tests (race detector) + Python end-to-end tests. |
 | Gate | `EXECUTION_GATE_MODE=off|observe|enforce` wired into `execute_script`. |
 | Audit | Full-field hashing + signed checkpoints. |
@@ -53,8 +54,8 @@ only into the parts nobody else covers.
 ## Known gaps / next (ordered)
 
 1. **Run the Firecracker path on a KVM host** (needs guest kernel, rootfs with `guest-agent/` installed, TAP + nftables). Highest risk item: the guest agent is now written and tested end-to-end against the Python host client over a Firecracker-style vsock proxy, but nothing has run inside a real microVM.
-2. Wire the egress broker into the data plane (nftables DROP-all except the broker's
-   per-cell proxy address) so the allowlist is enforced by the host, not by code in the cell.
+2. ~~Wire the egress broker into the data plane~~ — done (`netpolicy/`). Remaining: call `asetup_link`/`NetPolicyManager.register`/`CellProxy.start` from the cell lifecycle (`cell_service`), attach the TAP to Firecracker's jailer netns, `tc` bandwidth shaping, and a per-cell guest `ip=` kernel cmdline + HTTP proxy env (`http_proxy=http://<host_ip>:<port>`).
+   Known limits: a `nft flush ruleset` by another host tool removes filtering until the watchdog's next tick (mitigated structurally: no forwarding, no default route, proxy bound only to the cell link IP; host services bound to 0.0.0.0 are the exposed surface in that window); IPv6 rule path not exercised on this kernel (no IPv6) but is default-denied by construction.
 3. Cedar policy backend for tool/egress rules; Sigstore (keyless) signer; checkpoint
    publication to an external append-only store.
 4. `agent-sandbox` (K8s) engine backend; gVisor tier for lower-risk tenants.

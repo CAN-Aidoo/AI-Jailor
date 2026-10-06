@@ -306,3 +306,19 @@ Heuristic-based detection for:
 - **Beacon behavior**: Periodic connections to the same destination at regular intervals (potential C2 communication).
 
 Anomalies are logged as audit events with severity "warning" and optionally trigger webhook notifications.
+
+## Host enforcement (implemented): `src/aijailer/netpolicy/`
+
+Per cell: one TAP, one /30 (host `.1`, guest `.2`), no default route, no host forwarding.
+Static nftables table `inet aijailer` (hooks at priority -100), filtering by interface-name
+prefix `aj*` so an unregistered or stale cell interface is **denied, never open**:
+
+| hook | rule |
+|---|---|
+| input from `aj*` | accept only `(iface, guest_ip, host_ip, broker_port)` (rate-limited `ct new`); everything else counted + rate-limited log + drop (spoofed source, IPv6, ICMP, UDP, every other host service) |
+| forward | drop anything from or to `aj*` (no internet, no cell-to-cell, no inbound) |
+| output | drop NEW connections from the host into `aj*` |
+
+The broker listens per cell on `host_ip:broker_port` (`agentsec/proxy.py`); cell identity is the listener,
+not a source address. Cell-side config: static IP via kernel cmdline, `http_proxy=http://<host_ip>:<port>`.
+Verified with real packets in network namespaces (`tests/netpolicy/`).
