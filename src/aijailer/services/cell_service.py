@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aijailer.core.config import get_settings
 from aijailer.core.exceptions import (
     AiJailerError,
+    PolicyNotFoundError,
     CellLimitExceededError,
     CellNotFoundError,
     CellNotRunningError,
@@ -23,6 +24,7 @@ from aijailer.core.exceptions import (
 from aijailer.engine.microvm import VMConfig, VMNetwork, get_microvm_engine
 from aijailer.models.audit import EventType, Severity
 from aijailer.models.cell import Cell
+from aijailer.models.policy import SecurityPolicy
 from aijailer.models.tenant import Tenant
 from aijailer.netpolicy.shaping import MIN_KBIT, Bandwidth, effective_bandwidth
 from aijailer.netpolicy.runtime import get_cell_network, network_required, remember_tenant
@@ -94,6 +96,22 @@ class CellService:
         if errors:
             logger.error("cell.network.teardown_incomplete", cell_id=str(cell_id), errors=errors)
 
+    async def _effective_policy(self, tenant_id: uuid.UUID, policy_id: uuid.UUID) -> dict | None:
+        """Compile the cell's security policy once, at creation (cells keep that version).
+
+        No policy => None => the broker has no egress rules => default deny. A policy that was
+        asked for but is missing, archived/deprecated, or belongs to another tenant is an error,
+        never silently ignored. (The API passes the tenant id as the 'no policy chosen' marker.)"""
+        policy = await self.db.get(SecurityPolicy, policy_id)
+        usable = (policy is not None and policy.status == "active"
+                  and policy.tenant_id in (tenant_id, None))      # None = platform-wide policy
+        if usable:
+            from aijailer.services.policy_service import PolicyService
+            return PolicyService(self.db).compile_policy(policy)
+        if policy_id == tenant_id:
+            return None
+        raise PolicyNotFoundError(str(policy_id))
+
     async def create_cell(
         self,
         tenant_id: uuid.UUID,
@@ -138,8 +156,10 @@ class CellService:
         if active_count >= tenant.max_concurrent_cells:
             raise CellLimitExceededError(str(tenant_id), tenant.max_concurrent_cells)
 
+        effective_policy = await self._effective_policy(tenant_id, security_policy_id)
         cell = Cell(
             tenant_id=tenant_id,
+            effective_policy=effective_policy,
             name=name,
             image=image,
             vcpus=vcpus,

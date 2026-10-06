@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     # unless environment == "dev".
     environment: str = Field(default="dev", alias="AIJAILER_ENV")
     engine_backend: str = Field(default="simulated", alias="ENGINE_BACKEND")
+    # cgroup v2 limits (cpu/memory) for each VMM. Disabling is refused outside AIJAILER_ENV=dev.
+    jailer_use_cgroups: bool = Field(default=True, alias="JAILER_USE_CGROUPS")
     jailer_binary: str = Field(default="/usr/bin/jailer", alias="JAILER_BINARY")
     jailer_uid: int = Field(default=10000, alias="JAILER_UID")
     jailer_gid: int = Field(default=10000, alias="JAILER_GID")

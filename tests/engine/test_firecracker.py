@@ -47,25 +47,36 @@ def env(monkeypatch):
     import tempfile
 
     tmp_path = pathlib.Path(tempfile.mkdtemp(prefix="fc"))
-    s = Settings(CELL_DATA_DIR=str(tmp_path / "cells"), ROOTFS_DIR=str(tmp_path / "rootfs"))
+    s = Settings(ROOTFS_DIR=str(tmp_path / "rootfs"), JAILER_CHROOT_BASE=str(tmp_path / "jail"),
+                 KERNEL_IMAGE_PATH=str(tmp_path / "vmlinux"))
     monkeypatch.setattr(fc, "get_settings", lambda: s)
     (tmp_path / "rootfs").mkdir()
     (tmp_path / "rootfs" / "base-python.ext4").write_bytes(b"BASE")
+    (tmp_path / "vmlinux").write_bytes(b"KERNEL")
     (tmp_path / "kvm").write_text("")
     yield tmp_path, s
     shutil.rmtree(tmp_path, ignore_errors=True)
 
 
-async def make_engine(tmp, fake_holder):
-    async def spawner(argv):
+def jail_root(tmp, cell):
+    # what the real jailer builds: <chroot base>/<exec file name>/<id>/root
+    return os.path.join(str(tmp), "jail", "firecracker", cell, "root")
+
+
+async def make_engine(tmp, fake_holder, pid=0):
+    async def spawner(argv, log_path):
         cell = argv[argv.index("--id") + 1]
-        sock = os.path.join(str(tmp), "cells", cell, "api.sock")
-        fake = FakeFirecracker(sock)
+        root = jail_root(tmp, cell)
+        assert os.path.isdir(root)                        # engine prepared the jail first
+        fake = FakeFirecracker(os.path.join(root, "api.sock"))
         await fake.start()
+        with open(os.path.join(root, "firecracker.pid"), "w") as f:   # jailer writes the VMM pid
+            f.write(str(pid))
         fake_holder[cell] = fake
         return 0
 
-    return fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"))
+    return fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"),
+                                chown=lambda *a: None)
 
 
 @pytest.mark.asyncio
@@ -88,7 +99,9 @@ async def test_create_configures_via_api_with_isolated_rootfs_and_unique_cid(env
     paths = [c[1] for c in calls]
     assert paths == ["/boot-source", "/drives/rootfs", "/machine-config", "/vsock", "/actions"]
     drive = calls[1][2]
-    assert drive["path_on_host"].endswith(f"{a}/rootfs.ext4") and "base-python" not in drive["path_on_host"]
+    assert drive["path_on_host"] == "rootfs.ext4"           # jail-relative, never a host path
+    assert calls[0][2]["kernel_image_path"] == "vmlinux"
+    assert calls[3][2]["uds_path"] == "vsock.sock"
     assert (tmp / "rootfs" / "base-python.ext4").read_bytes() == b"BASE"  # base untouched
     cids = {holder[str(x)].calls[3][2]["guest_cid"] for x in (a, b)}
     assert len(cids) == 2 and min(cids) >= 3
@@ -106,11 +119,18 @@ async def test_pause_resume_snapshot_calls(env):
     await eng.pause_vm(cid)
     assert (await eng.get_vm_info(cid)).status == VMStatus.PAUSED
     await eng.resume_vm(cid)
+    root = jail_root(tmp, str(cid))
+    # the real VMM writes snapshot files into its jail; emulate that, the engine must move them out
+    for name in ("vm.snap", "vm.mem"):
+        open(os.path.join(root, name), "wb").write(name.encode())
     out = await eng.snapshot_vm(cid, str(tmp / "snap"))
     calls = [c[:2] for c in holder[str(cid)].calls[5:]]
     assert calls == [("PATCH", "/vm"), ("PATCH", "/vm"), ("PATCH", "/vm"),
                      ("PUT", "/snapshot/create"), ("PATCH", "/vm")]
-    assert os.path.exists(out["disk"])
+    assert holder[str(cid)].calls[8][2] == {
+        "snapshot_type": "Full", "snapshot_path": "vm.snap", "mem_file_path": "vm.mem"}
+    assert open(out["state"], "rb").read() == b"vm.snap" and os.path.exists(out["disk"])
+    assert not os.path.exists(os.path.join(root, "vm.snap"))       # moved, not copied
 
 
 @pytest.mark.asyncio
@@ -214,15 +234,145 @@ async def test_create_passes_netns_to_jailer(env):
     tmp, _ = env
     argvs = []
 
-    async def spawner(argv):
+    async def spawner(argv, log_path):
         argvs.append(argv)
         cell = argv[argv.index("--id") + 1]
-        fake = FakeFirecracker(os.path.join(str(tmp), "cells", cell, "api.sock"))
+        fake = FakeFirecracker(os.path.join(jail_root(tmp, cell), "api.sock"))
         await fake.start()
         return 0
 
-    eng = fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"))
+    eng = fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"), chown=lambda *a: None)
     await eng.create_vm(VMConfig(cell_id=uuid.uuid4(), image="base-python",
                                  network=VMNetwork("tap0", "10.200.0.2", "10.200.0.1", 30,
                                                    "/run/netns/ajcell1")))
     assert argvs[0][argvs[0].index("--netns") + 1] == "/run/netns/ajcell1"
+
+
+# ------------------------------------------------------------- real-jailer layout contract
+@pytest.mark.asyncio
+async def test_files_are_placed_in_the_jail_before_the_jailer_starts(env):
+    tmp, s = env
+    seen = {}
+
+    async def spawner(argv, log_path):
+        cell = argv[argv.index("--id") + 1]
+        root = jail_root(tmp, cell)
+        seen["files"] = sorted(os.listdir(root))                    # state at jailer start
+        seen["disk"] = open(os.path.join(root, "rootfs.ext4"), "rb").read()
+        seen["kernel"] = open(os.path.join(root, "vmlinux"), "rb").read()
+        seen["disk_mode"] = os.stat(os.path.join(root, "rootfs.ext4")).st_mode & 0o777
+        fake = FakeFirecracker(os.path.join(root, "api.sock"))
+        await fake.start()
+        return 0
+
+    chowned = []
+    eng = fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"),
+                               chown=lambda *a: chowned.append(a))
+    await eng.create_vm(VMConfig(cell_id=uuid.uuid4(), image="base-python"))
+    assert seen["files"] == ["rootfs.ext4", "vmlinux"]
+    assert seen["disk"] == b"BASE" and seen["kernel"] == b"KERNEL" and seen["disk_mode"] == 0o600
+    assert chowned and chowned[0][1:] == (s.jailer_uid, s.jailer_gid)   # VMM user owns its disk
+    assert (tmp / "rootfs" / "base-python.ext4").read_bytes() == b"BASE"
+
+
+@pytest.mark.asyncio
+async def test_destroy_kills_the_vmm_by_pidfile_and_removes_the_whole_jail(env):
+    import subprocess
+    tmp, _ = env
+    victim = subprocess.Popen(["sleep", "60"])                      # stands in for the VMM
+    holder = {}
+    eng = await make_engine(tmp, holder, pid=victim.pid)
+    cid = uuid.uuid4()
+    info = await eng.create_vm(VMConfig(cell_id=cid, image="base-python"))
+    assert info.pid == victim.pid                                   # pidfile, not the jailer's pid
+    assert info.vsock_path == os.path.join(jail_root(tmp, str(cid)), "vsock.sock")
+    await eng.destroy_vm(cid)
+    assert victim.wait(timeout=5) == -9
+    assert not os.path.exists(os.path.dirname(jail_root(tmp, str(cid))))     # jail dir gone
+    await eng.destroy_vm(cid)                                       # idempotent
+
+
+@pytest.mark.asyncio
+async def test_failed_start_leaves_no_jail_or_process_behind(env):
+    import subprocess
+    tmp, _ = env
+    victim = subprocess.Popen(["sleep", "60"])
+    holder = {}
+    eng = await make_engine(tmp, holder, pid=victim.pid)
+    cid = uuid.uuid4()
+    real = fc.FirecrackerAPI.start
+
+    async def refuse(self):
+        raise RuntimeError("firecracker PUT /actions -> 400: no /dev/kvm")
+    fc.FirecrackerAPI.start = refuse
+    try:
+        with pytest.raises(RuntimeError, match="kvm"):
+            await eng.create_vm(VMConfig(cell_id=cid, image="base-python"))
+    finally:
+        fc.FirecrackerAPI.start = real
+    assert victim.wait(timeout=5) == -9
+    assert not os.path.exists(os.path.dirname(jail_root(tmp, str(cid))))
+    assert (await eng.get_vm_info(cid)).status == VMStatus.DESTROYED
+
+
+@pytest.mark.asyncio
+async def test_jailer_failure_surfaces_its_own_message(env):
+    tmp, _ = env
+
+    async def spawner(argv, log_path):
+        log_path.write_text("Jailer error: Controller cpu is unavailable\n")
+        import subprocess
+        p = await asyncio.create_subprocess_exec("false")
+        await p.wait()
+        fc._PROCS[p.pid] = p
+        return p.pid
+
+    eng = fc.FirecrackerEngine(spawner=spawner, kvm_path=str(tmp / "kvm"), chown=lambda *a: None)
+    cid = uuid.uuid4()
+    with pytest.raises(RuntimeError, match="Controller cpu is unavailable"):
+        await eng.create_vm(VMConfig(cell_id=cid, image="base-python"))
+    assert not os.path.exists(os.path.dirname(jail_root(tmp, str(cid))))
+
+
+@pytest.mark.asyncio
+async def test_stale_jail_from_a_crash_is_replaced(env):
+    tmp, _ = env
+    cid = uuid.uuid4()
+    stale = jail_root(tmp, str(cid))
+    os.makedirs(stale)
+    open(os.path.join(stale, "garbage"), "w").write("old")
+    eng = await make_engine(tmp, {})
+    await eng.create_vm(VMConfig(cell_id=cid, image="base-python"))
+    assert not os.path.exists(os.path.join(stale, "garbage"))
+
+
+def test_jailer_argv_cgroups_toggle_and_in_jail_socket():
+    s = Settings()
+    on = fc.jailer_argv(s, "abc", 512, 2)
+    assert "--cgroup-version" in on and "memory.max=%d" % (576 * 1024 * 1024) in on
+    assert on[on.index("--") + 1:] == ["--api-sock", "api.sock"]       # relative: resolved in the jail
+    off = fc.jailer_argv(Settings(JAILER_USE_CGROUPS="false"), "abc", 512, 2)
+    assert "--cgroup" not in off and "--cgroup-version" not in off
+
+
+@pytest.mark.asyncio
+async def test_preflight_names_the_actual_problem(env, monkeypatch):
+    tmp, s = env
+    s.firecracker_binary = s.jailer_binary = str(tmp / "kvm")        # exists but not executable
+    eng = fc.FirecrackerEngine(kvm_path=str(tmp / "kvm"))
+    with pytest.raises(EngineUnavailable, match="not executable"):
+        await eng.preflight()
+    os.chmod(tmp / "kvm", 0o755)
+    s.kernel_image_path = str(tmp / "nokernel")
+    with pytest.raises(EngineUnavailable, match="kernel missing"):
+        await eng.preflight()
+    s.kernel_image_path = str(tmp / "vmlinux")
+    s.jailer_chroot_base = "/tmp/" + "x" * 80                         # socket path would not fit
+    with pytest.raises(EngineUnavailable, match="too long"):
+        await eng.preflight()
+    s.jailer_chroot_base = str(tmp / "jail")
+    s.jailer_use_cgroups = False
+    s.environment = "prod"
+    if os.path.exists("/dev/net/tun"):
+        with pytest.raises(EngineUnavailable, match="only allowed when AIJAILER_ENV=dev"):
+            await eng.preflight()

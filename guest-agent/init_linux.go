@@ -88,10 +88,20 @@ func setupInit() {
 
 // hardenSelf makes the agent and everything it spawns unable to gain
 // privileges through setuid binaries.
-func hardenSelf() {
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		log.Printf("no_new_privs: %v", err)
+//
+// no_new_privs is PER THREAD. A plain prctl would mark only the thread that happened to run it,
+// and workloads forked from any other Go runtime thread would NOT inherit it (found by running the
+// agent in the real guest userland: setuid `su` still worked). AllThreadsSyscall applies it to
+// every runtime thread, and threads created later are cloned from one that has it.
+//
+// AllThreadsSyscall exists only in cgo-free builds (the production build; `make build`). Callers must
+// treat an error as fatal: running workloads without no_new_privs would silently allow setuid
+// escalation.
+func hardenSelf() error {
+	if _, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); errno != 0 {
+		return errno
 	}
+	return nil
 }
 
 // shutdownOn powers the guest off on SIGTERM/SIGINT (Firecracker's

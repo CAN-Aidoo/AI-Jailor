@@ -16,7 +16,9 @@ func main() {
 	if os.Getpid() == 1 {
 		setupInit()
 	}
-	hardenSelf()
+	if err := hardenSelf(); err != nil {
+		log.Fatalf("refusing to start without no_new_privs on every thread: %v (build with CGO_ENABLED=0)", err)
+	}
 	shutdownOn()
 
 	cfg := defaultExecConfig()

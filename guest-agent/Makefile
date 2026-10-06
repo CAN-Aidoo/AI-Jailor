@@ -6,7 +6,9 @@ build:
 	CGO_ENABLED=0 go build $(GOFLAGS_REL) -o dist/aijailer-agent .
 
 test:
-	go vet ./... && go test -race -count=1 ./...
+	go vet ./...
+	CGO_ENABLED=0 go test -count=1 ./...   # the production build flavour: no_new_privs tests run here
+	go test -race -count=1 ./...            # race detector needs cgo: no_new_privs tests skip
 
 # Usage: make rootfs-install ROOTFS_MNT=/mnt/rootfs   (rootfs mounted rw)
 rootfs-install: build

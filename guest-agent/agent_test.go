@@ -302,7 +302,9 @@ func TestDropsToUnprivilegedUserWithNoNewPrivs(t *testing.T) {
 	_ = os.WriteFile(gr, []byte("agent:x:23457:\n"), 0o644)
 	cfg := defaultExecConfig()
 	cfg.passwd, cfg.group = pw, gr
-	hardenSelf()
+	if err := hardenSelf(); err != nil {
+		t.Skipf("no_new_privs needs a cgo-free build: %v", err)
+	}
 	r := runExec(&Request{Op: "exec", Cmd: "id -u; id -g; grep NoNewPrivs /proc/self/status; cd; pwd"}, cfg)
 	if r["error"] != nil {
 		t.Fatal(r["error"])
@@ -321,4 +323,25 @@ func TestVsockListenerOptional(t *testing.T) {
 		t.Skipf("vsock unavailable: %v", err)
 	}
 	l.Close()
+}
+
+// no_new_privs is per-thread: every workload must have it no matter which runtime thread forked
+// it. Spawn many concurrently so several distinct threads do the forking.
+func TestNoNewPrivsReachesEveryWorkload(t *testing.T) {
+	if err := hardenSelf(); err != nil {
+		t.Skipf("no_new_privs needs a cgo-free build: %v", err)
+	}
+	const n = 64
+	res := make(chan string, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			r := exec1(t, "grep NoNewPrivs /proc/self/status; sleep 0.05", nil)
+			res <- strings.TrimSpace(r["stdout"].(string))
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if got := <-res; got != "NoNewPrivs:\t1" {
+			t.Fatalf("a workload lacks no_new_privs: %q", got)
+		}
+	}
 }
