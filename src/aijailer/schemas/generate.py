@@ -27,6 +27,7 @@ class SecurityCertificateSchema(BaseModel):
     immune_memory_version: str = ""
     valid_until: str = ""
     signature: str = ""
+    attestation: dict | None = None  # DSSE envelope wrapping an in-toto Statement
 
 
 class GenerateRequest(BaseModel):

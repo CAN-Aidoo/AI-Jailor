@@ -4,7 +4,8 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
+from aijailer.db.types import INET, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aijailer.db.base import Base

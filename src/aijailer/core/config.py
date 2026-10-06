@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # Security
     api_key_header: str = "Authorization"
     jwt_secret: str = Field(default="change-me-in-production", alias="JWT_SECRET")
+    attestation_key: str = Field(default="", alias="ATTESTATION_KEY")
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 60
 

@@ -12,8 +12,17 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
+from aijailer.core.config import get_settings
+
 from aijailer.schemas.generate import ComponentRef, SecurityCertificateSchema
 from aijailer.schemas.intent import CodeIntent
+from aijailer.services.attestation import (
+    Ed25519Signer,
+    Signer,
+    make_statement,
+    sign_statement,
+    verify_envelope,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -21,8 +30,54 @@ logger = structlog.get_logger(__name__)
 IMMUNE_MEMORY_VERSION = "imm_v2026.02.10.0001"
 
 
+PREDICATE_TYPE = "https://aijailer.dev/attestation/secure-generation/v1"
+
+
 class CertificateGenerator:
-    """Generates security certificates for code that passes constraint checking."""
+    """Generates security certificates for code that passes constraint checking.
+
+    Certificates are in-toto statements in DSSE envelopes signed with
+    Ed25519. ``verify`` re-checks signature, expiry and (optionally) that the
+    presented code still matches the attested hash.
+    """
+
+    def __init__(self, signing_key: str | bytes | None = None, signer: Signer | None = None):
+        if signer is not None:
+            self._signer = signer
+        elif signing_key:
+            self._signer = Ed25519Signer.from_secret(signing_key)
+        else:
+            # No configured key: ephemeral. Certificates verify only inside this process
+            # lifetime, which is the safe failure mode (never a guessable default key).
+            logger.warning("certificate.ephemeral_signing_key")
+            self._signer = Ed25519Signer.generate()
+
+    @property
+    def public_key(self):
+        return self._signer.public_key
+
+    def verify(self, cert: SecurityCertificateSchema, code: str | None = None,
+               now: datetime | None = None) -> bool:
+        """True only if the signature is valid, the certificate unexpired, the
+        envelope statement matches the visible fields, and code (if given) matches."""
+        if not cert.attestation:
+            return False
+        statement = verify_envelope(cert.attestation, self.public_key)
+        if statement is None:
+            return False
+        pred = statement.get("predicate", {})
+        digest = statement["subject"][0]["digest"]["sha256"]
+        if cert.code_hash != f"sha256:{digest}" or pred.get("certificate_id") != cert.certificate_id:
+            return False
+        if pred.get("constraints_applied") != cert.constraints_applied:
+            return False
+        if code is not None and hashlib.sha256(code.encode()).hexdigest() != digest:
+            return False
+        try:
+            expires = datetime.fromisoformat(pred["valid_until"])
+        except (KeyError, ValueError):
+            return False
+        return (now or datetime.now(timezone.utc)) < expires
 
     def generate(
         self,
@@ -77,8 +132,15 @@ class CertificateGenerator:
             components_used=comp_refs,
             immune_memory_version=IMMUNE_MEMORY_VERSION,
             valid_until=(now + timedelta(days=validity_days)).isoformat(),
-            signature=self._sign_certificate(cert_id, code_hash, now),
         )
+        statement = make_statement(
+            "generated_code",
+            code_hash.removeprefix("sha256:"),
+            PREDICATE_TYPE,
+            certificate.model_dump(exclude={"signature", "attestation"}),
+        )
+        certificate.attestation = sign_statement(statement, self._signer)
+        certificate.signature = "ed25519:" + certificate.attestation["signatures"][0]["sig"]
 
         logger.info(
             "certificate.generated",
@@ -107,18 +169,6 @@ class CertificateGenerator:
             "data_boundary_enforced": "data_boundary" in constraints,
         }
 
-    def _sign_certificate(
-        self, cert_id: str, code_hash: str, timestamp: datetime
-    ) -> str:
-        """Sign the certificate.
-
-        In production, this uses Ed25519 signing with a HSM-backed key.
-        For MVP, we use HMAC-SHA256 with a local key.
-        """
-        sign_data = f"{cert_id}:{code_hash}:{timestamp.isoformat()}"
-        signature = hashlib.sha256(sign_data.encode()).hexdigest()
-        return f"hmac_sha256:{signature}"
-
 
 # Singleton
 _generator: CertificateGenerator | None = None
@@ -127,5 +177,5 @@ _generator: CertificateGenerator | None = None
 def get_certificate_generator() -> CertificateGenerator:
     global _generator
     if _generator is None:
-        _generator = CertificateGenerator()
+        _generator = CertificateGenerator(signing_key=get_settings().attestation_key or None)
     return _generator
