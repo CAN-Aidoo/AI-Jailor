@@ -57,17 +57,21 @@ def get_cell_network() -> CellNetwork:
 
 
 class NetworkRuntime:
-    """Startup/shutdown of host enforcement: install the ruleset (fail closed) and watch it."""
+    """Startup/shutdown of host enforcement: install the ruleset (fail closed), watch it, and
+    periodically reconcile host networking with the database."""
 
-    def __init__(self, stop: asyncio.Event, task: asyncio.Task) -> None:
-        self._stop, self._task = stop, task
+    def __init__(self, stop: asyncio.Event, task: asyncio.Task, reconciler=None) -> None:
+        self._stop, self._task, self.reconciler = stop, task, reconciler
 
     async def stop(self) -> None:
+        if self.reconciler is not None:
+            await self.reconciler.stop()
         self._stop.set()
         await self._task
 
 
-async def start_network_runtime(engine, interval: float = 5.0) -> NetworkRuntime | None:
+async def start_network_runtime(engine, interval: float = 5.0,
+                                 session_factory=None) -> NetworkRuntime | None:
     """Returns None for engines with no NIC. Raises if the ruleset cannot be installed, so the
     service refuses to start rather than serve cells without a firewall."""
     import structlog
@@ -86,4 +90,12 @@ async def start_network_runtime(engine, interval: float = 5.0) -> NetworkRuntime
 
     stop = asyncio.Event()
     task = asyncio.create_task(watchdog(net.manager, interval, on_drift, stop))
-    return NetworkRuntime(stop, task)
+    reconciler = None
+    if session_factory is not None:
+        from aijailer.netpolicy.reconciler import NetworkReconciler
+        s = get_settings()
+        reconciler = NetworkReconciler(net, session_factory, s.reconcile_interval_seconds,
+                                       s.reconcile_grace_seconds, s.reconcile_stuck_seconds)
+        # Inline first pass: adopt networks that survived a restart before taking traffic.
+        await reconciler.start(initial_pass=True)
+    return NetworkRuntime(stop, task, reconciler)

@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     network_enforcement: str = Field(default="auto", alias="NETWORK_ENFORCEMENT")
     cell_net_pool: str = Field(default="10.200.0.0/16", alias="CELL_NET_POOL")
     broker_port: int = Field(default=3128, alias="BROKER_PORT")
+    # Reconciler: how often to compare the host with the DB, and how long a network must
+    # have existed before "not in the DB" counts as stale (DB commit can lag provisioning).
+    reconcile_interval_seconds: float = Field(default=30.0, alias="RECONCILE_INTERVAL_SECONDS")
+    reconcile_grace_seconds: float = Field(default=120.0, alias="RECONCILE_GRACE_SECONDS")
+    # An in-flight cell status unchanged for this long means its owner process died.
+    reconcile_stuck_seconds: float = Field(default=600.0, alias="RECONCILE_STUCK_SECONDS")
     # off | observe (log containment tier) | enforce (block code the gate flags)
     execution_gate_mode: str = Field(default="observe", alias="EXECUTION_GATE_MODE")
 

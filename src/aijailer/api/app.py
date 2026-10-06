@@ -57,7 +57,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from aijailer.engine.microvm import get_microvm_engine
     from aijailer.netpolicy.runtime import start_network_runtime
 
-    net_runtime = await start_network_runtime(get_microvm_engine())
+    from aijailer.db.base import async_session_factory
+
+    net_runtime = await start_network_runtime(
+        get_microvm_engine(), session_factory=async_session_factory)
 
     yield
 

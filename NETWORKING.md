@@ -363,3 +363,20 @@ Both limits are **egress** shapers (they queue, so TCP backs off on delay rather
 `None` = unlimited per direction. `cell.network_bandwidth_mbps` is applied symmetrically at provisioning;
 if shaping fails the whole network is rolled back. Because the broker is the cell's only path off the box,
 bounding this link bounds the cell's total network use. Applied with netlink (no `tc` binary).
+
+### Reconciliation (`netpolicy/reconciler.py`)
+
+Every `RECONCILE_INTERVAL_SECONDS` (30, +/-10 % jitter) and once **before the service takes traffic**:
+
+| kernel (`aj<12 hex>`) | DB status | action |
+|---|---|---|
+| present, registered here | ready/running/paused | keep (flag `broken` if veth/namespace vanished -> cell marked `error`) |
+| present, not registered | ready/running/paused | **adopt** (restart recovery): rebuild registry from the veth address, re-grant firewall tuple, restart proxy, re-assert bandwidth |
+| present | creating/stopping/destroying | never touched; after `RECONCILE_STUCK_SECONDS` (600) the cell is marked `error` and the network is cleaned |
+| present, registered here | anything else | delete once older than `RECONCILE_GRACE_SECONDS` (120; the DB commit can lag provisioning) |
+| present, not registered | anything else / unknown | delete (orphan) |
+
+Safety: unreadable DB -> no changes; a sweep removing more than 5 networks **and** more than half of everything present aborts
+(`aborted` in the report, logged); names not matching `^aj[0-9a-f]{12}$` are never touched, even if the scanner returns
+them; subnets of resources we cannot adopt stay reserved so a new cell can never share a /30 with them.
+After a restart the freshly installed ruleset has no tuples, so cells are cut off (fail closed) until the first sweep adopts them.

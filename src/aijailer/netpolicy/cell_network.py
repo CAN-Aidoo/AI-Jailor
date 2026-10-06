@@ -12,6 +12,7 @@ Invariants (each tested):
 
 import asyncio
 import ipaddress
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -21,7 +22,8 @@ import structlog
 
 from aijailer.agentsec.egress import EgressBroker, EgressRule, SecretBinding
 from aijailer.agentsec.proxy import CellProxy
-from aijailer.netpolicy.nft import CellNet, LinkInfo, NetPolicyManager
+from aijailer.netpolicy import discovery
+from aijailer.netpolicy.nft import CellNet, LinkInfo, NetPolicyManager, ifname_for
 from aijailer.netpolicy.shaping import Bandwidth
 
 logger = structlog.get_logger(__name__)
@@ -105,6 +107,36 @@ def broker_from_policy(network_policy: dict | None, secrets: list[SecretBinding]
     return EgressBroker(rules, secrets, resolver=resolver, allow_private_cidrs=private), skipped
 
 
+@dataclass(frozen=True)
+class LiveCell:
+    """What the database says about a cell that should have a network."""
+
+    tenant_id: uuid.UUID
+    network_policy: dict | None = None
+    bandwidth_mbps: int | None = None
+
+
+@dataclass
+class SweepReport:
+    kept: list[uuid.UUID] = field(default_factory=list)
+    adopted: list[uuid.UUID] = field(default_factory=list)
+    stale_removed: list[uuid.UUID] = field(default_factory=list)
+    orphans_removed: list[str] = field(default_factory=list)
+    broken: list[uuid.UUID] = field(default_factory=list)   # live per DB but network unusable
+    errors: list[str] = field(default_factory=list)
+    aborted: str | None = None
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.adopted or self.stale_removed or self.orphans_removed or self.broken)
+
+
+# Refuse to remove more than this many networks in one sweep when it is also more than half of
+# everything present: the likelier explanation is a bad/empty database read, not a mass leak.
+MASS_REMOVAL_MIN = 5
+MASS_REMOVAL_FRACTION = 0.5
+
+
 @dataclass
 class Provisioned:
     net: CellNet
@@ -118,7 +150,11 @@ class CellNetwork:
     def __init__(self, manager: NetPolicyManager, link_ops: LinkOps,
                  secrets: SecretProvider | None = None,
                  audit: Callable[[uuid.UUID, dict], None] | None = None,
-                 proxy_factory: Callable[..., CellProxy] = CellProxy, resolver=None) -> None:
+                 proxy_factory: Callable[..., CellProxy] = CellProxy, resolver=None,
+                 scan: Callable[[], discovery.HostNetState] = discovery.scan_host,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._scan, self._clock = scan, clock
+        self._since: dict[uuid.UUID, float] = {}
         self._resolver = resolver
         self._mgr, self._links = manager, link_ops
         self._secrets = secrets or NoSecrets()
@@ -164,6 +200,7 @@ class CellNetwork:
                 raise
             self._proxies[cell_id] = proxy
             self._tenants[cell_id] = tenant_id
+            self._since[cell_id] = self._clock()
             url = f"http://{net.host_ip}:{net.broker_port}"
             logger.info("cell.network.provisioned", cell_id=str(cell_id), ifname=net.ifname,
                         guest_ip=str(net.guest_ip), skipped=skipped)
@@ -219,12 +256,140 @@ class CellNetwork:
         # subnet that may still be attached to a live interface.
         self._tenants.pop(cell_id, None)
         self._nets.pop(cell_id, None)
+        self._since.pop(cell_id, None)
         return errors
 
     async def reconcile(self, live_cells: set[uuid.UUID]) -> list[uuid.UUID]:
-        """Tear down networks of cells that are no longer live (crash/partial-commit leaks)."""
+        """In-memory only: tear down networks of cells that are no longer live. Prefer
+        ``sweep``, which also finds leaks the process has no memory of."""
         async with self._lock:
             stale = [c for c in list(self._proxies) if c not in live_cells]
             for cid in stale:
                 await self._teardown(cid, self._proxies.pop(cid))
             return stale
+
+    # ------------------------------------------------------------------ sweep
+    async def sweep(self, live: dict[uuid.UUID, LiveCell], protected: set[uuid.UUID],
+                    grace: float = 120.0) -> SweepReport:
+        """Make the host match the database, including after a crash or restart.
+
+        * known + live            -> keep (flag ``broken`` if its kernel resources vanished)
+        * known + not live        -> tear down (once older than ``grace``)
+        * unknown + live          -> ADOPT: rebuild registry, firewall tuple, proxy and shaping
+                                     from what the kernel still holds (a restart empties our memory
+                                     but leaves running cells' links in place)
+        * unknown + not live      -> orphan: delete veth + namespace
+        * ``protected`` cells (creating/stopping/destroying) are never touched.
+        Anything that does not match ``aj<12 hex>`` is never touched. A sweep that would remove a
+        suspiciously large share of everything aborts without changing anything.
+        """
+        report = SweepReport()
+        async with self._lock:
+            state = await asyncio.to_thread(self._scan)
+            by_prefix: dict[str, uuid.UUID | None] = {}
+            for cid in {*live, *protected, *self._proxies}:
+                p = cid.hex[:12]
+                by_prefix[p] = None if p in by_prefix else cid  # None => ambiguous, skip
+            unknown = object()
+            # Re-filter here: never delete anything whose name we did not generate, whatever
+            # the scanner returned.
+            names = {n for n in (state.names | {ifname_for(c) for c in self._proxies})
+                     if discovery.is_cell_name(n)}
+
+            stale: list[uuid.UUID] = []
+            orphans: list[str] = []
+            adopt: list[uuid.UUID] = []
+            now = self._clock()
+            for name in sorted(names):
+                cid = by_prefix.get(discovery.prefix_of(name), unknown)
+                if cid is None:
+                    report.errors.append(f"{name}: ambiguous cell id prefix, left alone")
+                    continue
+                if cid is not unknown and cid in protected:
+                    continue
+                if cid is not unknown and cid in self._proxies:
+                    if cid in live:
+                        if name in state.veths and name in state.netns:
+                            report.kept.append(cid)
+                        else:
+                            report.broken.append(cid)
+                    elif now - self._since.get(cid, 0.0) >= grace:
+                        stale.append(cid)
+                elif cid is not unknown and cid in live:
+                    adopt.append(cid)
+                else:
+                    orphans.append(name)
+
+            removals = len(stale) + len(orphans)
+            if removals > MASS_REMOVAL_MIN and removals > MASS_REMOVAL_FRACTION * len(names):
+                report.aborted = (f"refusing to remove {removals} of {len(names)} networks in one "
+                                  "sweep (database read looks wrong?)")
+                return report
+
+            for cid in adopt:
+                await self._adopt(cid, live[cid], state, report)
+            for cid in stale:
+                errs = await self._teardown(cid, self._proxies.pop(cid))
+                report.errors.extend(errs)
+                report.stale_removed.append(cid)
+            for name in orphans:
+                try:
+                    await self._links.teardown(name)
+                    for rid in self._mgr.revoked_ids():
+                        if ifname_for(rid) == name:
+                            await self._mgr.release(rid)
+                    report.orphans_removed.append(name)
+                except Exception as exc:
+                    report.errors.append(f"orphan {name}: {exc}")
+            # Subnets still occupied by resources we do not own (in-flight/unadoptable) must
+            # not be handed to a new cell: that would put two interfaces on one /30.
+            gone = set(report.orphans_removed) | {ifname_for(c) for c in report.stale_removed}
+            mine = {ifname_for(c) for c in self._proxies}
+            self._mgr.set_external({
+                ipaddress.ip_network(f"{a[0]}/{a[1]}", strict=False)
+                for n, a in state.veths.items()
+                if a is not None and discovery.is_cell_name(n) and n not in gone | mine})
+            return report
+
+    async def _adopt(self, cid: uuid.UUID, lc: LiveCell, state: discovery.HostNetState,
+                     report: SweepReport) -> None:
+        name = ifname_for(cid)
+        addr = state.veths.get(name)
+        net = None
+        try:
+            if name not in state.veths or name not in state.netns or addr is None:
+                raise RuntimeError("incomplete network (veth/namespace/address missing)")
+            host_ip, prefix = addr
+            if prefix != 30:
+                raise RuntimeError(f"unexpected prefix /{prefix}")
+            hosts = list(ipaddress.ip_network(f"{host_ip}/{prefix}", strict=False).hosts())
+            guest_ip = next(h for h in hosts if h != host_ip)
+            net = CellNet(cid, name, host_ip, guest_ip, 30, self._mgr.broker_port)
+            await self._mgr.adopt(net)
+            self._links_up.add(cid)
+            broker, skipped = broker_from_policy(
+                lc.network_policy, self._secrets.secrets_for(lc.tenant_id, cid), self._resolver)
+            if lc.bandwidth_mbps:  # re-assert the limit: do not trust what survived
+                await self._links.set_bandwidth(net, Bandwidth.symmetric_mbps(lc.bandwidth_mbps))
+            sink = (lambda ev, c=cid: self._audit(c, ev)) if self._audit else None
+            proxy = self._proxy_factory(str(cid), str(net.host_ip), net.broker_port, broker,
+                                        audit=sink)
+            await proxy.start()
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            logger.error("cell.network.adopt_failed", cell_id=str(cid), error=str(exc))
+            await self._teardown(cid, None)
+            try:
+                await self._links.teardown(name)  # remove remnants; the cell must be re-provisioned
+            except Exception as e2:
+                report.errors.append(f"adopt cleanup {name}: {e2}")
+            report.broken.append(cid)
+            report.errors.append(f"adopt {cid}: {exc}")
+            return
+        self._proxies[cid] = proxy
+        self._tenants[cid] = lc.tenant_id
+        self._nets[cid] = net
+        self._since[cid] = self._clock()
+        report.adopted.append(cid)
+        logger.info("cell.network.adopted", cell_id=str(cid), ifname=name, skipped=skipped)

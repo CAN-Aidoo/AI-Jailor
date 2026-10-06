@@ -290,3 +290,211 @@ def test_tbf_params_burst_floor_and_scaling():
     assert low["rate"] == "64kbit" and low["burst"] == 32 * 1024  # floor
     hi = tbf_params(1_000_000)  # 1 Gbit/s -> 100 ms of traffic
     assert hi["burst"] == 12_500_000 and hi["latency"] == "50ms"
+
+
+# ----------------------------------------------------------------- sweep / adopt
+import ipaddress  # noqa: E402
+
+from aijailer.netpolicy import discovery  # noqa: E402
+from aijailer.netpolicy.cell_network import LiveCell  # noqa: E402
+from aijailer.netpolicy.nft import ifname_for  # noqa: E402
+
+
+class Clock:
+    t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def host_state(*cells, addr=None, with_ns=True, orphans=()):
+    """Kernel state as the scanner would report it for the given cell ids (+ orphan names)."""
+    st = discovery.HostNetState()
+    for i, cid in enumerate(cells):
+        n = ifname_for(cid)
+        st.veths[n] = addr.get(cid) if isinstance(addr, dict) else (
+            ipaddress.IPv4Address(f"10.50.0.{1 + 4 * i}"), 30)
+        if with_ns:
+            st.netns.add(n)
+    for n in orphans:
+        st.veths[n] = (ipaddress.IPv4Address("10.50.0.253"), 30)
+        st.netns.add(n)
+    return st
+
+
+def mk_sweep(state_fn, pool="10.50.0.0/24", links=None, clock=None):
+    mgr = NetPolicyManager(runner=FakeNft(), allocator=NetAllocator(pool))
+    links = links or FakeLinks()
+    n = CellNetwork(mgr, links, proxy_factory=FakeProxy, scan=state_fn, clock=clock or Clock())
+    return n, mgr, links
+
+
+LIVE = LiveCell(uuid.uuid4(), POLICY, 10)
+
+
+@pytest.mark.asyncio
+async def test_sweep_adopts_live_cell_after_restart():
+    cid = uuid.uuid4()
+    n, mgr, links = mk_sweep(lambda: host_state(cid))
+    rep = await n.sweep({cid: LiveCell(uuid.uuid4(), POLICY, 10)}, set())
+    assert rep.adopted == [cid] and rep.broken == [] and not rep.changed is False
+    assert n.provisioned == {cid}
+    net = mgr.cells[0]
+    assert (str(net.host_ip), str(net.guest_ip)) == ("10.50.0.1", "10.50.0.2")
+    assert FakeProxy.instances[0].started and FakeProxy.instances[0].ip == "10.50.0.1"
+    assert links.shaped == [(cid, Bandwidth(10_000, 10_000))]  # limit re-asserted
+    # the adopted /30 is reserved: a new cell must not receive it
+    p = await n.provision(uuid.uuid4(), uuid.uuid4(), POLICY)
+    assert str(p.net.host_ip) != "10.50.0.1"
+    # second sweep is a no-op
+    rep2 = await n.sweep({cid: LIVE}, set())
+    assert rep2.kept == [cid] and rep2.adopted == [] and rep2.errors == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_orphans_but_never_foreign_names():
+    live, orphan = uuid.uuid4(), uuid.uuid4()
+    st = host_state(live, orphans=[ifname_for(orphan)])
+    st.veths["eth0"] = None          # foreign names must be invisible to the sweep
+    st.netns.add("docker0")
+    n, _, links = mk_sweep(lambda: st)
+    torn = []
+    orig = links.teardown
+
+    async def spy(name):
+        torn.append(name)
+        await orig(name)
+    links.teardown = spy
+    rep = await n.sweep({live: LIVE}, set())
+    assert rep.orphans_removed == [ifname_for(orphan)] and rep.adopted == [live]
+    assert torn == [ifname_for(orphan)]
+
+
+@pytest.mark.asyncio
+async def test_known_cell_not_live_removed_only_after_grace():
+    clock = Clock()
+    n, mgr, _ = mk_sweep(lambda: host_state(), clock=clock)
+    cid = uuid.uuid4()
+    await n.provision(cid, uuid.uuid4(), POLICY)
+    n._scan = lambda: host_state(cid)
+    clock.t += 30                                   # younger than grace: DB may lag the commit
+    assert (await n.sweep({}, set(), grace=120)).stale_removed == []
+    assert n.provisioned == {cid}
+    clock.t += 200
+    rep = await n.sweep({}, set(), grace=120)
+    assert rep.stale_removed == [cid] and n.provisioned == set() and mgr.cells == []
+
+
+@pytest.mark.asyncio
+async def test_protected_cells_are_never_touched():
+    cid = uuid.uuid4()
+    n, _, links = mk_sweep(lambda: host_state(cid))
+    rep = await n.sweep({}, {cid}, grace=0)          # 'creating' / 'destroying' in the DB
+    assert not rep.changed and n.provisioned == set() and not FakeProxy.instances
+
+
+@pytest.mark.asyncio
+async def test_live_cell_with_missing_kernel_resources_is_reported_broken():
+    clock = Clock()
+    n, _, _ = mk_sweep(lambda: host_state(), clock=clock)
+    cid = uuid.uuid4()
+    await n.provision(cid, uuid.uuid4(), POLICY)
+    n._scan = lambda: host_state()                   # veth and netns vanished
+    rep = await n.sweep({cid: LIVE}, set())
+    assert rep.broken == [cid]
+
+
+@pytest.mark.asyncio
+async def test_adopt_of_incomplete_network_cleans_up_and_reports_broken():
+    cid = uuid.uuid4()
+    n, mgr, links = mk_sweep(lambda: host_state(cid, with_ns=False))
+    rep = await n.sweep({cid: LIVE}, set())
+    assert rep.adopted == [] and rep.broken == [cid]
+    assert mgr.cells == [] and n.provisioned == set() and not FakeProxy.instances
+
+
+@pytest.mark.asyncio
+async def test_adopt_outside_pool_or_wrong_prefix_is_broken_not_adopted():
+    a, b = uuid.uuid4(), uuid.uuid4()
+    st = host_state(a, b, addr={a: (ipaddress.IPv4Address("192.168.9.1"), 30),
+                                b: (ipaddress.IPv4Address("10.50.0.1"), 24)})
+    n, mgr, _ = mk_sweep(lambda: st)
+    rep = await n.sweep({a: LIVE, b: LIVE}, set())
+    assert sorted(rep.broken) == sorted([a, b]) and rep.adopted == [] and mgr.cells == []
+
+
+@pytest.mark.asyncio
+async def test_two_cells_claiming_one_subnet_second_is_broken():
+    a, b = uuid.uuid4(), uuid.uuid4()
+    same = (ipaddress.IPv4Address("10.50.0.1"), 30)
+    n, mgr, _ = mk_sweep(lambda: host_state(a, b, addr={a: same, b: same}))
+    rep = await n.sweep({a: LIVE, b: LIVE}, set())
+    assert len(rep.adopted) == 1 and len(rep.broken) == 1 and len(mgr.cells) == 1
+
+
+@pytest.mark.asyncio
+async def test_mass_removal_guard_aborts_without_changes():
+    orphans = [ifname_for(uuid.uuid4()) for _ in range(8)]
+    n, _, links = mk_sweep(lambda: host_state(orphans=orphans))
+    rep = await n.sweep({}, set())                   # e.g. DB returned nothing
+    assert rep.aborted and "refusing" in rep.aborted and rep.orphans_removed == []
+    assert not links.up and n.provisioned == set()
+
+
+@pytest.mark.asyncio
+async def test_small_cleanups_are_not_blocked_by_the_guard():
+    orphans = [ifname_for(uuid.uuid4()) for _ in range(3)]
+    live = [uuid.uuid4() for _ in range(3)]
+    n, _, _ = mk_sweep(lambda: host_state(*live, orphans=orphans))
+    rep = await n.sweep({c: LIVE for c in live}, set())
+    assert len(rep.orphans_removed) == 3 and len(rep.adopted) == 3 and rep.aborted is None
+
+
+@pytest.mark.asyncio
+async def test_failed_orphan_removal_is_reported_and_retried_next_sweep():
+    orphan = ifname_for(uuid.uuid4())
+    links = FakeLinks(fail_teardown=True)
+    n, _, _ = mk_sweep(lambda: host_state(orphans=[orphan]), links=links)
+    rep = await n.sweep({}, set())
+    assert rep.orphans_removed == [] and rep.errors and orphan in rep.errors[0]
+    links.fail_teardown = False
+    assert (await n.sweep({}, set())).orphans_removed == [orphan]
+
+
+def test_allocator_reserve_prevents_double_allocation():
+    a = NetAllocator("10.9.0.0/28")                  # 4 subnets
+    ids = [uuid.uuid4() for _ in range(3)]
+    a.reserve(ids[0], ipaddress.ip_network("10.9.0.8/30"))
+    got = {str(a.allocate(i)) for i in ids[1:]} | {str(a.allocate(uuid.uuid4()))}
+    assert "10.9.0.8/30" not in got and len(got) == 3
+    with pytest.raises(Exception, match="exhausted"):
+        a.allocate(uuid.uuid4())
+    for bad in ("10.9.0.0/29", "10.10.0.0/30", "10.9.0.2/31"):
+        with pytest.raises(Exception):
+            a.reserve(uuid.uuid4(), ipaddress.ip_network(bad))
+    with pytest.raises(Exception, match="already allocated"):
+        a.reserve(uuid.uuid4(), ipaddress.ip_network("10.9.0.8/30"))
+
+
+@pytest.mark.asyncio
+async def test_unadopted_in_flight_cells_keep_their_subnet_reserved():
+    creating = uuid.uuid4()   # protected: DB says 'creating'; its veth owns 10.50.0.1/30
+    n, mgr, _ = mk_sweep(lambda: host_state(creating))
+    await n.sweep({}, {creating})
+    p = await n.provision(uuid.uuid4(), uuid.uuid4(), POLICY)
+    assert str(p.net.host_ip) != "10.50.0.1"          # would have put two ifaces on one /30
+    n._scan = lambda: host_state()                    # the in-flight cell's veth is gone
+    await n.sweep({}, set())
+    q = await n.provision(uuid.uuid4(), uuid.uuid4(), POLICY)
+    assert str(q.net.host_ip) == "10.50.0.1"          # and the subnet is reusable again
+
+
+def test_allocator_external_blocks_both_fresh_and_released_slots():
+    a = NetAllocator("10.7.0.0/28")
+    c1, c2 = uuid.uuid4(), uuid.uuid4()
+    s1 = a.allocate(c1)
+    a.release(c1)
+    a.set_external([s1])
+    assert a.allocate(c2) != s1
+    a.set_external([])
+    assert a.allocate(uuid.uuid4()) == s1
