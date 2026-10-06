@@ -57,6 +57,8 @@ class ExecResult:
     duration_ms: int
     cpu_ms: int = 0
     memory_peak_mb: int = 0
+    timed_out: bool = False
+    output_truncated: bool = False
 
 
 class MicroVMEngine(ABC):

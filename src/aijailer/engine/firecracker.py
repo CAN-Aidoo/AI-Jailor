@@ -17,6 +17,7 @@ Everything that needs root/KVM (spawn, TAP, nftables) is behind ``spawner`` /
 """
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -86,12 +87,16 @@ class FirecrackerAPI:
         await self._client.aclose()
 
 
-async def agent_exec(vsock_uds: str, port: int, command: str, timeout: int,
-                     user: str) -> ExecResult:
-    """Run one command in the guest agent via Firecracker's vsock UDS proxy.
+class AgentError(RuntimeError):
+    """The guest agent refused or failed a request (it replied {"error": ...})."""
+
+
+async def agent_request(vsock_uds: str, port: int, request: dict, timeout: float) -> dict:
+    """One request/response with the guest agent via Firecracker's vsock UDS proxy.
 
     Host side of the proxy protocol: connect to the UDS, send ``CONNECT <port>\\n``,
-    expect ``OK <n>\\n``; then speak length-prefixed JSON with the agent.
+    expect ``OK <n>\\n``; then speak length-prefixed JSON with the agent
+    (see guest-agent/protocol.go). The reply is untrusted input from the guest.
     """
     reader, writer = await asyncio.open_unix_connection(vsock_uds)
     try:
@@ -100,21 +105,53 @@ async def agent_exec(vsock_uds: str, port: int, command: str, timeout: int,
         ack = await asyncio.wait_for(reader.readline(), 5)
         if not ack.startswith(b"OK"):
             raise RuntimeError(f"vsock connect refused: {ack!r}")
-        req = json.dumps({"op": "exec", "cmd": command, "timeout": timeout, "user": user}).encode()
-        writer.write(struct.pack(">I", len(req)) + req)
+        body = json.dumps(request).encode()
+        if len(body) > _MAX_FRAME:
+            raise ValueError("request too large")
+        writer.write(struct.pack(">I", len(body)) + body)
         await writer.drain()
-        hdr = await asyncio.wait_for(reader.readexactly(4), timeout + 5)
+        hdr = await asyncio.wait_for(reader.readexactly(4), timeout)
         (n,) = struct.unpack(">I", hdr)
         if n > _MAX_FRAME:
             raise RuntimeError("agent frame too large")
-        resp = json.loads(await asyncio.wait_for(reader.readexactly(n), timeout + 5))
-        return ExecResult(
-            exit_code=int(resp["exit_code"]), stdout=resp.get("stdout", ""),
-            stderr=resp.get("stderr", ""), duration_ms=int(resp.get("duration_ms", 0)),
-            cpu_ms=int(resp.get("cpu_ms", 0)), memory_peak_mb=int(resp.get("memory_peak_mb", 0)),
-        )
+        resp = json.loads(await asyncio.wait_for(reader.readexactly(n), timeout))
+        if not isinstance(resp, dict):
+            raise RuntimeError("agent reply is not an object")
+        if "error" in resp:
+            raise AgentError(str(resp["error"]))
+        return resp
     finally:
         writer.close()
+
+
+async def agent_ping(vsock_uds: str, port: int, timeout: float = 2.0) -> dict:
+    return await agent_request(vsock_uds, port, {"op": "ping"}, timeout)
+
+
+async def agent_put_file(vsock_uds: str, port: int, path: str, data: bytes, mode: int = 0o644,
+                         user: str = "agent") -> None:
+    await agent_request(vsock_uds, port, {
+        "op": "put_file", "path": path, "mode": mode, "user": user,
+        "data": base64.b64encode(data).decode()}, 30)
+
+
+async def agent_get_file(vsock_uds: str, port: int, path: str) -> bytes:
+    resp = await agent_request(vsock_uds, port, {"op": "get_file", "path": path}, 30)
+    return base64.b64decode(resp["data"], validate=True)
+
+
+async def agent_exec(vsock_uds: str, port: int, command: str, timeout: int,
+                     user: str) -> ExecResult:
+    resp = await agent_request(
+        vsock_uds, port, {"op": "exec", "cmd": command, "timeout": timeout, "user": user},
+        timeout + 5)
+    return ExecResult(
+        exit_code=int(resp["exit_code"]), stdout=resp.get("stdout", ""),
+        stderr=resp.get("stderr", ""), duration_ms=int(resp.get("duration_ms", 0)),
+        cpu_ms=int(resp.get("cpu_ms", 0)), memory_peak_mb=int(resp.get("memory_peak_mb", 0)),
+        timed_out=bool(resp.get("timed_out", False)),
+        output_truncated=bool(resp.get("output_truncated", False)),
+    )
 
 
 def jailer_argv(settings, vm_id: str, mem_mib: int, vcpus: int) -> list[str]:
@@ -165,7 +202,7 @@ class FirecrackerEngine(MicroVMEngine):
         return {
             "boot-source": {
                 "kernel_image_path": self.settings.kernel_image_path,
-                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off ro",
+                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/aijailer-agent",
             },
             "drives": [{
                 "drive_id": "rootfs",

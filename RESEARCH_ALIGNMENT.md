@@ -46,13 +46,13 @@ only into the parts nobody else covers.
 | Constraint engine | Z3 path now reports *every* violated rule by name via iterated unsat cores (was a generic "z3_unsat"). |
 | Engine | Real Firecracker API client, per-cell rootfs copy (base never writable), unique vsock CIDs, jailer argv (non-root, cgroup v2, PID ns), vsock agent protocol, pause/resume/snapshot. Verified against a fake Firecracker API and agent; **not yet exercised on a real KVM host.** |
 | Agent security | Flow labels + egress broker (new). |
+| Guest agent | `guest-agent/` (Go, static, PID 1): framed-JSON vsock protocol (exec/ping/put_file/get_file), uid drop + no_new_privs, process-group kill, orphan reaping, output/frame caps, symlink-safe files; Go tests (race detector) + Python end-to-end tests. |
 | Gate | `EXECUTION_GATE_MODE=off|observe|enforce` wired into `execute_script`. |
 | Audit | Full-field hashing + signed checkpoints. |
 
 ## Known gaps / next (ordered)
 
-1. **Run the Firecracker path on a KVM host** (needs guest kernel, rootfs, Go/Rust guest agent
-   speaking the framed-JSON protocol, TAP + nftables). Highest risk item: untested against real hardware.
+1. **Run the Firecracker path on a KVM host** (needs guest kernel, rootfs with `guest-agent/` installed, TAP + nftables). Highest risk item: the guest agent is now written and tested end-to-end against the Python host client over a Firecracker-style vsock proxy, but nothing has run inside a real microVM.
 2. Wire the egress broker into the data plane (nftables DROP-all except the broker's
    per-cell proxy address) so the allowlist is enforced by the host, not by code in the cell.
 3. Cedar policy backend for tool/egress rules; Sigstore (keyless) signer; checkpoint
