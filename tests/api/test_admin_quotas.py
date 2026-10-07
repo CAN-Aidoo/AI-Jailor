@@ -250,3 +250,32 @@ async def test_tampering_with_the_stored_history_is_reported(client: AsyncClient
     ev.details["to"] = {"max_snapshot_count": 100}                       # someone rewrites history
     d = (await client.get(aurl(test_tenant.id), headers=OP)).json()["data"]
     assert d["chain_intact"] is False
+
+
+@pytest.mark.asyncio
+async def test_quota_history_survives_a_restart_with_the_database_audit_log(
+        client: AsyncClient, test_tenant, tmp_path, monkeypatch):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from aijailer.db.base import Base
+    from aijailer.models.audit_log import AuditCheckpointRow, AuditEventRow
+    from aijailer.services import audit_service as asv
+    from aijailer.services.attestation import Ed25519Signer
+    from aijailer.services.audit_store import DbAuditStore
+    eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/a.db", connect_args={"timeout": 30})
+    async with eng.begin() as c:
+        await c.run_sync(lambda s: Base.metadata.create_all(
+            s, tables=[AuditEventRow.__table__, AuditCheckpointRow.__table__]))
+    sf = async_sessionmaker(eng, expire_on_commit=False)
+
+    def boot():                                                   # a "process start"
+        monkeypatch.setattr(asv, "_audit_service", asv.AuditService(
+            signer=Ed25519Signer.from_secret("k"), store=DbAuditStore(sf)))
+    boot()
+    await client.patch(url(test_tenant.id), headers=OP, json={"max_snapshot_count": 7})
+    await client.patch(url(test_tenant.id), headers=OP, json={"max_snapshot_count": 9})
+    boot()                                                        # restart: fresh service, same DB
+    d = (await client.get(aurl(test_tenant.id), headers=OP)).json()["data"]
+    assert d["durable"] is True and d["chain_intact"] is True
+    assert [e["to"]["max_snapshot_count"] for e in d["events"]] == [9, 7]
+    await eng.dispose()

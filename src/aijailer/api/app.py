@@ -67,12 +67,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from aijailer.secretstore.runtime import startup_check
 
     await startup_check()
+
+    # Audit log: build now so a misconfiguration (e.g. no signing secret with the database
+    # backend) stops startup instead of the first request; checkpoint durable chains periodically.
+    from aijailer.services.audit_service import AuditCheckpointer, get_audit_service
+
+    audit = get_audit_service()
+    checkpointer = None
+    if audit.durable:
+        checkpointer = AuditCheckpointer(audit, settings.audit_checkpoint_interval_seconds)
+        checkpointer.start()
     net_runtime = await start_network_runtime(
         get_microvm_engine(), session_factory=async_session_factory)
 
     yield
 
     # Shutdown
+    if checkpointer is not None:
+        await checkpointer.stop()
     if net_runtime is not None:
         await net_runtime.stop()
     app.state.rate_limit_store.clear()

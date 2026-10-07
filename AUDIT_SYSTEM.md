@@ -366,3 +366,44 @@ The hash chain verification process detects any gaps in the event stream. If a g
 2. Gap metadata recorded (which events are missing, time range).
 3. Recovery attempted from node-local buffers if available.
 4. Compliance reports for the affected time range flagged with a gap warning.
+
+## Current implementation: database-backed log (what actually runs today)
+
+The Kafka -> ClickHouse pipeline above is the target architecture. Today the audit log is written **directly to the
+application database** by `AuditService` (`services/audit_service.py`) through a pluggable store
+(`services/audit_store.py`):
+
+| `AUDIT_BACKEND` | Behaviour |
+|---|---|
+| `auto` (default) | `memory` when `AIJAILER_ENV=dev`, otherwise `db` |
+| `db` | `audit_events` + `audit_checkpoints` tables (migration `007_audit_log`) |
+| `memory` | volatile; history is lost on restart (a warning is logged outside dev; `durable: false` in API responses) |
+
+**Chains.** One hash chain per (tenant, cell); non-cell events (secrets, quota changes) use the nil cell id. Each event
+hashes every field plus its predecessor's hash, and has a per-chain `seq`. `UNIQUE (tenant_id, cell_id, seq)` is the write
+lock: two writers extending the same head cannot both succeed, the loser re-reads the head and retries (so concurrent
+writers never fork or lose a chain). Each append is its own short transaction on its own session, so an audit record
+survives a request that later rolls back, and never depends on one. A failed append raises: the operation that needed
+the record is not silently unaudited.
+
+**Append-only.** On PostgreSQL the migration installs `BEFORE UPDATE OR DELETE` triggers that reject any change to
+`audit_events` and `audit_checkpoints`, even from the application role. Retention or erasure therefore needs a deliberate
+privileged procedure (disable the trigger, re-anchor the chain, record that you did). *Not exercised by the test suite*
+(SQLite has no such triggers); verify on your Postgres.
+
+**Checkpoints.** A bare hash chain cannot see tail truncation or a consistent rebuild of the whole chain. A background task
+(`AUDIT_CHECKPOINT_INTERVAL_SECONDS`, default 300, plus a final pass on clean shutdown) signs (head hash, length) with
+Ed25519 (DSSE/in-toto) for every chain that grew and stores it. `verify` checks every link, every hash, and that each
+checkpoint's head is still at its position. Deleting head or middle rows, editing any field, truncating after a checkpoint
+and rebuilding consistently are all detected (tests); events written after the last checkpoint can still be truncated
+undetected, bounded by the interval.
+
+**Signing key.** `AUDIT_SIGNING_SECRET` derives the key (HKDF). It is **required** with the database backend outside dev:
+an ephemeral key would orphan every earlier checkpoint on restart and silently disable truncation detection (startup
+fails instead). Checkpoints signed by a different key (after rotating the secret) are reported as
+`checkpoints_unverifiable`, not trusted and not counted as tampering; anyone who holds the signing secret AND database
+write access can forge history, so keep the secret out of the database's reach (secret manager / KMS).
+
+**Limits.** One database write (and connection checkout) per event; high-volume sources such as per-request proxy
+decisions will want batching or the Kafka path. Verification streams a chain in pages of 5000 but is O(chain length).
+

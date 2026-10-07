@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # Bearer token for the operator API (/v1/admin/*: per-tenant quota overrides). Separate from
     # tenant API keys on purpose. Unset => the operator API does not exist (404).
     admin_token: str = Field(default="", alias="ADMIN_TOKEN")
+    # Audit log: "auto" = database outside dev, memory in dev. The database backend needs a stable
+    # signing secret (checkpoint signatures must verify across restarts) unless AIJAILER_ENV=dev.
+    audit_backend: str = Field(default="auto", alias="AUDIT_BACKEND")
+    audit_signing_secret: str = Field(default="", alias="AUDIT_SIGNING_SECRET")
+    audit_checkpoint_interval_seconds: float = Field(
+        default=300.0, alias="AUDIT_CHECKPOINT_INTERVAL_SECONDS")
     # Tenant secret store: "id:base64key[,id2:base64key2]" (32 raw bytes each). Unset => the secret
     # store is DISABLED (API returns 503, brokers get no secrets); there is no insecure default.
     secrets_master_keys: str = Field(default="", alias="SECRETS_MASTER_KEYS")

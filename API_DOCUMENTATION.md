@@ -366,8 +366,8 @@ own owner/admin must not be able to raise the limits that bound them; their keys
   `previous_hash`/`event_hash` chain links. Query: `limit` (1-500, default 50), `before` (exclusive ISO timestamp; pass the
   previous page's `next_before`, which is `null` on the last page) and `action`. The tenant's hash-chained audit log is
   verified on every call: `chain_intact: false` means the stored history was altered or truncated and the entries must not
-  be trusted. `durable: false` means the audit store is in-memory, so history from before the last restart is not
-  available (the production store is ClickHouse). Pages use the timestamp as a cursor, so events written in the same
+  be trusted. `durable: false` means the audit store is in-memory (`AUDIT_BACKEND=memory`, the default in dev), so history from before the
+  last restart is not available; with the database backend (the default outside dev, see AUDIT_SYSTEM.md) it is `true`. Pages use the timestamp as a cursor, so events written in the same
   microsecond could straddle a page boundary.
 
 Lowering a limit below current usage is allowed: existing snapshots stay, new ones get 429 until usage drops (reported

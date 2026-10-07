@@ -550,3 +550,10 @@ All schema changes managed via Alembic (SQLAlchemy migrations):
 - Every migration is tested against a production-like dataset before deployment.
 - Zero-downtime migrations only (no table locks on large tables).
 - New columns added as nullable first, backfilled, then made non-nullable.
+
+### audit_events / audit_checkpoints (migration 007)
+
+`audit_events(id, tenant_id, cell_id, seq, event_type, severity, timestamp, details, source_ip, api_key_id, request_id,
+previous_hash, event_hash)` with `UNIQUE (tenant_id, cell_id, seq)`; `audit_checkpoints(id, tenant_id, cell_id, length, head,
+key_id, envelope, created_at)`. Append-only (PostgreSQL triggers reject UPDATE/DELETE). See AUDIT_SYSTEM.md.
+

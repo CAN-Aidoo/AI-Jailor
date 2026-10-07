@@ -79,7 +79,7 @@ async def test_detail_tamper_detected():
 @pytest.mark.asyncio
 async def test_tail_truncation_detected_via_signed_checkpoint():
     svc, t, c = await _filled()
-    svc.checkpoint(t, c)
+    await svc.checkpoint(t, c)
     svc._events.pop()
     assert not await svc.verify_chain(t, c)
 
@@ -87,7 +87,7 @@ async def test_tail_truncation_detected_via_signed_checkpoint():
 @pytest.mark.asyncio
 async def test_full_rebuild_detected_via_checkpoint():
     svc, t, c = await _filled()
-    svc.checkpoint(t, c)
+    await svc.checkpoint(t, c)
     svc._events[1].details["i"] = 42
     # attacker recomputes the whole chain consistently
     prev = ""
@@ -101,6 +101,6 @@ async def test_full_rebuild_detected_via_checkpoint():
 @pytest.mark.asyncio
 async def test_clean_chain_with_checkpoint_verifies():
     svc, t, c = await _filled()
-    svc.checkpoint(t, c)
+    await svc.checkpoint(t, c)
     await svc.record_event(t, c, EventType.EXECUTION, details={"i": 99})
     assert await svc.verify_chain(t, c)
