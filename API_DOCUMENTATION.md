@@ -850,3 +850,37 @@ intersection to stdout, one item per line.
 
 Limits: semi-honest security only, demo-grade, about 0.1 s per item pair. See the README for what it does
 not protect (notably, low-entropy identifiers can be enumerated by the receiver).
+
+### Loopback inside a cell (no endpoints)
+
+Loopback adds **no routes, fields or error codes**. It is part of the environment commands run in, through
+`POST /v1/cells/{cell_id}/exec` and `/exec/script`.
+
+- **`127.0.0.1` works inside a cell.** The guest init (`aijailer-agent`) brings the loopback interface up at
+  boot, so a command, and any process it starts, can run a local server and connect to it. `localhost` means
+  *that* cell only; it never reaches the host or another cell. A freshly booted kernel starts with `lo` down
+  (connections to `127.0.0.1` then fail with `Network is unreachable`), so a cell whose base image contains an
+  `aijailer-agent` built **before** this fix needs the image rebuilt (`make -C guest-agent rootfs-install`, or
+  `scripts/e2e/build-rootfs.sh`). See NETWORKING.md and PEER_LINKS.md ("Local hand-off and loopback").
+- **In-guest only.** Loopback traffic never leaves the guest kernel, so the cell's network policy, bandwidth
+  limits and network audit events do not apply to it, and it is not visible to the platform. Only what leaves the
+  cell (through the egress broker or a peer link) is policed and audited. Details: SECURITY_MODEL.md, "Loopback
+  inside the cell".
+- **HTTP clients and the proxy variables.** Cells get `http_proxy`/`HTTP_PROXY`/`https_proxy`/`HTTPS_PROXY`
+  pointing at the egress broker and an **empty** `NO_PROXY`. Clients that honour those variables send even
+  `http://127.0.0.1:PORT/` through the proxy instead of connecting locally. Checked with the guest image's
+  Python `urllib` and `curl` against a dead proxy address: both failed to reach a local server with `NO_PROXY`
+  empty and succeeded with `NO_PROXY=127.0.0.1,localhost`. In a real cell the proxy is the broker, which blocks
+  private addresses by design, so such a request would be refused (not tested end to end). Go's standard library
+  is documented to skip the proxy for loopback addresses (not tested here). Plain TCP sockets are not affected
+  (the PSI example talks to its local helper this way).
+
+  Set the bypass inline in the command, both spellings because clients differ in which they read:
+
+      NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost curl -s http://127.0.0.1:8080/
+
+- **Known gap: the `environment` field of `/exec` has no effect today.** The request's `environment` and
+  `working_directory` are stored with the execution record but are not passed to the guest (the engine call
+  takes only the command, timeout and user), so setting `NO_PROXY` there does nothing. The cell-creation
+  `environment` cannot override the platform's proxy variables either (the platform's values win). Until that is
+  fixed, set variables inline in the command as shown above.
