@@ -26,7 +26,8 @@ Any failure replies `{"error": "..."}`. The host treats replies as untrusted gue
 - stdout/stderr capped at 4 MiB each (child is never SIGPIPE'd); 16 MiB frame cap; max 16 concurrent execs.
 - `put_file` is atomic temp+rename (a planted symlink is replaced, never followed);
   `get_file` uses `O_NOFOLLOW|O_NONBLOCK` and only regular files.
-- As PID 1: mounts /proc(hidepid=2) /sys /dev /dev/pts /tmp(nosuid,nodev), powers off on SIGINT/SIGTERM
+- As PID 1: mounts /proc(hidepid=2) /sys /dev /dev/pts /tmp(nosuid,nodev), brings the loopback interface up (a fresh kernel
+  starts with `lo` down, so `127.0.0.1` would be unreachable), powers off on SIGINT/SIGTERM
   (Firecracker `SendCtrlAltDel`), never exits.
 
 ## Build / install

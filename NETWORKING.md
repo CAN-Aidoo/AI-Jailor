@@ -447,13 +447,15 @@ host proxy described above. The PSI frames are about 256 bytes per element, so t
 reveal set sizes to anyone who can read the audit log.
 
 **Guest requirement: loopback must be up.** The local hand-off between `psi.py` and `aijailer-peer` needs the
-guest's `lo` interface to be up. The guest init (`guest-agent/init_linux.go`, `setupInit`) mounts
-`/proc`, `/sys`, `/dev` and `/tmp` but does not bring `lo` up, and the boot arguments configure only
-`eth0` (`ip=<guest>::<host>:<mask>::eth0:off`). In a fresh network namespace, where `lo` starts down like a
-freshly booted kernel's, a localhost TCP connection fails with `Network is unreachable` until `lo` is
-brought up, and works immediately afterwards. Whether the guest kernel's `ip=` autoconfiguration happens to
-bring `lo` up could not be checked here (no KVM), so until the guest init does it explicitly, treat the
-loopback hand-off as **unverified in a real cell**; the helper's `--stdio` mode does not need loopback.
+guest's `lo` interface to be up. A freshly booted kernel starts with `lo` down, and the boot arguments
+configure only `eth0` (`ip=<guest>::<host>:<mask>::eth0:off`), so a TCP connection to `127.0.0.1` fails
+with `Network is unreachable`. The guest init (`guest-agent/init_linux.go`, `setupInit`) therefore brings
+`lo` up with an ioctl (`bringUpLoopback`; no `ip` binary needed in the image). Verified: unit tests in a fresh
+network namespace (loopback unreachable before, reachable after, idempotent, and an error is reported when
+the ioctl is not permitted); and the real agent binary run as PID 1 in fresh PID, mount and network
+namespaces inside the guest rootfs, where a workload running as the unprivileged `agent` user could connect
+to `127.0.0.1`, whereas the agent built from the commit before the change reproduced `Network is
+unreachable`. The helper's `--stdio` mode never needed loopback.
 
 **Verified / not verified.** Verified: the relay path with real sockets through the real proxy and hub, and PSI
 end to end over it (host network; also with both programs running in the guest rootfs's userland as the

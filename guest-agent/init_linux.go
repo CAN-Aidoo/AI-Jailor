@@ -76,6 +76,28 @@ func mountIfNeeded(src, target, fstype string, flags uintptr, data string) {
 	}
 }
 
+// bringUpLoopback sets IFF_UP on lo; the kernel then assigns 127.0.0.1. A freshly booted kernel
+// starts with lo DOWN, and its ip= autoconfiguration only configures the device it names (eth0), so
+// without this a TCP connection to 127.0.0.1 fails with "network is unreachable". That breaks every
+// workload that talks to a local helper, for example `aijailer-peer --listen 127.0.0.1:PORT` with a
+// workload connecting to it. Uses an ioctl, so no `ip` binary is needed in the image. Idempotent.
+func bringUpLoopback() error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	ifr, err := unix.NewIfreq("lo")
+	if err != nil {
+		return err
+	}
+	if err := unix.IoctlIfreq(fd, unix.SIOCGIFFLAGS, ifr); err != nil {
+		return err
+	}
+	ifr.SetUint16(ifr.Uint16() | unix.IFF_UP)
+	return unix.IoctlIfreq(fd, unix.SIOCSIFFLAGS, ifr)
+}
+
 // setupInit prepares a bare guest when we are PID 1.
 func setupInit() {
 	mountIfNeeded("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "hidepid=2")
@@ -83,6 +105,9 @@ func setupInit() {
 	mountIfNeeded("devtmpfs", "/dev", "devtmpfs", unix.MS_NOSUID, "mode=0755")
 	mountIfNeeded("devpts", "/dev/pts", "devpts", unix.MS_NOSUID|unix.MS_NOEXEC, "gid=5,mode=0620")
 	mountIfNeeded("tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777,size=512m")
+	if err := bringUpLoopback(); err != nil {
+		log.Printf("loopback: %v", err) // not fatal, but localhost will not work for workloads
+	}
 	go reapOrphans()
 }
 
