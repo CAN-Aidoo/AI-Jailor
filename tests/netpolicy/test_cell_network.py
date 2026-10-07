@@ -672,3 +672,84 @@ async def test_refresh_resolves_secrets_once_per_tenant_not_once_per_cell():
     sec.secrets_for = down
     calls.clear()
     assert await n.refresh_secrets(t1, fail_closed=True) == 3 and calls == [t1]
+
+
+# ---------------------------------------------------------------- loopback must bypass the proxy
+LOCAL = "127.0.0.1,localhost"
+
+
+@pytest.mark.asyncio
+async def test_cells_get_a_no_proxy_that_keeps_loopback_local_in_both_spellings():
+    n, _, _ = mk()
+    p = await n.provision(uuid.uuid4(), uuid.uuid4(), POLICY)
+    assert p.env["NO_PROXY"] == LOCAL and p.env["no_proxy"] == LOCAL    # clients differ in which they read
+    assert p.env["https_proxy"] == p.proxy_url                           # everything else still goes via the broker
+
+
+def test_extra_env_can_still_override_it():
+    n = CellNetwork(manager=None, link_ops=None, extra_env={"NO_PROXY": "custom"})
+    assert n._proxy_env("http://x:1")["NO_PROXY"] == "custom"
+
+
+def _local_http_server(host="127.0.0.1"):
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"LOCAL SERVER")
+
+        def log_message(self, *a):
+            pass
+    try:
+        srv = http.server.HTTPServer((host, 0), H)
+    except OSError:
+        pytest.skip(f"cannot bind {host} here")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _apply_platform_env(monkeypatch):
+    """The environment a cell really gets, except that the 'broker' is a dead local port so that anything
+    sent through the proxy fails at once instead of reaching a real one."""
+    env = CellNetwork(manager=None, link_ops=None)._proxy_env("http://127.0.0.1:9")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+
+def test_python_clients_reach_a_local_server_but_other_destinations_still_use_the_proxy(monkeypatch):
+    import urllib.error
+    import urllib.request
+    _apply_platform_env(monkeypatch)
+    srv, other = _local_http_server(), _local_http_server("127.0.0.2")
+    try:
+        assert urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/", timeout=3).read() == b"LOCAL SERVER"
+        # A live server on 127.0.0.2 is NOT on the list, so the client must send it to the (dead) proxy and
+        # fail; if the bypass were any wider it would connect straight to this server and succeed.
+        with pytest.raises(urllib.error.URLError):
+            urllib.request.urlopen(f"http://127.0.0.2:{other.server_address[1]}/", timeout=3)
+    finally:
+        srv.shutdown()
+        other.shutdown()
+
+
+def test_curl_reaches_a_local_server_but_other_destinations_still_use_the_proxy(monkeypatch):
+    import shutil
+    import subprocess
+    if shutil.which("curl") is None:
+        pytest.skip("no curl")
+    _apply_platform_env(monkeypatch)
+    srv, other = _local_http_server(), _local_http_server("127.0.0.2")
+    try:
+        ok = subprocess.run(["curl", "-s", "-m", "3", f"http://127.0.0.1:{srv.server_address[1]}/"],
+                            capture_output=True, text=True)
+        assert ok.stdout == "LOCAL SERVER"
+        # not on the list: goes to the dead proxy and fails even though a live server is right there
+        off = subprocess.run(["curl", "-s", "-m", "3", f"http://127.0.0.2:{other.server_address[1]}/"],
+                             capture_output=True, text=True)
+        assert off.returncode != 0 and off.stdout == ""
+    finally:
+        srv.shutdown()
+        other.shutdown()

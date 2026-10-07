@@ -28,6 +28,9 @@ from aijailer.netpolicy.shaping import Bandwidth
 
 logger = structlog.get_logger(__name__)
 
+# Destinations proxy-aware clients inside a cell must reach directly (see CellNetwork._proxy_env).
+LOCAL_NO_PROXY = "127.0.0.1,localhost"
+
 
 class SecretProvider(Protocol):
     async def secrets_for(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> list[SecretBinding]: ...
@@ -231,8 +234,12 @@ class CellNetwork:
         return f"http://{net.host_ip}:{net.broker_port}"
 
     def _proxy_env(self, url: str) -> dict:
+        # Loopback never leaves the guest, so proxy-aware clients must connect to it directly: with an
+        # empty NO_PROXY they send http://127.0.0.1:PORT/ to the egress broker, which refuses it. Both
+        # spellings are set because clients differ in which they read (Python and curl prefer lowercase).
+        # This is only a client hint: what a cell can reach is enforced by nftables, not by these variables.
         return {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
-                "NO_PROXY": "", **self._extra_env}
+                "NO_PROXY": LOCAL_NO_PROXY, "no_proxy": LOCAL_NO_PROXY, **self._extra_env}
 
     def env_for(self, cell_id: uuid.UUID) -> dict:
         """The platform-injected guest environment of a provisioned cell ({} if none); lets a

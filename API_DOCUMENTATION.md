@@ -867,20 +867,22 @@ Loopback adds **no routes, fields or error codes**. It is part of the environmen
   cell (through the egress broker or a peer link) is policed and audited. Details: SECURITY_MODEL.md, "Loopback
   inside the cell".
 - **HTTP clients and the proxy variables.** Cells get `http_proxy`/`HTTP_PROXY`/`https_proxy`/`HTTPS_PROXY`
-  pointing at the egress broker and an **empty** `NO_PROXY`. Clients that honour those variables send even
-  `http://127.0.0.1:PORT/` through the proxy instead of connecting locally. Checked with the guest image's
-  Python `urllib` and `curl` against a dead proxy address: both failed to reach a local server with `NO_PROXY`
-  empty and succeeded with `NO_PROXY=127.0.0.1,localhost`. In a real cell the proxy is the broker, which blocks
-  private addresses by design, so such a request would be refused (not tested end to end). Go's standard library
-  is documented to skip the proxy for loopback addresses (not tested here). Plain TCP sockets are not affected
-  (the PSI example talks to its local helper this way).
+  pointing at the egress broker, and `NO_PROXY`/`no_proxy` set to `127.0.0.1,localhost` (both spellings, because
+  clients differ in which they read), so proxy-aware clients such as `curl` and Python's `urllib` connect to
+  `http://127.0.0.1:PORT/` locally instead of sending it to the broker. Only those two names bypass the proxy:
+  any other destination, including other loopback addresses such as `127.0.0.2`, still goes through it. These
+  variables are a hint to clients; what a cell can actually reach is enforced by the host firewall. Go's standard
+  library is documented to skip the proxy for loopback addresses anyway (not tested here), and plain TCP sockets
+  are never affected (the PSI example talks to its local helper this way).
 
-  Set the bypass inline in the command, both spellings because clients differ in which they read:
+  Cells created before this default (and any custom image or init that sets its own variables) can have an
+  **empty** `NO_PROXY`; then even local HTTP requests go to the broker, which blocks private addresses and so
+  refuses them. Set the bypass inline in the command:
 
       NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost curl -s http://127.0.0.1:8080/
 
 - **Known gap: the `environment` field of `/exec` has no effect today.** The request's `environment` and
   `working_directory` are stored with the execution record but are not passed to the guest (the engine call
-  takes only the command, timeout and user), so setting `NO_PROXY` there does nothing. The cell-creation
+  takes only the command, timeout and user), so variables set there (for example a different `NO_PROXY`) do nothing. The cell-creation
   `environment` cannot override the platform's proxy variables either (the platform's values win). Until that is
   fixed, set variables inline in the command as shown above.

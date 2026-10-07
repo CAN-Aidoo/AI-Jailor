@@ -433,8 +433,10 @@ layer:
   broker's content and credential checks do not see the traffic, which is end-to-end TLS 1.3 between the
   cells (see SECURITY_MODEL.md, "Peer links and the PSI example workload").
 - **Environment.** When `PEER_ATTESTATION_SECRET` is set the cell also receives
-  `AIJAILER_PEER_ATTEST_PUBKEY` next to the usual proxy variables; `NO_PROXY` stays empty, so nothing is
-  configured to bypass the proxy.
+  `AIJAILER_PEER_ATTEST_PUBKEY` next to the usual proxy variables; `NO_PROXY` and `no_proxy` are
+  `127.0.0.1,localhost`, so loopback stays local (a proxy-aware client would otherwise send even
+  `http://127.0.0.1:PORT/` to the broker, which refuses it); nothing else is configured to bypass the proxy,
+  and what a cell can reach is enforced by the nftables rules, not by these variables.
 - **Accounting.** The session crosses the cell's TAP like all other traffic, so by construction the cell's tc
   shaping and the broker-port connection-rate rule apply to it. I have not tested peer traffic under shaping.
   Sessions are bounded by the relay itself: lifetime (default 1 h), idle time (5 min) and bytes (1 GiB), and are
