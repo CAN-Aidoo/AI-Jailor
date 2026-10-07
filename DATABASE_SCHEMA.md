@@ -30,6 +30,7 @@ CREATE TABLE tenants (
     max_persistent_storage_gb INTEGER NOT NULL DEFAULT 50,
     max_snapshot_count INTEGER NOT NULL DEFAULT 100,
     max_snapshots_per_cell INTEGER NOT NULL DEFAULT 10,
+    max_snapshot_storage_per_cell_gb INTEGER NOT NULL DEFAULT 10,
     max_snapshot_storage_gb INTEGER NOT NULL DEFAULT 50,  -- total snapshot bytes
     spending_cap_cents INTEGER,  -- NULL = no cap
 

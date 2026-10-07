@@ -325,16 +325,18 @@ support answer `501 snapshot_unsupported`; other failures `502 snapshot_failed` 
 }
 ```
 
-**Quotas**: each tenant has `max_snapshot_count`, `max_snapshots_per_cell` (default 10; stops one cell or agent loop
-taking the whole allowance) and `max_snapshot_storage_gb` (total bytes, since memory dumps dominate). All three are checked, and the slot reserved, before the guest is touched; exceeding either answers
-`429 resource_limit_exceeded` (`snapshots` / `snapshots_per_cell` / `snapshot_storage`). A snapshot being created counts at an upper-bound
+**Quotas**: each tenant has `max_snapshot_count`, `max_snapshots_per_cell` (default 10), `max_snapshot_storage_per_cell_gb` (default 10) and
+`max_snapshot_storage_gb` (tenant total bytes, since memory dumps dominate; the per-cell limits stop one cell or agent
+loop taking the whole allowance). All four are checked, and the slot reserved, before the guest is touched; exceeding either answers
+`429 resource_limit_exceeded` (`snapshots` / `snapshots_per_cell` / `snapshot_storage_per_cell` / `snapshot_storage`). A cell whose memory + disk
+alone exceed its per-cell size limit can never be snapshotted (the reservation is an upper bound). A snapshot being created counts at an upper-bound
 estimate (memory + configured disk) until its real size is known; a failed one gives its reservation back, and one stuck
 in `creating` longer than `RECONCILE_STUCK_SECONDS` (owner died) is expired so a crash cannot wedge the quota.
 
 #### GET /v1/snapshots/quota
 
 `{"data": {"count": 3, "max_count": 100, "bytes_used": 1073741824, "max_bytes": 53687091200}}`
-Add `?cell_id=<id>` to also get `cell_count` and `max_per_cell` for that cell (404 for a cell that is not yours).
+Add `?cell_id=<id>` to also get `cell_count`, `max_per_cell`, `cell_bytes` and `max_bytes_per_cell` for that cell (404 for a cell that is not yours).
 
 #### DELETE /v1/snapshots/{snapshot_id}
 

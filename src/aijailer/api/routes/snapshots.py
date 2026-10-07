@@ -118,12 +118,13 @@ async def snapshot_quota(
 ):
     """The tenant's snapshot usage against its limits (count and total bytes; in-flight
     snapshots are counted at their reserved size). With ``cell_id`` it also reports that cell's
-    count against the per-cell limit."""
+    count and bytes against the per-cell limits."""
     q = await SnapshotService(db).quota(auth.tenant_id, cell_id)
     data = {"count": q.count, "max_count": q.max_count,
             "bytes_used": q.bytes_used, "max_bytes": q.max_bytes}
     if cell_id is not None:
-        data.update(cell_count=q.cell_count, max_per_cell=q.max_per_cell)
+        data.update(cell_count=q.cell_count, max_per_cell=q.max_per_cell,
+                    cell_bytes=q.cell_bytes, max_bytes_per_cell=q.max_bytes_per_cell)
     return ApiResponse(data=data)
 
 

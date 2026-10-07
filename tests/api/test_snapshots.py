@@ -160,6 +160,7 @@ async def test_per_cell_limit_429_and_quota_endpoint_reports_it(client: AsyncCli
     assert r.status_code == 429 and "snapshots_per_cell" in r.text
     q = (await client.get(f"/v1/snapshots/quota?cell_id={cell_id}")).json()["data"]
     assert (q["cell_count"], q["max_per_cell"], q["count"]) == (1, 1, 2)
+    assert q["max_bytes_per_cell"] == 10 * (1 << 30) and q["cell_bytes"] is not None
     import uuid
     assert (await client.get(f"/v1/snapshots/quota?cell_id={uuid.uuid4()}")).status_code == 404
     assert "cell_count" not in (await client.get("/v1/snapshots/quota")).json()["data"]

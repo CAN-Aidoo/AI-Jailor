@@ -536,3 +536,47 @@ async def test_cell_quota_query_is_tenant_scoped(world, db_session):
     with pytest.raises(Exception) as e:
         await snaps.quota(other.id, cell.id)
     assert getattr(e.value, "code", "") == "cell_not_found"
+
+
+# ------------------------------------------------------------------ per-cell size limit
+@pytest.mark.asyncio
+async def test_per_cell_size_limit_uses_real_sizes_and_the_reserved_estimate(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    # cell = 256 MiB memory + 512 MiB disk => 768 MiB reserved per snapshot; per-cell cap 1 GiB
+    tenant.max_snapshot_storage_per_cell_gb = 1
+    tenant.max_snapshots_per_cell = 10
+    first = await snaps.create_snapshot(cell.id, tenant.id, "a", None)
+    assert first.total_size_bytes == 150                      # real (tiny) size replaced the estimate
+    await snaps.create_snapshot(cell.id, tenant.id, "b", None)   # 300 B + 768 MiB still fits
+    cell.memory_mb = 900                                      # 900 + 512 MiB estimate > 1 GiB
+    log.clear()
+    with pytest.raises(AiJailerError) as e:
+        await snaps.create_snapshot(cell.id, tenant.id, "c", None)
+    assert e.value.code == "resource_limit_exceeded"
+    assert "snapshot_storage_per_cell" in e.value.message and "vm:snapshot" not in log
+    q = await snaps.quota(tenant.id, cell.id)
+    assert (q.cell_bytes, q.max_bytes_per_cell) == (300, 1 << 30)
+
+
+@pytest.mark.asyncio
+async def test_per_cell_size_counts_real_bytes_of_existing_snapshots(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshot_storage_per_cell_gb = 1
+    db_session.add(Snapshot(tenant_id=tenant.id, cell_id=cell.id, status="available",
+                            cell_config={}, total_size_bytes=(1 << 30) - 100 * (1 << 20)))
+    await db_session.commit()                                 # 924 MiB used by this cell
+    with pytest.raises(AiJailerError) as e:                   # +768 MiB estimate > 1 GiB
+        await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    assert "snapshot_storage_per_cell" in e.value.message
+    other = await cells.create_cell(                          # a different cell has its own budget
+        tenant_id=tenant.id, name="o", image="i", vcpus=1, memory_mb=64, disk_mb=64,
+        network_bandwidth_mbps=1, security_policy_id=tenant.id, environment={}, tags={})
+    await snaps.create_snapshot(other.id, tenant.id, None, None)
+    # error rows and other tenants' rows with the same cell id are not counted
+    tenant.max_snapshot_storage_per_cell_gb = 2
+    db_session.add(Snapshot(tenant_id=uuid.uuid4(), cell_id=cell.id, status="available",
+                            cell_config={}, total_size_bytes=50 << 30))
+    db_session.add(Snapshot(tenant_id=tenant.id, cell_id=cell.id, status="error",
+                            cell_config={}, total_size_bytes=50 << 30))
+    await db_session.commit()
+    await snaps.create_snapshot(cell.id, tenant.id, None, None)
