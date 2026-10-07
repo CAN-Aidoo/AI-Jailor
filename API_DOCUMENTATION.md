@@ -821,3 +821,32 @@ protocol and threat model: PEER_LINKS.md. All routes need `PEER_ATTESTATION_SECR
 
 Error codes: `peer_link_not_found` 404, `peer_link_invalid` 400, `peer_link_conflict` 409,
 `peer_link_limit` 429, `peer_links_disabled` 503.
+
+### Example workload: private set intersection (no platform endpoints)
+
+PSI adds **no REST routes and no platform state**. The platform only provides the peer link above; the
+computation is the reference program `examples/psi/psi.py` (see `examples/psi/README.md` and the
+"Example workload" section of PEER_LINKS.md), which runs inside the two cells and talks to its peer through
+`aijailer-peer` on a local socket. To use it: propose and accept a peer link, read `link_id` from the
+response, then start `aijailer-peer --link <link_id> --listen 127.0.0.1:7000` and `psi.py ... --context
+<link_id> --connect 127.0.0.1:7000` in each cell.
+
+The wire format between the two `psi.py` processes (carried inside the link's TLS, never seen by the
+platform in the clear) is a sequence of frames: `version (1 byte, =1) | kind (1 byte) | count (4 bytes,
+big-endian) | count x 256-byte big-endian group elements`.
+
+| Kind | Name | Direction | Count must be |
+|---|---|---|---|
+| 1 | blinded items | receiver -> sender | at most the item limit |
+| 2 | doubly blinded items | sender -> receiver | exactly the number of items the receiver sent |
+| 3 | sender's blinded set | sender -> receiver | at most the item limit |
+
+Every element must be a quadratic residue in the RFC 3526 2048-bit group other than 1 and p-1; a frame
+with a wrong version or kind, an over-limit or mismatched count, an invalid element or a truncated body
+ends the run with a `psi_error` status line and exit code 1. The item limit defaults to 50,000
+(`--max-items`). Command-line exit codes: 0 success, 1 protocol or I/O error. Status goes to stderr as JSON
+(`psi_done` with set sizes, plus `intersection` on the receiver, or `psi_error`); the receiver prints the
+intersection to stdout, one item per line.
+
+Limits: semi-honest security only, demo-grade, about 0.1 s per item pair. See the README for what it does
+not protect (notably, low-entropy identifiers can be enumerated by the receiver).
