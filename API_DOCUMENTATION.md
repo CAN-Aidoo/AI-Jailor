@@ -333,6 +333,22 @@ alone exceed its per-cell size limit can never be snapshotted (the reservation i
 estimate (memory + configured disk) until its real size is known; a failed one gives its reservation back, and one stuck
 in `creating` longer than `RECONCILE_STUCK_SECONDS` (owner died) is expired so a crash cannot wedge the quota.
 
+#### GET /metrics (operator, Prometheus)
+
+Disabled (404) unless `METRICS_TOKEN` is set; then requires `Authorization: Bearer <METRICS_TOKEN>` (401 otherwise).
+Not tenant-scoped: it exports every active tenant, so scrape it from your monitoring network only.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `aijailer_snapshot_quota_used` | gauge | `tenant`, `quota` | In use: snapshots (count quotas) or bytes (storage quotas); the per-cell quotas report the tenant's **fullest cell** |
+| `aijailer_snapshot_quota_limit` | gauge | `tenant`, `quota` | The limit, same units |
+| `aijailer_snapshot_quota_denied_total` | counter | `tenant`, `quota` | Creations refused because that quota was reached (per process; resets on restart) |
+
+`quota` is one of `snapshots`, `snapshot_storage`, `snapshots_per_cell`, `snapshot_storage_per_cell`. Counting follows
+the enforcement rules exactly (in-flight counts, failed/stuck do not), so `used / limit >= 1` is the condition that starts
+refusing requests. Example alert: `max by (tenant, quota) (aijailer_snapshot_quota_used / aijailer_snapshot_quota_limit) > 0.9`.
+Cardinality is tenants x 4 quotas; there is deliberately no per-cell label.
+
 #### GET /v1/snapshots/quota
 
 `{"data": {"count": 3, "max_count": 100, "bytes_used": 1073741824, "max_bytes": 53687091200}}`

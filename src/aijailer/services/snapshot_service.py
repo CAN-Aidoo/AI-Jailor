@@ -34,6 +34,7 @@ from aijailer.models.audit import EventType
 from aijailer.models.cell import Cell
 from aijailer.models.snapshot import Snapshot
 from aijailer.models.tenant import Tenant
+from aijailer.services import quota_metrics
 from aijailer.services.cell_service import CellService
 
 logger = structlog.get_logger(__name__)
@@ -203,27 +204,27 @@ class SnapshotService:
                                         .with_for_update())).scalar_one()
         count, used = await self._usage(tid)
         if count >= tenant.max_snapshot_count:
-            await self.db.commit()
-            raise ResourceLimitExceededError("snapshots", str(tenant.max_snapshot_count))
+            await self._deny(tid, "snapshots", str(tenant.max_snapshot_count))
         cell_count, cell_bytes = await self._cell_usage(tid, cell.id)
         if cell_count >= tenant.max_snapshots_per_cell:
-            await self.db.commit()
-            raise ResourceLimitExceededError("snapshots_per_cell",
-                                             str(tenant.max_snapshots_per_cell))
+            await self._deny(tid, "snapshots_per_cell", str(tenant.max_snapshots_per_cell))
         estimate = (cell.memory_mb + cell.disk_mb) * _MIB
         if cell_bytes + estimate > tenant.max_snapshot_storage_per_cell_gb * _GIB:
-            await self.db.commit()
-            raise ResourceLimitExceededError(
-                "snapshot_storage_per_cell", f"{tenant.max_snapshot_storage_per_cell_gb} GB")
+            await self._deny(tid, "snapshot_storage_per_cell",
+                             f"{tenant.max_snapshot_storage_per_cell_gb} GB")
         if used + estimate > tenant.max_snapshot_storage_gb * _GIB:
-            await self.db.commit()
-            raise ResourceLimitExceededError(
-                "snapshot_storage", f"{tenant.max_snapshot_storage_gb} GB")
+            await self._deny(tid, "snapshot_storage", f"{tenant.max_snapshot_storage_gb} GB")
         snap = Snapshot(tenant_id=tid, cell_id=cell.id, name=name, description=description,
                         status="creating", cell_config={}, total_size_bytes=estimate)
         self.db.add(snap)
         await self.db.commit()                    # releases the lock; reservation is now visible
         return snap
+
+    async def _deny(self, tenant_id: uuid.UUID, quota: str, limit: str):
+        """Refuse a creation: release the tenant lock, count it for the metrics, raise 429."""
+        await self.db.commit()
+        quota_metrics.record_denial(tenant_id, quota)
+        raise ResourceLimitExceededError(quota, limit)
 
     async def _release(self, snap: Snapshot, path: str) -> None:
         """Give a failed snapshot's reservation back (row and any partial files)."""

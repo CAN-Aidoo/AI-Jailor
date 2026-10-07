@@ -109,8 +109,7 @@ async def world(db_session, monkeypatch, tmp_path):
     log = []
     eng = Engine(log, tmp_path)
     monkeypatch.setattr(cell_service, "get_microvm_engine", lambda: eng)
-    s = get_settings()
-    monkeypatch.setattr(s, "snapshot_dir", str(tmp_path / "snaps"))
+    monkeypatch.setenv("SNAPSHOT_DIR", str(tmp_path / "snaps"))     # get_settings() is uncached
     net = AllocNet(log)
     tenant = Tenant(name="t", slug=f"t-{uuid.uuid4().hex[:6]}", status="active", tier="pro",
                     max_concurrent_cells=3)
@@ -453,11 +452,11 @@ async def test_delete_removes_files_refuses_in_flight_and_keeps_row_if_files_sta
     snap = await snaps.create_snapshot(cell.id, tenant.id, None, None)
     path = snaps._dir(snap)
     assert os.path.isdir(path)
-    monkeypatch.setattr(SnapshotService, "_discard_dir", staticmethod(lambda p: None))
-    with pytest.raises(AiJailerError) as e:                        # files could not be removed
-        await snaps.delete_snapshot(snap.id, tenant.id)
+    with monkeypatch.context() as m:
+        m.setattr(SnapshotService, "_discard_dir", staticmethod(lambda p: None))
+        with pytest.raises(AiJailerError) as e:                    # files could not be removed
+            await snaps.delete_snapshot(snap.id, tenant.id)
     assert e.value.code == "snapshot_delete_failed" and (await snaps.quota(tenant.id)).count == 1
-    monkeypatch.undo()
     snap.status = "creating"
     with pytest.raises(AiJailerError) as e:
         await snaps.delete_snapshot(snap.id, tenant.id)

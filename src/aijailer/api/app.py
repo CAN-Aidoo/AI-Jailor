@@ -6,14 +6,16 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from aijailer.core.config import get_settings
 from aijailer.core.exceptions import AiJailerError
 from aijailer.core.logging import configure_logging
+from aijailer.db.base import get_db
 
 from aijailer.api.routes import (
     cells,
@@ -262,6 +264,26 @@ def create_app() -> FastAPI:
     app.include_router(immune_route.router)
     app.include_router(compliance_route.router)
     app.include_router(metrics_route.router)
+
+    # --- Prometheus (operator): disabled unless METRICS_TOKEN is set ---
+    @app.get("/metrics", tags=["System"], include_in_schema=False)
+    async def prometheus_metrics(request: Request, db: AsyncSession = Depends(get_db)):
+        import hmac
+
+        from fastapi.responses import PlainTextResponse
+
+        from aijailer.core import promtext
+        from aijailer.core.config import get_settings
+        from aijailer.services import quota_metrics
+
+        token = get_settings().metrics_token
+        if not token:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        given = request.headers.get("authorization", "")
+        if not hmac.compare_digest(given.encode(), f"Bearer {token}".encode()):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"},
+                                headers={"WWW-Authenticate": "Bearer"})
+        return PlainTextResponse(await quota_metrics.collect(db), media_type=promtext.CONTENT_TYPE)
 
     # --- Health check ---
     @app.get("/health", tags=["System"])
