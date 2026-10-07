@@ -39,6 +39,7 @@ from aijailer.api.routes import (
     constraints as constraints_route,
     immune as immune_route,
     compliance as compliance_route,
+    admin as admin_route,
     metrics as metrics_route,
 )
 
@@ -140,6 +141,8 @@ def create_app() -> FastAPI:
             "cell_not_found": 404,
             "policy_not_found": 404,
             "snapshot_not_found": 404,
+            "tenant_not_found": 404,
+            "invalid_quota": 400,
             "snapshot_not_available": 409,
             "snapshot_address_in_use": 409,
             "snapshot_cell_mismatch": 400,
@@ -264,6 +267,7 @@ def create_app() -> FastAPI:
     app.include_router(immune_route.router)
     app.include_router(compliance_route.router)
     app.include_router(metrics_route.router)
+    app.include_router(admin_route.router)
 
     # --- Prometheus (operator): disabled unless METRICS_TOKEN is set ---
     @app.get("/metrics", tags=["System"], include_in_schema=False)

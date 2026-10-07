@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     jwt_secret: str = Field(default="change-me-in-production", alias="JWT_SECRET")
     # Bearer token for GET /metrics (Prometheus). Unset => the endpoint does not exist (404).
     metrics_token: str = Field(default="", alias="METRICS_TOKEN")
+    # Bearer token for the operator API (/v1/admin/*: per-tenant quota overrides). Separate from
+    # tenant API keys on purpose. Unset => the operator API does not exist (404).
+    admin_token: str = Field(default="", alias="ADMIN_TOKEN")
     # Tenant secret store: "id:base64key[,id2:base64key2]" (32 raw bytes each). Unset => the secret
     # store is DISABLED (API returns 503, brokers get no secrets); there is no insecure default.
     secrets_master_keys: str = Field(default="", alias="SECRETS_MASTER_KEYS")

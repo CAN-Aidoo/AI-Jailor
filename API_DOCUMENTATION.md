@@ -349,6 +349,25 @@ the enforcement rules exactly (in-flight counts, failed/stuck do not), so `used 
 refusing requests. Example alert: `max by (tenant, quota) (aijailer_snapshot_quota_used / aijailer_snapshot_quota_limit) > 0.9`.
 Cardinality is tenants x 4 quotas; there is deliberately no per-cell label.
 
+#### Operator API: per-tenant quota overrides (`/v1/admin/tenants/{tenant_id}/quotas`)
+
+Platform-operator only, authenticated by `Authorization: Bearer <ADMIN_TOKEN>`, **not** by tenant API keys (a tenant's
+own owner/admin must not be able to raise the limits that bound them; their keys get 401). Disabled (404) when
+`ADMIN_TOKEN` is unset; hidden from the OpenAPI schema. Unknown tenant: `404 tenant_not_found`.
+
+- `GET` returns `limits`, platform `defaults`, `usage` (snapshots, bytes), `over_limit` and `warnings`.
+- `PATCH` changes any subset of `max_snapshot_count` (default 100), `max_snapshots_per_cell` (10),
+  `max_snapshot_storage_gb` (50), `max_snapshot_storage_per_cell_gb` (10). Strict integers 0..1,000,000 (storage
+  0..10,000,000, a typo guard); `0` forbids new snapshots; unknown fields, nulls, strings, floats and booleans are
+  rejected (400/422) and change nothing. Effective on the next request, and the metrics follow on the next scrape.
+- `DELETE` resets all four to the defaults.
+
+Lowering a limit below current usage is allowed: existing snapshots stay, new ones get 429 until usage drops (reported
+in `over_limit`). Per-cell limits above the tenant totals are allowed but listed in `warnings` (the totals win).
+Every change is audited (action `quota_override_set` / `quota_override_reset`, severity warning, with the before/after
+values); no-op requests are not. Changes take the same tenant row lock as snapshot reservations, so they cannot
+interleave with one.
+
 #### GET /v1/snapshots/quota
 
 `{"data": {"count": 3, "max_count": 100, "bytes_used": 1073741824, "max_bytes": 53687091200}}`
@@ -716,6 +735,8 @@ X-RateLimit-Reset: 1705312260
 | `policy_violation` | 403 | Action blocked by security policy |
 | `resource_limit_exceeded` | 429 | Cell or tenant resource quota exceeded |
 | `snapshot_failed` | 502 | Snapshot creation failed |
+| `tenant_not_found` | 404 | Operator API: no such tenant |
+| `invalid_quota` | 400 | Operator API: invalid quota change (nothing applied) |
 | `snapshot_delete_failed` | 500 | Snapshot files could not be removed (row kept) |
 | `snapshot_unsupported` | 501 | The isolation backend cannot snapshot |
 | `snapshot_not_found` | 404 | No such snapshot for this tenant |
