@@ -162,10 +162,12 @@ async def agent_get_file(vsock_uds: str, port: int, path: str) -> bytes:
 
 
 async def agent_exec(vsock_uds: str, port: int, command: str, timeout: int,
-                     user: str, env: dict | None = None) -> ExecResult:
+                     user: str, env: dict | None = None, cwd: str | None = None) -> ExecResult:
     req = {"op": "exec", "cmd": command, "timeout": timeout, "user": user}
     if env:
         req["env"] = env
+    if cwd:
+        req["cwd"] = cwd
     resp = await agent_request(vsock_uds, port, req, timeout + 5)
     return ExecResult(
         exit_code=int(resp["exit_code"]), stdout=resp.get("stdout", ""),
@@ -636,14 +638,15 @@ class FirecrackerEngine(MicroVMEngine):
             self._launching.discard(config.cell_id)
 
     async def exec_command(self, cell_id: uuid.UUID, command: str, timeout: int = 30,
-                           user: str = "agent", env: dict[str, str] | None = None) -> ExecResult:
+                           user: str = "agent", env: dict[str, str] | None = None,
+                           cwd: str | None = None) -> ExecResult:
         vm = self._vm(cell_id)
         if vm["info"].status != VMStatus.RUNNING:
             raise RuntimeError(f"cell is {vm['info'].status.value}, cannot exec")
         # The cell's own environment (creation-time settings plus the platform's proxy variables), with the
         # per-command one on top. The caller has already refused platform-managed names (core.exec_env).
         return await self._agent_call(vm["info"].vsock_path, self.settings.agent_vsock_port,
-                                      command, timeout, user, env={**vm["env"], **(env or {})})
+                                      command, timeout, user, env={**vm["env"], **(env or {})}, cwd=cwd)
 
     # ------------------------------------------------------------- reconciliation
     # A control-plane restart loses ``self._vms`` while jailed VMMs keep running (the jailer

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -93,6 +94,17 @@ func runExec(req *Request, cfg execConfig) map[string]any {
 		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: acc.uid, Gid: acc.gid, Groups: acc.groups}
 		home = acc.home
 	}
+	if req.Cwd != "" {
+		// Relative paths would resolve against the agent's own directory ("/" as PID 1), which no caller
+		// means; a NUL cannot be passed to chdir. Whether the directory exists, and whether the user may
+		// enter it, is only known when the command starts and is reported then.
+		if !filepath.IsAbs(req.Cwd) {
+			return errReply("working directory %q must be an absolute path", req.Cwd)
+		}
+		if strings.IndexByte(req.Cwd, 0) >= 0 {
+			return errReply("working directory contains a NUL byte")
+		}
+	}
 	cmd.Dir = req.Cwd
 	if cmd.Dir == "" {
 		if st, err := os.Stat(home); err == nil && st.IsDir() {
@@ -130,6 +142,15 @@ func runExec(req *Request, cfg execConfig) map[string]any {
 		outW.Close()
 		errR.Close()
 		errW.Close()
+		// A failed chdir into the working directory is reported by os/exec against the program ("fork/exec
+		// /bin/sh: no such file or directory"), which reads as if the shell were missing. If the shell exists
+		// and a directory was asked for, the directory is the cause: say so and name it.
+		if req.Cwd != "" {
+			var errno syscall.Errno
+			if _, serr := os.Stat(cfg.shell); serr == nil && errors.As(err, &errno) {
+				return errReply("cannot start in working directory %q: %v", req.Cwd, errno)
+			}
+		}
 		return errReply("start failed: %v", err)
 	}
 	outW.Close()
@@ -224,8 +245,9 @@ func validEnvName(name string) bool {
 }
 
 // buildEnv returns the command's environment: the agent's defaults, overridden by the request's variables.
-// Each name appears exactly once (a duplicate would make the winner depend on which program reads it) and
-// the order is fixed. HOME and USER belong to the account the command runs as and cannot be overridden.
+// Names are validated (see validEnvName), each appears exactly once and the order is fixed. (os/exec would
+// also drop duplicates, keeping the last, but building from a map makes the precedence explicit here.)
+// HOME and USER belong to the account the command runs as and cannot be overridden.
 func buildEnv(req map[string]string, home, userName string) ([]string, error) {
 	m := map[string]string{"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
 	for k, v := range req {

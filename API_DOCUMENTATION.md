@@ -200,8 +200,19 @@ Rules, enforced with `400 invalid_environment` before anything runs or is stored
 The rules are a guard against confusion, not a security boundary: a command can always export whatever it likes
 itself, and what a cell can reach is enforced by the host firewall. **Do not put secrets in `environment`:** the
 request's environment is stored as given in the execution record (no application-level encryption or redaction). Use the secret store (`/v1/secrets`),
-which injects credentials at the egress broker so they never enter the cell. `working_directory` is accepted
-but not yet applied to the command.
+which injects credentials at the egress broker so they never enter the cell.
+
+**`working_directory`** is where the command starts. It must be an absolute path (starting with `/`) of at most
+1,024 characters with no NUL byte, otherwise `400 invalid_working_directory` (nothing runs or is stored). When
+it is omitted the command starts in the home directory of the user it runs as: the cell-level default
+(`/home/agent`) is deliberately not passed on, as it would be wrong for a command run as another user. Whether
+the directory exists, and whether that user may enter it, is only known inside the guest: if it cannot start
+there, the execution is recorded as `failed` and the reason names the directory (for example
+`cannot start in working directory "/data/x": no such file or directory`).
+
+**Known issue:** a command the guest could not start at all (a missing or inaccessible `working_directory`, an
+unknown `user`) currently comes back as `200` with `exit_code` `0` and the reason in `stderr`; the execution's
+status in `GET /v1/cells/{cell_id}/executions` is `failed`. Check `stderr`, or the status, as well as `exit_code`.
 
 **Response** (200 OK, non-streaming):
 
@@ -781,6 +792,7 @@ X-RateLimit-Reset: 1705312260
 | `image_not_found` | 404 | Specified base image does not exist |
 | `invalid_policy` | 400 | Policy definition is invalid |
 | `invalid_environment` | 400 | The `environment` of an exec request is invalid or names a platform-managed variable (nothing ran) |
+| `invalid_working_directory` | 400 | The `working_directory` of an exec request is not an absolute path, is too long or contains a NUL byte (nothing ran) |
 | `spending_cap_reached` | 402 | Tenant spending cap exceeded |
 | `rate_limited` | 429 | Too many requests |
 | `unauthorized` | 401 | Invalid or missing authentication |
@@ -904,4 +916,4 @@ Loopback adds **no routes, fields or error codes**. It is part of the environmen
 - **`environment` on `/exec` works, but not for the proxy variables.** Variables in the request's `environment`
   reach the command (see "Execution" above), but `NO_PROXY`/`no_proxy` and the other proxy variables are
   platform-managed and refused there. To change the proxy bypass for one command, set it inline in the command as
-  shown above. `working_directory` is still accepted but not applied.
+  shown above.

@@ -196,7 +196,7 @@ async def test_exec_passes_cell_environment_to_agent(env):
     holder, seen = {}, {}
     eng = await make_engine(tmp, holder)
 
-    async def fake_agent(uds, port, cmd, timeout, user, env=None):
+    async def fake_agent(uds, port, cmd, timeout, user, env=None, cwd=None):
         seen["env"] = env
         from aijailer.engine.microvm import ExecResult
         return ExecResult(0, "", "", 1)
@@ -215,7 +215,7 @@ async def test_exec_env_is_applied_over_the_cells_own_environment_for_that_comma
     holder, seen = {}, []
     eng = await make_engine(tmp, holder)
 
-    async def fake_agent(uds, port, cmd, timeout, user, env=None):
+    async def fake_agent(uds, port, cmd, timeout, user, env=None, cwd=None):
         seen.append(env)
         from aijailer.engine.microvm import ExecResult
         return ExecResult(0, "", "", 1)
@@ -399,3 +399,22 @@ async def test_preflight_names_the_actual_problem(env, monkeypatch):
     if os.path.exists("/dev/net/tun"):
         with pytest.raises(EngineUnavailable, match="only allowed when AIJAILER_ENV=dev"):
             await eng.preflight()
+
+
+@pytest.mark.asyncio
+async def test_exec_working_directory_reaches_the_agent_call(env):
+    tmp, _ = env
+    holder, seen = {}, []
+    eng = await make_engine(tmp, holder)
+
+    async def fake_agent(uds, port, cmd, timeout, user, env=None, cwd=None):
+        seen.append(cwd)
+        from aijailer.engine.microvm import ExecResult
+        return ExecResult(0, "", "", 1)
+
+    eng._agent_call = fake_agent
+    cid = uuid.uuid4()
+    await eng.create_vm(VMConfig(cell_id=cid, image="base-python"))
+    await eng.exec_command(cid, "pwd", cwd="/data/project")
+    await eng.exec_command(cid, "pwd")
+    assert seen == ["/data/project", None]

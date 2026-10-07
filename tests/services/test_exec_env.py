@@ -8,8 +8,10 @@ from aijailer.core.exec_env import (
     MAX_TOTAL_BYTES,
     MAX_VALUE_BYTES,
     MAX_VARS,
+    MAX_CWD_LEN,
     managed_reason,
     validate_exec_environment,
+    validate_working_directory,
 )
 
 
@@ -74,3 +76,32 @@ def test_validation_does_not_mutate_its_input():
     env = {"A": "1"}
     validate_exec_environment(env)
     assert env == {"A": "1"}
+
+
+# ---------------------------------------------------------------- working directory
+def cwd_refused(path):
+    with pytest.raises(AiJailerError) as e:
+        validate_working_directory(path)
+    assert e.value.code == "invalid_working_directory"
+    return e.value.message
+
+
+def test_no_working_directory_means_the_guests_default_not_the_cell_default():
+    assert validate_working_directory(None) is None
+    assert validate_working_directory("") is None
+
+
+@pytest.mark.parametrize("path", ["/", "/tmp", "/home/agent/project", "/a b/c", "/naïve/☃", "/x/../y", "//double"])
+def test_absolute_paths_pass_unchanged(path):
+    assert validate_working_directory(path) == path
+
+
+@pytest.mark.parametrize("path", ["relative", "./here", "../up", "~", "~/x", " /leading-space", "C:\\win"])
+def test_non_absolute_paths_are_refused(path):
+    assert "absolute" in cwd_refused(path)
+
+
+def test_nul_and_overlong_paths_are_refused():
+    assert "NUL" in cwd_refused("/tmp/a\x00b")
+    validate_working_directory("/" + "a" * (MAX_CWD_LEN - 1))
+    assert str(MAX_CWD_LEN) in cwd_refused("/" + "a" * MAX_CWD_LEN)

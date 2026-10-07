@@ -1,10 +1,14 @@
-"""The per-command environment of POST /v1/cells/{id}/exec.
+"""The per-command parameters of POST /v1/cells/{id}/exec that reach the guest: the environment and the
+working directory.
 
 The request's ``environment`` is applied on top of the cell's own environment (the creation-time settings
 plus the variables the platform injects). Names the platform or the guest agent manage are refused instead of
 silently ignored, so a request can never appear to set something it does not. That is a guard against
 confusion, not a security boundary: a command can always export anything it likes itself, and what a cell can
 reach is enforced by the host firewall.
+
+``working_directory`` is where the command starts. It must be an absolute path; whether it exists and is
+accessible to the user is only known inside the guest, which reports it when the command cannot start.
 """
 
 import re
@@ -62,3 +66,27 @@ def validate_exec_environment(env: dict[str, str] | None) -> dict[str, str]:
     if total > MAX_TOTAL_BYTES:
         raise _bad(f"environment is larger than {MAX_TOTAL_BYTES} bytes in total")
     return env
+
+
+MAX_CWD_LEN = 1024      # the length of the column the execution record keeps it in
+
+
+def validate_working_directory(path: str | None) -> str | None:
+    """Return the directory to start the command in, or None for the guest's default (the user's home).
+
+    Only an explicit request value is passed on: the cell-level default (``/home/agent``) would be wrong for
+    a command run as another user, and the guest already starts in the user's home when none is given.
+    """
+    if path is None or path == "":
+        return None
+    if not isinstance(path, str):
+        raise AiJailerError("working_directory must be a string", code="invalid_working_directory")
+    if "\x00" in path:
+        raise AiJailerError("working_directory contains a NUL byte", code="invalid_working_directory")
+    if len(path) > MAX_CWD_LEN:
+        raise AiJailerError(f"working_directory is longer than {MAX_CWD_LEN} characters",
+                            code="invalid_working_directory")
+    if not path.startswith("/"):
+        raise AiJailerError("working_directory must be an absolute path (start with /)",
+                            code="invalid_working_directory")
+    return path

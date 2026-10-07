@@ -445,3 +445,60 @@ func TestNulInValueIsRefusedUpFrontAndNamesTheVariable(t *testing.T) {
 		t.Fatalf("want an up-front refusal naming the variable, got %q", e)
 	}
 }
+
+func TestWorkingDirectoryIsWhereTheCommandStarts(t *testing.T) {
+	dir := t.TempDir()
+	want, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := exec1(t, "pwd -P", func(q *Request) { q.Cwd = dir })
+	if got := strings.TrimSpace(r["stdout"].(string)); got != want {
+		t.Fatalf("started in %q, want %q (reply %v)", got, want, r)
+	}
+}
+
+func TestNoWorkingDirectoryMeansTheUsersHomeOrRoot(t *testing.T) {
+	r := exec1(t, "pwd -P", nil)
+	if got := strings.TrimSpace(r["stdout"].(string)); got == "" {
+		t.Fatalf("no directory reported: %v", r)
+	}
+}
+
+func TestBadWorkingDirectoriesAreRefusedWithAClearReason(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "plain-file")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]struct{ cwd, wantInError string }{
+		"relative":    {"some/dir", "absolute"},
+		"dot":         {".", "absolute"},
+		"NUL":         {"/tmp/a\x00b", "NUL"},
+		"missing":     {"/definitely/not/here", "no such file or directory"},
+		"not a dir":   {file, "not a directory"},
+		"empty-ish /": {"", ""}, // empty means default and must still run
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := exec1(t, "true", func(q *Request) { q.Cwd = c.cwd })
+			e, isErr := r["error"].(string)
+			if c.cwd == "" {
+				if isErr {
+					t.Fatalf("an empty directory must mean the default: %v", r)
+				}
+				return
+			}
+			if !isErr || !strings.Contains(e, c.wantInError) {
+				t.Fatalf("want an error mentioning %q, got %v", c.wantInError, r)
+			}
+		})
+	}
+}
+
+func TestAWorkingDirectoryFailureNamesTheDirectoryNotTheShell(t *testing.T) {
+	r := exec1(t, "true", func(q *Request) { q.Cwd = "/definitely/not/here" })
+	e, _ := r["error"].(string)
+	if !strings.Contains(e, `"/definitely/not/here"`) || strings.Contains(e, "fork/exec") || strings.Contains(e, "/bin/sh") {
+		t.Fatalf("the message must name the directory and not blame the shell: %q", e)
+	}
+}
