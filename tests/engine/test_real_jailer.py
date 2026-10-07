@@ -99,3 +99,15 @@ def test_reconcile_after_restart_finds_and_reaps_the_real_vmm(r):
     assert r["restart_live_not_started"] == {"unresponsive": True, "adopted": False}
     assert r["restart_orphan_killed"] is True
     assert r["restart_orphan_vmm_gone"] is True and r["restart_orphan_jail_removed"] is True
+
+
+def test_restore_request_is_understood_by_real_firecracker(r):
+    """A bogus snapshot must be rejected for its CONTENT. A request-shape problem would surface as
+    a deserialization / unknown-field / missing-field error instead."""
+    assert r["restore"]["ok"] is False
+    err = r["restore"]["error"].lower()
+    print("restore error from real firecracker:", err)
+    assert "/snapshot/load" in err
+    assert not any(w in err for w in ("unknown field", "missing field", "invalid type",
+                                      "invalid request", "deserial", "expected"))
+    assert r["restore_cleaned_up"] is True

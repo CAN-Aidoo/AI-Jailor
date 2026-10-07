@@ -129,6 +129,28 @@ async def main():
         await asyncio.sleep(0.3)
         res["vmm_gone"] = not os.path.exists(f"/proc/{pid}")
         res["jail_removed"] = not os.path.exists(vm["jail"])
+    # --- restore: real Firecracker must accept our /snapshot/load REQUEST (a bogus snapshot is
+    # rejected for its CONTENT, not because the request shape/fields are wrong) ---
+    import hashlib
+    bundle = f"{WORK}/bundle"
+    os.makedirs(bundle)
+    files = {"vm.snap": b"not a snapshot", "vm.mem": b"\0" * 4096, "rootfs.ext4": b"disk"}
+    for n, data in files.items():
+        open(f"{bundle}/{n}", "wb").write(data)
+    json.dump({"version": 1, "image": "base", "vcpus": 1, "memory_mb": 128,
+               "network": {"guest_ip": "10.99.0.2", "host_ip": "10.99.0.1", "prefix": 30},
+               "files": {n: hashlib.sha256(d).hexdigest() for n, d in files.items()}},
+              open(f"{bundle}/meta.json", "w"))
+    rcid = uuid.uuid4()
+    rcfg = VMConfig(cell_id=rcid, image="base", vcpus=1, memory_mb=128,
+                    network=VMNetwork(info.tap_name, "10.99.0.2", "10.99.0.1", 30, info.netns_path))
+    try:
+        await eng.restore_vm(rcfg, bundle)
+        res["restore"] = {"ok": True}
+    except Exception as exc:
+        res["restore"] = {"ok": False, "error": str(exc)[:500]}
+    await asyncio.sleep(0.3)
+    res["restore_cleaned_up"] = rcid not in eng._vms and not os.path.exists(eng.jail_dir(rcid))
     await asyncio.to_thread(link.teardown_link, net.ifname)
     shutil.rmtree(WORK, ignore_errors=True)
     print("RESULT" + json.dumps(res, default=str))

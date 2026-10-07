@@ -18,6 +18,8 @@ Everything that needs root/KVM (spawn, TAP, nftables) is behind ``spawner`` /
 
 import asyncio
 import base64
+import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -88,14 +90,22 @@ class FirecrackerAPI:
         await self._call("PUT", "/snapshot/create", {
             "snapshot_type": "Full", "snapshot_path": snap_path, "mem_file_path": mem_path})
 
-    async def load_snapshot(self, snap_path: str, mem_path: str, resume: bool = True) -> None:
-        await self._call("PUT", "/snapshot/load", {
+    async def load_snapshot(self, snap_path: str, mem_path: str, resume: bool = True,
+                            network_overrides: list[dict] | None = None) -> None:
+        body: dict = {
             "snapshot_path": snap_path,
             "mem_backend": {"backend_path": mem_path, "backend_type": "File"},
-            "resume_vm": resume})
+            "resume_vm": resume}
+        if network_overrides:
+            body["network_overrides"] = network_overrides    # [{"iface_id", "host_dev_name"}]
+        await self._call("PUT", "/snapshot/load", body)
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+class SnapshotError(RuntimeError):
+    """A snapshot bundle is unusable or does not match the restore request."""
 
 
 class AgentError(RuntimeError):
@@ -192,6 +202,7 @@ JAIL_KERNEL = "vmlinux"
 JAIL_ROOTFS = "rootfs.ext4"
 JAIL_VSOCK = "vsock.sock"
 JAIL_API_SOCK = "api.sock"
+SNAP_STATE, SNAP_MEM, SNAP_DISK, SNAP_META = "vm.snap", "vm.mem", "rootfs.ext4", "meta.json"
 _UDS_MAX = 104  # sun_path is 108 bytes; keep margin
 
 
@@ -329,7 +340,7 @@ class FirecrackerEngine(MicroVMEngine):
         if r.returncode != 0:
             shutil.copyfile(base, dest)
 
-    def _prepare_jail(self, config: VMConfig) -> Path:
+    def _prepare_jail(self, config: VMConfig, restore: Path | None = None) -> Path:
         """Create the jail root and put the VM's files in it BEFORE the jailer starts.
 
         The jailer chroots into this directory, so anything the VMM needs (kernel, disk) must
@@ -343,26 +354,36 @@ class FirecrackerEngine(MicroVMEngine):
         root = jail / "root"
         root.mkdir(parents=True, mode=0o755)
         disk = root / JAIL_ROOTFS
-        self._clone_rootfs(Path(s.rootfs_dir) / f"{config.image}.ext4", disk)
+        if restore is None:
+            self._clone_rootfs(Path(s.rootfs_dir) / f"{config.image}.ext4", disk)
+        else:  # private copies: the snapshot stays pristine and can be restored again
+            self._clone_rootfs(restore / SNAP_DISK, disk)
+            self._clone_rootfs(restore / SNAP_MEM, root / SNAP_MEM)
+            self._clone_rootfs(restore / SNAP_STATE, root / SNAP_STATE)
+            for f in (SNAP_MEM, SNAP_STATE):
+                os.chmod(root / f, 0o600)
+                self._chown(root / f, s.jailer_uid, s.jailer_gid)
         os.chmod(disk, 0o600)
         self._chown(disk, s.jailer_uid, s.jailer_gid)
-        kernel = root / JAIL_KERNEL
-        try:
-            os.link(s.kernel_image_path, kernel)
-        except OSError:
-            shutil.copyfile(s.kernel_image_path, kernel)
+        if restore is None:     # a restored guest carries its kernel in its memory image
+            kernel = root / JAIL_KERNEL
+            try:
+                os.link(s.kernel_image_path, kernel)
+            except OSError:
+                shutil.copyfile(s.kernel_image_path, kernel)
         if len(str(root / JAIL_VSOCK)) >= _UDS_MAX:
             raise EngineUnavailable("jail path too long for a unix socket; shorten JAILER_CHROOT_BASE")
         return root
 
     # ----------------------------------------------------------------- lifecycle
-    async def _launch(self, config: VMConfig) -> dict:
-        """Everything up to (not including) InstanceStart: jail, jailer, API socket, config."""
+    async def _launch(self, config: VMConfig, restore: Path | None = None) -> dict:
+        """Everything up to (not including) InstanceStart: jail, jailer, API socket, config.
+        With ``restore`` the VMM is left unconfigured (the snapshot carries the configuration)."""
         self._require_kvm()
         if config.network is not None and not config.network.netns_path:
             raise EngineUnavailable(
                 "refusing to attach a NIC outside a dedicated network namespace")
-        root = self._prepare_jail(config)
+        root = self._prepare_jail(config, restore)
         jail = root.parent
         cid = self._next_cid
         self._next_cid += 1
@@ -370,7 +391,7 @@ class FirecrackerEngine(MicroVMEngine):
                            config.network.netns_path if config.network else None)
         log_path = jail / "jailer.log"
         vm: dict = {"root": root, "jail": jail, "cid": cid, "api": None,
-                    "env": dict(config.environment or {})}
+                    "env": dict(config.environment or {}), "meta": self._meta(config)}
         try:
             spawner_pid = await self._spawner(argv, log_path)
             sock = root / JAIL_API_SOCK
@@ -385,7 +406,8 @@ class FirecrackerEngine(MicroVMEngine):
                 await asyncio.sleep(0.02)
             vm["fc_pid"] = self._read_pid(root) or spawner_pid
             vm["api"] = self._api_factory(str(sock))
-            await vm["api"].configure(self._build_config(config, cid))
+            if restore is None:
+                await vm["api"].configure(self._build_config(config, cid))
         except BaseException:
             await self._teardown(vm)
             raise
@@ -502,24 +524,101 @@ class FirecrackerEngine(MicroVMEngine):
         if vm:
             await self._teardown(vm)
 
+    @staticmethod
+    def _meta(config: VMConfig) -> dict:
+        """What a snapshot must remember about the VM: the guest's network identity is baked into
+        its memory (IP, MAC, routes), so a restore has to be given the same one."""
+        n = config.network
+        return {"image": config.image, "vcpus": config.vcpus, "memory_mb": config.memory_mb,
+                "network": {"guest_ip": n.guest_ip, "host_ip": n.host_ip, "prefix": n.prefix}
+                if n else None}
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+        return h.hexdigest()
+
     async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
-        """Snapshot files are written INSIDE the jail (jail-relative paths), then moved out."""
+        """Snapshot files are written INSIDE the jail (jail-relative paths), then moved out,
+        together with ``meta.json`` (guest identity + sha256 of every file)."""
         vm = self._vm(cell_id)
+        if not vm.get("meta"):
+            raise RuntimeError("cannot snapshot an adopted VM: its configuration is unknown")
         out = Path(snapshot_dir)
         out.mkdir(parents=True, exist_ok=True, mode=0o700)
         was_running = vm["info"].status == VMStatus.RUNNING
         if was_running:
             await vm["api"].set_state("Paused")
         try:
-            await vm["api"].create_snapshot("vm.snap", "vm.mem")
-            shutil.move(str(vm["root"] / "vm.snap"), out / "vm.snap")
-            shutil.move(str(vm["root"] / "vm.mem"), out / "vm.mem")
-            shutil.copyfile(vm["root"] / JAIL_ROOTFS, out / "rootfs.ext4")
+            await vm["api"].create_snapshot(SNAP_STATE, SNAP_MEM)
+            shutil.move(str(vm["root"] / SNAP_STATE), out / SNAP_STATE)
+            shutil.move(str(vm["root"] / SNAP_MEM), out / SNAP_MEM)
+            shutil.copyfile(vm["root"] / JAIL_ROOTFS, out / SNAP_DISK)
         finally:
             if was_running:
                 await vm["api"].set_state("Resumed")
-        return {"state": str(out / "vm.snap"), "memory": str(out / "vm.mem"),
-                "disk": str(out / "rootfs.ext4")}
+        files = {n: await asyncio.to_thread(self._sha256, out / n)
+                 for n in (SNAP_STATE, SNAP_MEM, SNAP_DISK)}
+        (out / SNAP_META).write_text(json.dumps({"version": 1, **vm["meta"], "files": files}))
+        return {"state": str(out / SNAP_STATE), "memory": str(out / SNAP_MEM),
+                "disk": str(out / SNAP_DISK), "meta": str(out / SNAP_META)}
+
+    async def _read_snapshot(self, snapshot_dir: str, config: VMConfig) -> tuple[Path, dict]:
+        """Validate a snapshot bundle against the restore request BEFORE anything is spawned.
+        Hashes catch corruption/truncation (not a malicious writer of the whole directory:
+        keep snapshot storage write-protected)."""
+        d = Path(snapshot_dir)
+        try:
+            meta = json.loads((d / SNAP_META).read_text())
+        except (OSError, ValueError) as exc:
+            raise SnapshotError(f"snapshot {d} has no readable {SNAP_META}: {exc}") from exc
+        if meta.get("version") != 1 or set(meta.get("files", {})) != {SNAP_STATE, SNAP_MEM, SNAP_DISK}:
+            raise SnapshotError(f"snapshot {d}: unsupported or incomplete metadata")
+        for name, want in meta["files"].items():
+            f = d / name
+            if not f.is_file() or f.is_symlink():
+                raise SnapshotError(f"snapshot {d}: {name} missing")
+            if await asyncio.to_thread(self._sha256, f) != want:
+                raise SnapshotError(f"snapshot {d}: {name} does not match its recorded sha256")
+        want_net, have = meta.get("network"), config.network
+        if (want_net is None) != (have is None) or (
+                want_net and (want_net["guest_ip"], want_net["prefix"])
+                != (have.guest_ip, have.prefix)):
+            raise SnapshotError(
+                "snapshot was taken with guest network "
+                f"{want_net and (want_net['guest_ip'], want_net['prefix'])}; the restored cell must be "
+                "given the same guest address (it is baked into guest memory)")
+        return d, meta
+
+    async def restore_vm(self, config: VMConfig, snapshot_dir: str) -> VMInfo:
+        """Start a new jailed VMM and load a snapshot into it (resumed). The snapshot's disk and
+        memory are copied into the new jail, so the bundle stays pristine and restorable again.
+
+        The guest keeps its saved identity: same IP/MAC (checked), same machine shape (taken from
+        the snapshot, overriding ``config``), and ALSO its saved RNG/entropy state, so restoring one
+        snapshot into several cells yields clones that must not be trusted to be unique."""
+        self._require_kvm()
+        if config.cell_id in self._vms:
+            raise RuntimeError(f"cell {config.cell_id} already has a VM")
+        d, meta = await self._read_snapshot(snapshot_dir, config)
+        config = dataclasses.replace(config, image=meta["image"], vcpus=meta["vcpus"],
+                                     memory_mb=meta["memory_mb"])
+        self._launching.add(config.cell_id)
+        try:
+            vm = await self._launch(config, restore=d)
+            try:
+                overrides = [{"iface_id": "eth0", "host_dev_name": config.network.tap_name}] \
+                    if config.network else None
+                await vm["api"].load_snapshot(SNAP_STATE, SNAP_MEM, True, overrides)
+            except BaseException:
+                await self._teardown(vm)
+                raise
+            return self._register(config, vm)
+        finally:
+            self._launching.discard(config.cell_id)
 
     async def exec_command(self, cell_id: uuid.UUID, command: str, timeout: int = 30,
                            user: str = "agent") -> ExecResult:
