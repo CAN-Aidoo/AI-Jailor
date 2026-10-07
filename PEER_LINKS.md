@@ -88,7 +88,8 @@ Protected:
 - **The operator still sees metadata** (who connects to whom, when, how many bytes) and can deny service.
   Peer sessions are audited as network events. The operator can also read a cell's memory (see
   SECURITY_MODEL.md): this feature does not change the trust model for the cells themselves.
-- No protocol for the actual joint computation is provided.
+- No protocol for the actual joint computation is provided by the platform. `examples/psi/` is a reference
+  two-party PSI workload (semi-honest, demo-grade; see its README for what it does not protect).
 
 ## Operating notes and limits
 
