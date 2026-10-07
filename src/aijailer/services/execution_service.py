@@ -14,11 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aijailer.core.config import get_settings
 from aijailer.core.exec_env import validate_exec_environment, validate_working_directory
 from aijailer.core.exceptions import (
+    AiJailerError,
     CellNotRunningError,
     ExecutionTimeoutError,
     PolicyViolationError,
 )
-from aijailer.engine.microvm import get_microvm_engine
+from aijailer.engine.microvm import AgentError, get_microvm_engine
 from aijailer.models.audit import EventType, Severity
 from aijailer.models.cell import Cell
 from aijailer.models.execution import Execution
@@ -29,6 +30,25 @@ from aijailer.services.execution_gate import ExecutionGate
 from aijailer.services.resource_service import get_resource_governor
 
 logger = structlog.get_logger(__name__)
+
+# The guest agent's reply when it is already running its maximum number of commands (guest-agent/server.go).
+AGENT_BUSY = "too many concurrent executions"
+
+
+def failure_error(execution: Execution, exc: Exception) -> AiJailerError:
+    """The API error for a command that did not run to a result. Only text the guest agent itself authored is
+    passed on; anything else (socket paths, internal exceptions) stays in the logs and the execution record."""
+    if isinstance(exc, AiJailerError):
+        return exc
+    details = {"execution_id": str(execution.id)}
+    if isinstance(exc, AgentError):
+        if str(exc) == AGENT_BUSY:
+            return AiJailerError("the cell is already running its maximum number of commands; retry shortly",
+                                 code="execution_busy", details=details)
+        return AiJailerError(f"the guest could not run the command: {exc}", code="execution_not_started",
+                             details=details)
+    return AiJailerError("the command could not be run in the cell, or its result could not be read; it may or "
+                         "may not have run", code="execution_failed", details=details)
 
 
 class ExecutionService:
@@ -89,6 +109,7 @@ class ExecutionService:
         )
 
         # Execute via MicroVM engine
+        failure: Exception | None = None
         try:
             result = await self.engine.exec_command(
                 cell_id=cell_id,
@@ -116,6 +137,7 @@ class ExecutionService:
             )
 
         except TimeoutError:
+            failure = ExecutionTimeoutError(str(execution.id), timeout_seconds)
             execution.status = "timeout"
             execution.completed_at = datetime.now(timezone.utc)
             logger.warning(
@@ -125,6 +147,7 @@ class ExecutionService:
             )
 
         except Exception as e:
+            failure = e
             execution.status = "failed"
             execution.stderr = str(e)
             execution.completed_at = datetime.now(timezone.utc)
@@ -161,6 +184,11 @@ class ExecutionService:
             api_calls=1,
         )
 
+        if failure is not None:
+            # A command that did not run to a result must not look like a success. get_db rolls the session
+            # back when an error response is produced, so keep the failed record before raising.
+            await self.db.commit()
+            raise failure_error(execution, failure) from failure
         return execution
 
     async def execute_script(
@@ -215,6 +243,7 @@ class ExecutionService:
         )
 
         # Execute script via engine (wraps as command with interpreter)
+        failure: Exception | None = None
         try:
             # In production: write script to tmpfile, exec via interpreter
             # For MVP: the engine simulates execution
@@ -243,6 +272,7 @@ class ExecutionService:
             )
 
         except TimeoutError:
+            failure = ExecutionTimeoutError(str(execution.id), timeout_seconds)
             execution.status = "timeout"
             execution.completed_at = datetime.now(timezone.utc)
             logger.warning(
@@ -252,6 +282,7 @@ class ExecutionService:
             )
 
         except Exception as e:
+            failure = e
             execution.status = "failed"
             execution.stderr = str(e)
             execution.completed_at = datetime.now(timezone.utc)
@@ -289,6 +320,11 @@ class ExecutionService:
             api_calls=1,
         )
 
+        if failure is not None:
+            # A command that did not run to a result must not look like a success. get_db rolls the session
+            # back when an error response is produced, so keep the failed record before raising.
+            await self.db.commit()
+            raise failure_error(execution, failure) from failure
         return execution
 
     async def cancel_execution(

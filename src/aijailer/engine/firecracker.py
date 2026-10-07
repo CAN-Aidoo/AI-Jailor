@@ -34,6 +34,7 @@ import httpx
 
 from aijailer.core.config import get_settings
 from aijailer.engine.microvm import (
+    AgentError,
     EngineSweepReport,
     EngineUnavailable,
     ExecResult,
@@ -106,10 +107,6 @@ class FirecrackerAPI:
 
 class SnapshotError(RuntimeError):
     """A snapshot bundle is unusable or does not match the restore request."""
-
-
-class AgentError(RuntimeError):
-    """The guest agent refused or failed a request (it replied {"error": ...})."""
 
 
 async def agent_request(vsock_uds: str, port: int, request: dict, timeout: float) -> dict:

@@ -59,6 +59,10 @@ class VMInfo:
     vsock_path: str | None = None
 
 
+class AgentError(RuntimeError):
+    """The guest agent refused or failed a request (it replied {"error": ...})."""
+
+
 @dataclass
 class ExecResult:
     """Result from executing a command inside a microVM."""

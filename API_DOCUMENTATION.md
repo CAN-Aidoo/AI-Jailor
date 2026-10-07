@@ -206,13 +206,25 @@ which injects credentials at the egress broker so they never enter the cell.
 1,024 characters with no NUL byte, otherwise `400 invalid_working_directory` (nothing runs or is stored). When
 it is omitted the command starts in the home directory of the user it runs as: the cell-level default
 (`/home/agent`) is deliberately not passed on, as it would be wrong for a command run as another user. Whether
-the directory exists, and whether that user may enter it, is only known inside the guest: if it cannot start
-there, the execution is recorded as `failed` and the reason names the directory (for example
-`cannot start in working directory "/data/x": no such file or directory`).
+the directory exists, and whether that user may enter it, is only known inside the guest: if the command
+cannot start there, the request fails with `400 execution_not_started` and the message names the directory (for
+example `the guest could not run the command: cannot start in working directory "/data/x": no such file or
+directory`).
 
-**Known issue:** a command the guest could not start at all (a missing or inaccessible `working_directory`, an
-unknown `user`) currently comes back as `200` with `exit_code` `0` and the reason in `stderr`; the execution's
-status in `GET /v1/cells/{cell_id}/executions` is `failed`. Check `stderr`, or the status, as well as `exit_code`.
+**A command that did not run to a result is an error, never `exit_code` 0.** `200` means the command ran and
+finished, whatever its exit code (a command that fails with exit code 3, or that the guest stopped on its
+timeout and reports as exit code 124, is still a `200`). Otherwise the response is an error that carries
+`details.execution_id`, and the execution is still recorded (status `failed`, or `timeout`) so it shows up in
+`GET /v1/cells/{cell_id}/executions`:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `execution_not_started` | 400 | The guest agent refused or could not start the command (a missing, inaccessible or non-directory `working_directory`, an unknown `user`, a request to run as root). The message carries the agent's reason. In nearly every case nothing ran; a `wait failed` reason would mean it ran but its result was lost |
+| `execution_busy` | 429 | The cell is already running its maximum number of commands; retry shortly |
+| `execution_failed` | 502 | The command could not be run or its result could not be read (the agent was unreachable or answered garbage). It may or may not have run. The message is generic on purpose; the detail stays in the platform's logs and the execution record |
+| `execution_timeout` | 408 | The command exceeded its timeout and the guest agent returned no result at all (the execution is recorded with status `timeout`). When the agent itself reports the timeout it is a `200` with `exit_code` 124 |
+
+The same applies to `POST /v1/cells/{cell_id}/exec/script`.
 
 **Response** (200 OK, non-streaming):
 
@@ -793,6 +805,9 @@ X-RateLimit-Reset: 1705312260
 | `invalid_policy` | 400 | Policy definition is invalid |
 | `invalid_environment` | 400 | The `environment` of an exec request is invalid or names a platform-managed variable (nothing ran) |
 | `invalid_working_directory` | 400 | The `working_directory` of an exec request is not an absolute path, is too long or contains a NUL byte (nothing ran) |
+| `execution_not_started` | 400 | The guest could not run the command; the message carries its reason (see Execution) |
+| `execution_busy` | 429 | The cell is running its maximum number of commands; retry shortly |
+| `execution_failed` | 502 | The command could not be run or its result could not be read; it may or may not have run |
 | `spending_cap_reached` | 402 | Tenant spending cap exceeded |
 | `rate_limited` | 429 | Too many requests |
 | `unauthorized` | 401 | Invalid or missing authentication |
