@@ -331,3 +331,154 @@ async def test_snapshots_are_tenant_scoped(world, db_session):
         with pytest.raises(AiJailerError) as e:
             await call
         assert e.value.code == "snapshot_not_found"
+
+
+# ------------------------------------------------------------------ quota
+@pytest.mark.asyncio
+async def test_count_quota_blocks_the_next_snapshot_and_delete_frees_it(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshot_count = 2
+    a = await snaps.create_snapshot(cell.id, tenant.id, "a", None)
+    await snaps.create_snapshot(cell.id, tenant.id, "b", None)
+    log.clear()
+    with pytest.raises(AiJailerError) as e:
+        await snaps.create_snapshot(cell.id, tenant.id, "c", None)
+    assert e.value.code == "resource_limit_exceeded" and "snapshots" in e.value.message
+    assert "vm:snapshot" not in log                               # refused before touching the VM
+    q = await snaps.quota(tenant.id)
+    assert (q.count, q.max_count) == (2, 2)
+    await snaps.delete_snapshot(a.id, tenant.id)
+    assert (await snaps.quota(tenant.id)).count == 1
+    await snaps.create_snapshot(cell.id, tenant.id, "c", None)
+
+
+@pytest.mark.asyncio
+async def test_storage_quota_uses_a_reserved_estimate_then_the_real_size(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    # the cell is 256 MiB memory + 512 MiB disk => 768 MiB reserved per snapshot
+    tenant.max_snapshot_storage_gb = 1
+    first = await snaps.create_snapshot(cell.id, tenant.id, "a", None)
+    assert first.total_size_bytes == 150                           # real size replaced the estimate
+    q = await snaps.quota(tenant.id)
+    assert q.bytes_used == 150 and q.max_bytes == 1 << 30
+    # real usage is tiny, but a 768 MiB reservation on top of 150 B still fits in 1 GiB: allowed
+    await snaps.create_snapshot(cell.id, tenant.id, "b", None)
+    tenant.max_snapshot_storage_gb = 1
+    cell.memory_mb = 900                                           # 900 + 512 MiB > 1 GiB
+    with pytest.raises(AiJailerError) as e:
+        await snaps.create_snapshot(cell.id, tenant.id, "c", None)
+    assert e.value.code == "resource_limit_exceeded" and "snapshot_storage" in e.value.message
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_gives_its_reservation_back(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshot_count = 1
+    eng.fail_snapshot = True
+    with pytest.raises(AiJailerError):
+        await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    assert (await snaps.quota(tenant.id)).count == 0
+    eng.fail_snapshot = False
+    await snaps.create_snapshot(cell.id, tenant.id, None, None)    # the one slot is free again
+
+
+@pytest.mark.asyncio
+async def test_a_reservation_is_visible_to_other_requests_while_the_snapshot_runs(
+        world, db_engine, db_session):
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshot_count = 1
+    await db_session.commit()
+    gate, entered = asyncio.Event(), asyncio.Event()
+    orig = eng.snapshot_vm
+
+    async def slow(cid, d):
+        entered.set()
+        await gate.wait()
+        return await orig(cid, d)
+    eng.snapshot_vm = slow
+    first = asyncio.create_task(snaps.create_snapshot(cell.id, tenant.id, "slow", None))
+    await entered.wait()
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s2:
+        other = SnapshotService(s2, CellService(s2, network=net))
+        with pytest.raises(AiJailerError) as e:
+            await other.create_snapshot(cell.id, tenant.id, "second", None)
+        assert e.value.code == "resource_limit_exceeded"
+    gate.set()
+    assert (await first).status == "available"
+
+
+@pytest.mark.asyncio
+async def test_snapshots_stuck_in_creating_expire_instead_of_wedging_the_quota(world, db_session):
+    from datetime import datetime, timedelta, timezone
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshot_count = 1
+    ghost = Snapshot(tenant_id=tenant.id, cell_id=cell.id, status="creating", cell_config={},
+                     total_size_bytes=999)
+    db_session.add(ghost)
+    await db_session.commit()
+    with pytest.raises(AiJailerError):                             # fresh in-flight row counts
+        await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    ghost.created_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    await db_session.commit()
+    ok = await snaps.create_snapshot(cell.id, tenant.id, None, None)  # owner died: row expires
+    assert ok.status == "available"
+    await db_session.refresh(ghost)
+    assert ghost.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_quota_is_per_tenant_and_delete_is_tenant_scoped(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshot_count = 1
+    snap = await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    other = Tenant(name="x", slug=f"x-{uuid.uuid4().hex[:6]}", status="active", tier="pro",
+                   max_concurrent_cells=5, max_snapshot_count=1)
+    db_session.add(other)
+    await db_session.commit()
+    assert (await snaps.quota(other.id)).count == 0
+    with pytest.raises(AiJailerError) as e:
+        await snaps.delete_snapshot(snap.id, other.id)
+    assert e.value.code == "snapshot_not_found"
+    assert (await snaps.quota(tenant.id)).count == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_files_refuses_in_flight_and_keeps_row_if_files_stay(
+        world, db_session, monkeypatch):
+    import os
+    snaps, cells, eng, net, tenant, cell, log = world
+    snap = await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    path = snaps._dir(snap)
+    assert os.path.isdir(path)
+    monkeypatch.setattr(SnapshotService, "_discard_dir", staticmethod(lambda p: None))
+    with pytest.raises(AiJailerError) as e:                        # files could not be removed
+        await snaps.delete_snapshot(snap.id, tenant.id)
+    assert e.value.code == "snapshot_delete_failed" and (await snaps.quota(tenant.id)).count == 1
+    monkeypatch.undo()
+    snap.status = "creating"
+    with pytest.raises(AiJailerError) as e:
+        await snaps.delete_snapshot(snap.id, tenant.id)
+    assert e.value.code == "snapshot_not_available"
+    snap.status = "available"
+    await snaps.delete_snapshot(snap.id, tenant.id)
+    assert not os.path.exists(path) and (await snaps.quota(tenant.id)).count == 0
+
+
+@pytest.mark.asyncio
+async def test_reservation_is_committed_before_the_slow_engine_call(world, db_session):
+    """The reservation (and the tenant row lock) must be released by a COMMIT before the
+    snapshot runs; otherwise concurrent requests cannot see it (an in-memory SQLite shared
+    connection hides that, so assert the transaction state directly)."""
+    snaps, cells, eng, net, tenant, cell, log = world
+    seen = {}
+    orig = eng.snapshot_vm
+
+    async def probe(cid, d):
+        seen["in_tx"] = db_session.in_transaction()
+        return await orig(cid, d)
+    eng.snapshot_vm = probe
+    await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    assert seen["in_tx"] is False

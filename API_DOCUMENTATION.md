@@ -325,6 +325,21 @@ support answer `501 snapshot_unsupported`; other failures `502 snapshot_failed` 
 }
 ```
 
+**Quotas**: each tenant has `max_snapshot_count` and `max_snapshot_storage_gb` (total bytes, since memory dumps
+dominate). Both are checked, and the slot reserved, before the guest is touched; exceeding either answers
+`429 resource_limit_exceeded` (`snapshots` / `snapshot_storage`). A snapshot being created counts at an upper-bound
+estimate (memory + configured disk) until its real size is known; a failed one gives its reservation back, and one stuck
+in `creating` longer than `RECONCILE_STUCK_SECONDS` (owner died) is expired so a crash cannot wedge the quota.
+
+#### GET /v1/snapshots/quota
+
+`{"data": {"count": 3, "max_count": 100, "bytes_used": 1073741824, "max_bytes": 53687091200}}`
+
+#### DELETE /v1/snapshots/{snapshot_id}
+
+Delete a snapshot and its stored data (204); frees quota. `409 snapshot_not_available` while it is still being created.
+`500 snapshot_delete_failed` (row kept, so the storage stays accounted) if the files could not be removed.
+
 #### GET /v1/cells/{cell_id}/snapshots
 
 List snapshots for a cell.
@@ -682,6 +697,7 @@ X-RateLimit-Reset: 1705312260
 | `policy_violation` | 403 | Action blocked by security policy |
 | `resource_limit_exceeded` | 429 | Cell or tenant resource quota exceeded |
 | `snapshot_failed` | 502 | Snapshot creation failed |
+| `snapshot_delete_failed` | 500 | Snapshot files could not be removed (row kept) |
 | `snapshot_unsupported` | 501 | The isolation backend cannot snapshot |
 | `snapshot_not_found` | 404 | No such snapshot for this tenant |
 | `snapshot_not_available` | 409 | Snapshot is not in `available` state |

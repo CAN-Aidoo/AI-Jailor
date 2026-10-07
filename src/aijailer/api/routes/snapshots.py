@@ -108,3 +108,25 @@ async def clone_from_snapshot(
     return ApiResponse(data={"id": str(cell.id), "cell_id": str(cell.id),
                              "snapshot_id": str(snapshot_id), "name": cell.name,
                              "status": cell.status})
+
+
+@router.get("/v1/snapshots/quota", response_model=ApiResponse[dict])
+async def snapshot_quota(
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """The tenant's snapshot usage against its limits (count and total bytes; in-flight
+    snapshots are counted at their reserved size)."""
+    q = await SnapshotService(db).quota(auth.tenant_id)
+    return ApiResponse(data={"count": q.count, "max_count": q.max_count,
+                             "bytes_used": q.bytes_used, "max_bytes": q.max_bytes})
+
+
+@router.delete("/v1/snapshots/{snapshot_id}", status_code=204)
+async def delete_snapshot(
+    snapshot_id: uuid.UUID,
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a snapshot and its stored data; frees quota."""
+    await SnapshotService(db).delete_snapshot(snapshot_id, auth.tenant_id)

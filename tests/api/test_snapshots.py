@@ -122,3 +122,23 @@ async def test_snapshot_of_a_stopped_cell_conflicts_and_unknown_cell_404s(client
     await client.post(f"/v1/cells/{cell_id}/stop", json={})
     assert (await client.post(f"/v1/cells/{cell_id}/snapshots", json={})).status_code == 409
     assert (await client.post(f"/v1/cells/{uuid.uuid4()}/snapshots", json={})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_quota_endpoint_limit_429_and_delete_frees_a_slot(client: AsyncClient, db_engine, test_tenant):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from aijailer.models.tenant import Tenant
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        t = await s.get(Tenant, test_tenant.id)
+        t.max_snapshot_count = 1
+        await s.commit()
+    cell_id, snap_id = await _cell_and_snap(client)
+    q = (await client.get("/v1/snapshots/quota")).json()["data"]
+    assert q["count"] == 1 and q["max_count"] == 1 and q["max_bytes"] == 50 * (1 << 30)
+    r = await client.post(f"/v1/cells/{cell_id}/snapshots", json={})
+    assert r.status_code == 429 and "resource_limit_exceeded" in r.text
+    assert (await client.delete(f"/v1/snapshots/{snap_id}")).status_code == 204
+    assert (await client.get("/v1/snapshots/quota")).json()["data"]["count"] == 0
+    assert (await client.post(f"/v1/cells/{cell_id}/snapshots", json={})).status_code == 202
+    assert (await client.delete(f"/v1/snapshots/{snap_id}")).status_code == 404   # already gone

@@ -14,7 +14,8 @@ clone uses the snapshot's policy only if it still exists and is usable (else the
 """
 
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
@@ -26,6 +27,7 @@ from aijailer.core.exceptions import (
     AiJailerError,
     CellLimitExceededError,
     InvalidStateTransitionError,
+    ResourceLimitExceededError,
 )
 from aijailer.engine.microvm import VMConfig, VMNetwork
 from aijailer.models.audit import EventType
@@ -38,6 +40,18 @@ logger = structlog.get_logger(__name__)
 
 SNAPSHOTTABLE = {"ready", "running", "paused"}
 RESTORABLE = {"ready", "running", "paused", "stopped", "error"}
+
+
+_MIB = 1 << 20
+_GIB = 1 << 30
+
+
+@dataclass(frozen=True)
+class SnapshotQuota:
+    count: int
+    max_count: int
+    bytes_used: int
+    max_bytes: int
 
 
 def _err(message: str, code: str) -> AiJailerError:
@@ -102,19 +116,17 @@ class SnapshotService:
         cell = await self.cells.get_cell(cell_id, tenant_id)
         if cell.status not in SNAPSHOTTABLE:
             raise InvalidStateTransitionError(str(cell.id), cell.status, "snapshot")
-        snap = Snapshot(tenant_id=tenant_id, cell_id=cell_id, name=name, description=description,
-                        status="creating", cell_config={})
-        self.db.add(snap)
-        await self.db.flush()
+        snap = await self._reserve(cell, name, description)
         path = self._dir(snap)
         try:
             out = await self.engine.snapshot_vm(cell_id, path)
         except NotImplementedError:
+            await self._release(snap, path)
             raise _err("this isolation backend does not support snapshots",
                        "snapshot_unsupported") from None
         except Exception as exc:
             logger.error("snapshot.failed", cell_id=str(cell_id), error=str(exc))
-            self._discard_dir(path)
+            await self._release(snap, path)
             raise _err("snapshot failed", "snapshot_failed") from None
         sizes = {k: self._size(out.get(k)) for k in ("memory", "disk")}
         snap.cell_config = {
@@ -136,6 +148,75 @@ class SnapshotService:
             tenant_id=tenant_id, cell_id=cell_id, event_type=EventType.LIFECYCLE,
             details={"action": "snapshot_created", "snapshot_id": str(snap.id)})
         return snap
+
+    # ------------------------------------------------------------------ quota
+    async def _usage(self, tenant_id: uuid.UUID) -> tuple[int, int]:
+        """(count, bytes) of snapshots that hold or are about to hold storage. In-flight rows
+        count at their reserved estimate; rows stuck in 'creating' (owner died) are expired first
+        so a crash can never wedge a tenant's quota."""
+        stuck_before = datetime.now(timezone.utc) - timedelta(
+            seconds=get_settings().reconcile_stuck_seconds)
+        stuck = (await self.db.execute(select(Snapshot).where(
+            Snapshot.tenant_id == tenant_id, Snapshot.status == "creating",
+            Snapshot.created_at < stuck_before))).scalars().all()
+        for sn in stuck:
+            sn.status, sn.error_message = "error", "creation did not finish (owner process died)"
+            self._discard_dir(self._dir(sn))
+        row = (await self.db.execute(select(
+            func.count(), func.coalesce(func.sum(Snapshot.total_size_bytes), 0)).where(
+            Snapshot.tenant_id == tenant_id,
+            Snapshot.status.in_(("creating", "available"))))).one()
+        return int(row[0]), int(row[1])
+
+    async def quota(self, tenant_id: uuid.UUID) -> SnapshotQuota:
+        tenant = await self.db.get(Tenant, tenant_id)
+        count, used = await self._usage(tenant_id)
+        return SnapshotQuota(count, tenant.max_snapshot_count, used,
+                             tenant.max_snapshot_storage_gb * _GIB)
+
+    async def _reserve(self, cell: Cell, name: str | None, description: str | None) -> Snapshot:
+        """Check both quotas and insert the 'creating' row in one step under a tenant row lock,
+        then COMMIT, so concurrent requests see each other's reservations (a count-then-insert
+        without it lets N parallel requests all pass). The reserved size is an upper-bound estimate
+        (memory + configured disk), replaced by the real size on completion."""
+        tid = cell.tenant_id
+        tenant = (await self.db.execute(select(Tenant).where(Tenant.id == tid)
+                                        .with_for_update())).scalar_one()
+        count, used = await self._usage(tid)
+        if count >= tenant.max_snapshot_count:
+            await self.db.commit()
+            raise ResourceLimitExceededError("snapshots", str(tenant.max_snapshot_count))
+        estimate = (cell.memory_mb + cell.disk_mb) * _MIB
+        if used + estimate > tenant.max_snapshot_storage_gb * _GIB:
+            await self.db.commit()
+            raise ResourceLimitExceededError(
+                "snapshot_storage", f"{tenant.max_snapshot_storage_gb} GB")
+        snap = Snapshot(tenant_id=tid, cell_id=cell.id, name=name, description=description,
+                        status="creating", cell_config={}, total_size_bytes=estimate)
+        self.db.add(snap)
+        await self.db.commit()                    # releases the lock; reservation is now visible
+        return snap
+
+    async def _release(self, snap: Snapshot, path: str) -> None:
+        """Give a failed snapshot's reservation back (row and any partial files)."""
+        self._discard_dir(path)
+        await self.db.delete(snap)
+        await self.db.commit()
+
+    async def delete_snapshot(self, snapshot_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
+        """Remove the bundle from disk, then the row. Frees quota. A snapshot still being created
+        cannot be deleted (its files are being written)."""
+        snap = await self.get_snapshot(snapshot_id, tenant_id)
+        if snap.status == "creating":
+            raise _err("snapshot is still being created", "snapshot_not_available")
+        path = self._dir(snap)
+        self._discard_dir(path)
+        if Path(path).exists():                   # keep the row so the storage stays accounted
+            raise _err("could not remove the snapshot's files", "snapshot_delete_failed")
+        await self.db.delete(snap)
+        await self.audit.record_event(
+            tenant_id=tenant_id, cell_id=snap.cell_id, event_type=EventType.LIFECYCLE,
+            details={"action": "snapshot_deleted", "snapshot_id": str(snapshot_id)})
 
     @staticmethod
     def _size(path) -> int | None:

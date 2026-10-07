@@ -145,6 +145,7 @@ def create_app() -> FastAPI:
             "snapshot_corrupt": 422,
             "snapshot_unsupported": 501,
             "snapshot_failed": 502,
+            "snapshot_delete_failed": 500,
             "restore_failed": 502,
             "image_not_found": 404,
             "cell_not_running": 409,
