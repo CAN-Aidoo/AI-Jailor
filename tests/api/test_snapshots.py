@@ -142,3 +142,24 @@ async def test_quota_endpoint_limit_429_and_delete_frees_a_slot(client: AsyncCli
     assert (await client.get("/v1/snapshots/quota")).json()["data"]["count"] == 0
     assert (await client.post(f"/v1/cells/{cell_id}/snapshots", json={})).status_code == 202
     assert (await client.delete(f"/v1/snapshots/{snap_id}")).status_code == 404   # already gone
+
+
+@pytest.mark.asyncio
+async def test_per_cell_limit_429_and_quota_endpoint_reports_it(client: AsyncClient, db_engine,
+                                                                 test_tenant):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from aijailer.models.tenant import Tenant
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        t = await s.get(Tenant, test_tenant.id)
+        t.max_snapshots_per_cell = 1
+        await s.commit()
+    cell_id, _ = await _cell_and_snap(client)
+    other_cell, _ = await _cell_and_snap(client, "other")          # a different cell still works
+    r = await client.post(f"/v1/cells/{cell_id}/snapshots", json={})
+    assert r.status_code == 429 and "snapshots_per_cell" in r.text
+    q = (await client.get(f"/v1/snapshots/quota?cell_id={cell_id}")).json()["data"]
+    assert (q["cell_count"], q["max_per_cell"], q["count"]) == (1, 1, 2)
+    import uuid
+    assert (await client.get(f"/v1/snapshots/quota?cell_id={uuid.uuid4()}")).status_code == 404
+    assert "cell_count" not in (await client.get("/v1/snapshots/quota")).json()["data"]

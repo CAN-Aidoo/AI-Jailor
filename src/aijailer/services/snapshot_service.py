@@ -52,6 +52,8 @@ class SnapshotQuota:
     max_count: int
     bytes_used: int
     max_bytes: int
+    cell_count: int | None = None        # set when a cell was asked about
+    max_per_cell: int | None = None
 
 
 def _err(message: str, code: str) -> AiJailerError:
@@ -168,11 +170,21 @@ class SnapshotService:
             Snapshot.status.in_(("creating", "available"))))).one()
         return int(row[0]), int(row[1])
 
-    async def quota(self, tenant_id: uuid.UUID) -> SnapshotQuota:
+    async def _cell_count(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> int:
+        return int((await self.db.execute(select(func.count()).select_from(Snapshot).where(
+            Snapshot.tenant_id == tenant_id, Snapshot.cell_id == cell_id,
+            Snapshot.status.in_(("creating", "available"))))).scalar_one())
+
+    async def quota(self, tenant_id: uuid.UUID, cell_id: uuid.UUID | None = None) -> SnapshotQuota:
         tenant = await self.db.get(Tenant, tenant_id)
         count, used = await self._usage(tenant_id)
+        cell_count = None
+        if cell_id is not None:
+            await self.cells.get_cell(cell_id, tenant_id)          # 404 for other tenants' cells
+            cell_count = await self._cell_count(tenant_id, cell_id)
         return SnapshotQuota(count, tenant.max_snapshot_count, used,
-                             tenant.max_snapshot_storage_gb * _GIB)
+                             tenant.max_snapshot_storage_gb * _GIB, cell_count,
+                             tenant.max_snapshots_per_cell if cell_id is not None else None)
 
     async def _reserve(self, cell: Cell, name: str | None, description: str | None) -> Snapshot:
         """Check both quotas and insert the 'creating' row in one step under a tenant row lock,
@@ -186,6 +198,10 @@ class SnapshotService:
         if count >= tenant.max_snapshot_count:
             await self.db.commit()
             raise ResourceLimitExceededError("snapshots", str(tenant.max_snapshot_count))
+        if await self._cell_count(tid, cell.id) >= tenant.max_snapshots_per_cell:
+            await self.db.commit()
+            raise ResourceLimitExceededError("snapshots_per_cell",
+                                             str(tenant.max_snapshots_per_cell))
         estimate = (cell.memory_mb + cell.disk_mb) * _MIB
         if used + estimate > tenant.max_snapshot_storage_gb * _GIB:
             await self.db.commit()

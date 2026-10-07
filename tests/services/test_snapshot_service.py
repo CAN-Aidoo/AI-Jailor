@@ -482,3 +482,57 @@ async def test_reservation_is_committed_before_the_slow_engine_call(world, db_se
     eng.snapshot_vm = probe
     await snaps.create_snapshot(cell.id, tenant.id, None, None)
     assert seen["in_tx"] is False
+
+
+# ------------------------------------------------------------------ per-cell quota
+@pytest.mark.asyncio
+async def test_per_cell_limit_stops_one_cell_taking_the_whole_tenant_allowance(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshots_per_cell = 2
+    tenant.max_snapshot_count = 10
+    s1 = await snaps.create_snapshot(cell.id, tenant.id, "a", None)
+    await snaps.create_snapshot(cell.id, tenant.id, "b", None)
+    log.clear()
+    with pytest.raises(AiJailerError) as e:
+        await snaps.create_snapshot(cell.id, tenant.id, "c", None)
+    assert e.value.code == "resource_limit_exceeded" and "snapshots_per_cell" in e.value.message
+    assert "vm:snapshot" not in log
+    q = await snaps.quota(tenant.id, cell.id)
+    assert (q.cell_count, q.max_per_cell, q.count) == (2, 2, 2)
+    # another cell of the same tenant is unaffected
+    other = await cells.create_cell(
+        tenant_id=tenant.id, name="o", image="i", vcpus=1, memory_mb=64, disk_mb=64,
+        network_bandwidth_mbps=1, security_policy_id=tenant.id, environment={}, tags={})
+    await snaps.create_snapshot(other.id, tenant.id, "x", None)
+    assert (await snaps.quota(tenant.id, other.id)).cell_count == 1
+    await snaps.delete_snapshot(s1.id, tenant.id)                  # deleting frees the slot
+    await snaps.create_snapshot(cell.id, tenant.id, "c", None)
+
+
+@pytest.mark.asyncio
+async def test_per_cell_count_ignores_failed_rows_and_other_tenants(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    tenant.max_snapshots_per_cell = 1
+    eng.fail_snapshot = True
+    with pytest.raises(AiJailerError):
+        await snaps.create_snapshot(cell.id, tenant.id, None, None)
+    eng.fail_snapshot = False
+    db_session.add(Snapshot(tenant_id=tenant.id, cell_id=cell.id, status="error", cell_config={}))
+    db_session.add(Snapshot(tenant_id=uuid.uuid4(), cell_id=cell.id, status="available",
+                            cell_config={}))                       # same cell id, other tenant
+    await db_session.commit()
+    await snaps.create_snapshot(cell.id, tenant.id, None, None)    # still allowed: nothing counted
+    with pytest.raises(AiJailerError):
+        await snaps.create_snapshot(cell.id, tenant.id, None, None)
+
+
+@pytest.mark.asyncio
+async def test_cell_quota_query_is_tenant_scoped(world, db_session):
+    snaps, cells, eng, net, tenant, cell, log = world
+    other = Tenant(name="x", slug=f"x-{uuid.uuid4().hex[:6]}", status="active", tier="pro",
+                   max_concurrent_cells=5)
+    db_session.add(other)
+    await db_session.commit()
+    with pytest.raises(Exception) as e:
+        await snaps.quota(other.id, cell.id)
+    assert getattr(e.value, "code", "") == "cell_not_found"

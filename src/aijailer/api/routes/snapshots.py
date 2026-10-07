@@ -112,14 +112,19 @@ async def clone_from_snapshot(
 
 @router.get("/v1/snapshots/quota", response_model=ApiResponse[dict])
 async def snapshot_quota(
+    cell_id: uuid.UUID | None = None,
     auth: AuthContext = Depends(authenticate),
     db: AsyncSession = Depends(get_db),
 ):
     """The tenant's snapshot usage against its limits (count and total bytes; in-flight
-    snapshots are counted at their reserved size)."""
-    q = await SnapshotService(db).quota(auth.tenant_id)
-    return ApiResponse(data={"count": q.count, "max_count": q.max_count,
-                             "bytes_used": q.bytes_used, "max_bytes": q.max_bytes})
+    snapshots are counted at their reserved size). With ``cell_id`` it also reports that cell's
+    count against the per-cell limit."""
+    q = await SnapshotService(db).quota(auth.tenant_id, cell_id)
+    data = {"count": q.count, "max_count": q.max_count,
+            "bytes_used": q.bytes_used, "max_bytes": q.max_bytes}
+    if cell_id is not None:
+        data.update(cell_count=q.cell_count, max_per_cell=q.max_per_cell)
+    return ApiResponse(data=data)
 
 
 @router.delete("/v1/snapshots/{snapshot_id}", status_code=204)

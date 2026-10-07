@@ -25,6 +25,8 @@ class Tenant(Base):
     max_persistent_storage_gb: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     max_snapshot_count: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     # Total bytes of snapshot bundles (memory dumps dominate): count alone does not bound disk use.
+    # Keeps one runaway cell (or agent loop) from using the whole tenant allowance.
+    max_snapshots_per_cell: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     max_snapshot_storage_gb: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     spending_cap_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
