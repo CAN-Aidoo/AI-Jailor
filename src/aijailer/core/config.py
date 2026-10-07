@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     )
     rootfs_dir: str = Field(default="/var/lib/aijailer/rootfs", alias="ROOTFS_DIR")
     cell_data_dir: str = Field(default="/var/lib/aijailer/cells", alias="CELL_DATA_DIR")
+    snapshot_dir: str = Field(default="/var/lib/aijailer/snapshots", alias="SNAPSHOT_DIR")
 
     # Rate limiting defaults
     default_rate_limit_per_minute: int = 300

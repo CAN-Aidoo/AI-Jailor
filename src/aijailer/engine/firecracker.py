@@ -534,6 +534,13 @@ class FirecrackerEngine(MicroVMEngine):
                 if n else None}
 
     @staticmethod
+    def _mkdir_private(path: Path) -> None:
+        """mkdir -p where every directory we create is 0700 (``mkdir(mode=)`` only covers the leaf)."""
+        missing = [p for p in (path, *path.parents) if not p.exists()]
+        for p in reversed(missing):
+            p.mkdir(mode=0o700, exist_ok=True)
+
+    @staticmethod
     def _sha256(path: Path) -> str:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -548,7 +555,7 @@ class FirecrackerEngine(MicroVMEngine):
         if not vm.get("meta"):
             raise RuntimeError("cannot snapshot an adopted VM: its configuration is unknown")
         out = Path(snapshot_dir)
-        out.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._mkdir_private(out)
         was_running = vm["info"].status == VMStatus.RUNNING
         if was_running:
             await vm["api"].set_state("Paused")
@@ -566,8 +573,8 @@ class FirecrackerEngine(MicroVMEngine):
         return {"state": str(out / SNAP_STATE), "memory": str(out / SNAP_MEM),
                 "disk": str(out / SNAP_DISK), "meta": str(out / SNAP_META)}
 
-    async def _read_snapshot(self, snapshot_dir: str, config: VMConfig) -> tuple[Path, dict]:
-        """Validate a snapshot bundle against the restore request BEFORE anything is spawned.
+    async def _verify_bundle(self, snapshot_dir: str) -> tuple[Path, dict]:
+        """Metadata present and well-formed, every file present and matching its sha256.
         Hashes catch corruption/truncation (not a malicious writer of the whole directory:
         keep snapshot storage write-protected)."""
         d = Path(snapshot_dir)
@@ -583,6 +590,14 @@ class FirecrackerEngine(MicroVMEngine):
                 raise SnapshotError(f"snapshot {d}: {name} missing")
             if await asyncio.to_thread(self._sha256, f) != want:
                 raise SnapshotError(f"snapshot {d}: {name} does not match its recorded sha256")
+        return d, meta
+
+    async def check_snapshot(self, snapshot_dir: str) -> None:
+        await self._verify_bundle(snapshot_dir)
+
+    async def _read_snapshot(self, snapshot_dir: str, config: VMConfig) -> tuple[Path, dict]:
+        """Validate a snapshot bundle against the restore request BEFORE anything is spawned."""
+        d, meta = await self._verify_bundle(snapshot_dir)
         want_net, have = meta.get("network"), config.network
         if (want_net is None) != (have is None) or (
                 want_net and (want_net["guest_ip"], want_net["prefix"])

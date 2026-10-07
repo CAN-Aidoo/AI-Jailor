@@ -322,8 +322,9 @@ every file. `restore_vm(config, snapshot_dir)`:
 Machine shape comes from the snapshot, not the request. Sharp edges: the guest resumes with its old RNG/entropy state, so
 several restores of one snapshot are *clones* and must not be treated as independent for keys/nonces; established vsock
 connections are reset (the agent must accept new ones); hashes detect corruption, not a hostile writer, so keep snapshot
-storage write-protected; the control-plane routes `POST /cells/{id}/snapshots|restore` are still stubs that do not call the
-engine, and the network allocator does not yet reserve a specific /30 for a restored cell.
+storage write-protected; the control-plane routes now call the engine (`services/snapshot_service.py`; see API_DOCUMENTATION.md): restore
+claims the snapshot's exact /30 (`NetAllocator.claim`) and is refused with 409 if another cell holds it, which also means a
+clone only works once the source cell no longer holds that address.
 Verified with real Firecracker (no KVM): the jailer-uid VMM opens our jail-relative snapshot file and parses our
 `/snapshot/load` request (it rejects a bogus snapshot by CRC, not by request shape). Not verified: an actual restore of a
 running guest, and `network_overrides` (processed after state load).

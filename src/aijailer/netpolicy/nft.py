@@ -222,6 +222,25 @@ class NetAllocator:
         self._index[cell_id] = i
         self._taken.add(i)
 
+    def _slot(self, subnet: ipaddress.IPv4Network) -> int:
+        if subnet.prefixlen != 30 or not subnet.subnet_of(self._net):
+            raise NftError(f"{subnet} is not a /30 inside pool {self._net}")
+        return (int(subnet.network_address) - int(self._net.network_address)) // 4
+
+    def is_available(self, cell_id: uuid.UUID, subnet: ipaddress.IPv4Network) -> bool:
+        """Could ``cell_id`` claim ``subnet`` right now (free, or already its own)?"""
+        i = self._slot(subnet)
+        return self._index.get(cell_id) == i or not self._blocked(i)
+
+    def claim(self, cell_id: uuid.UUID, subnet: ipaddress.IPv4Network) -> None:
+        """Take a specific /30 for a new cell (a restored guest keeps its address). Unlike
+        ``reserve`` it also refuses subnets that exist on the host under someone else's name."""
+        if not self.is_available(cell_id, subnet):
+            raise NftError(f"{subnet} is already in use")
+        self.reserve(cell_id, subnet)
+        if self._slot(subnet) in self._free:
+            self._free.remove(self._slot(subnet))
+
     def release(self, cell_id: uuid.UUID) -> None:
         i = self._index.pop(cell_id, None)
         if i is not None:
@@ -257,14 +276,23 @@ class NetPolicyManager:
             await self._nft.run(full_ruleset(self.cells))
             self._installed = True
 
-    async def register(self, cell_id: uuid.UUID, broker_port: int | None = None) -> CellNet:
+    def subnet_available(self, cell_id: uuid.UUID, subnet) -> bool:
+        return self._alloc.is_available(cell_id, ipaddress.ip_network(subnet))
+
+    async def register(self, cell_id: uuid.UUID, broker_port: int | None = None,
+                       subnet=None) -> CellNet:
+        """``subnet`` pins the cell to a specific /30 (restoring a snapshot); NftError if taken."""
         async with self._lock:
             if cell_id in self._cells:
                 return self._cells[cell_id]
             if not self._installed:
                 await self._nft.run(full_ruleset(self.cells))
                 self._installed = True
-            sn = self._alloc.allocate(cell_id)
+            if subnet is not None:
+                sn = ipaddress.ip_network(subnet)
+                self._alloc.claim(cell_id, sn)
+            else:
+                sn = self._alloc.allocate(cell_id)
             hosts = list(sn.hosts())
             cell = CellNet(cell_id, ifname_for(cell_id), hosts[0], hosts[1], 30,
                            broker_port or self._port)

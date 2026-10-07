@@ -138,6 +138,10 @@ class MicroVMEngine(ABC):
     async def restore_vm(self, config: "VMConfig", snapshot_dir: str) -> "VMInfo":
         raise NotImplementedError(f"{type(self).__name__} does not support restore")
 
+    async def check_snapshot(self, snapshot_dir: str) -> None:
+        """Cheap, side-effect-free validation of a snapshot bundle (raises if unusable). Callers
+        run it BEFORE destroying the VM they are about to replace."""
+
     @abstractmethod
     async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
         """Get current status and info for a microVM."""
@@ -204,6 +208,14 @@ class SimulatedMicroVMEngine(MicroVMEngine):
 
     async def destroy_vm(self, cell_id: uuid.UUID) -> None:
         self._vms.pop(cell_id, None)
+
+    async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
+        if cell_id not in self._vms:
+            raise KeyError(f"unknown cell {cell_id}")
+        return {"state": None, "memory": None, "disk": None}      # nothing real to store
+
+    async def restore_vm(self, config: VMConfig, snapshot_dir: str) -> VMInfo:
+        return await self.create_vm(config)
 
     async def exec_command(
         self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"

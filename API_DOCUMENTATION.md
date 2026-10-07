@@ -297,7 +297,9 @@ List files in a directory inside a cell.
 
 #### POST /v1/cells/{cell_id}/snapshots
 
-Create a snapshot of a cell.
+Snapshot a `ready`/`running`/`paused` cell (memory + VM state + disk; the guest is paused briefly and resumed).
+The bundle is stored under `SNAPSHOT_DIR/<tenant>/<snapshot>` with a sha256 per file. Backends without snapshot
+support answer `501 snapshot_unsupported`; other failures `502 snapshot_failed` (no snapshot row is kept).
 
 **Request Body**:
 
@@ -316,7 +318,8 @@ Create a snapshot of a cell.
     "id": "snap_abc123",
     "cell_id": "cell_abc123def456",
     "name": "after-setup",
-    "status": "creating",
+    "status": "available",
+    "total_size_bytes": 268435456,
     "created_at": "2025-01-15T10:40:00Z"
   }
 }
@@ -328,21 +331,29 @@ List snapshots for a cell.
 
 #### POST /v1/cells/{cell_id}/restore
 
-Restore a cell from a snapshot.
-
-**Request Body**:
+Restore the cell from one of **its own** snapshots. **Destructive and synchronous**: the cell's current VM (and
+everything done in it since the snapshot) is replaced; the response is the final status (`running`).
 
 ```json
-{
-  "snapshot_id": "snap_abc123"
-}
+{ "snapshot_id": "snap_abc123" }
 ```
+
+- The guest keeps its saved network address, so the snapshot's /30 must be free: otherwise `409 snapshot_address_in_use`.
+- The cell's **current** security policy, bandwidth and environment are kept (restoring never resurrects an older, looser policy).
+- Checked before anything is destroyed: snapshot exists / is `available` / belongs to this cell (`400 snapshot_cell_mismatch`),
+  cell state (`409`), address, bundle integrity (`422 snapshot_corrupt`).
+- If the restore itself fails after the old VM was replaced, the cell is left in `error` (`502 restore_failed`).
+- Restored guests resume with their saved RNG state; established vsock connections are reset.
 
 #### POST /v1/snapshots/{snapshot_id}/clone
 
-Create a new cell from a snapshot.
+Create a new cell from a snapshot. The clone keeps the snapshot's machine (`resources` is rejected: `400 invalid_clone`)
+and its guest address, so it only works while no other cell holds that address (typically after the source cell is
+gone; otherwise `409 snapshot_address_in_use`). `security_policy_id` defaults to the source cell's policy and must still
+be usable. A clone shares the snapshot's saved RNG state: do not treat clones as independent for keys or nonces.
+Returns `201` with the new cell's `id` and `status` (`error` if the restore failed).
 
-**Request Body**:
+**Request Body** (`resources` shown for completeness; it must be omitted):
 
 ```json
 {
@@ -670,7 +681,15 @@ X-RateLimit-Reset: 1705312260
 | `execution_timeout` | 408 | Command exceeded its timeout |
 | `policy_violation` | 403 | Action blocked by security policy |
 | `resource_limit_exceeded` | 429 | Cell or tenant resource quota exceeded |
-| `snapshot_failed` | 500 | Snapshot creation failed |
+| `snapshot_failed` | 502 | Snapshot creation failed |
+| `snapshot_unsupported` | 501 | The isolation backend cannot snapshot |
+| `snapshot_not_found` | 404 | No such snapshot for this tenant |
+| `snapshot_not_available` | 409 | Snapshot is not in `available` state |
+| `snapshot_address_in_use` | 409 | The snapshot's guest address is held by another cell |
+| `snapshot_cell_mismatch` | 400 | Snapshot belongs to a different cell (use clone) |
+| `snapshot_corrupt` | 422 | Snapshot data is missing or fails its checksums |
+| `restore_failed` | 502 | Restore failed after the old VM was replaced; cell is `error` |
+| `invalid_clone` | 400 | Clone request tried to change the snapshot's resources |
 | `image_not_found` | 404 | Specified base image does not exist |
 | `invalid_policy` | 400 | Policy definition is invalid |
 | `spending_cap_reached` | 402 | Tenant spending cap exceeded |

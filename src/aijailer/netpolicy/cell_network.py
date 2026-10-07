@@ -182,9 +182,17 @@ class CellNetwork:
     def provisioned(self) -> set[uuid.UUID]:
         return set(self._proxies)
 
+    def subnet_of(self, cell_id: uuid.UUID) -> str | None:
+        net = self._nets.get(cell_id)
+        return str(net.network) if net is not None else None
+
+    def subnet_available(self, cell_id: uuid.UUID, subnet: str) -> bool:
+        return self._mgr.subnet_available(cell_id, subnet)
+
     async def provision(self, cell_id: uuid.UUID, tenant_id: uuid.UUID,
                         network_policy: dict | None,
-                        bandwidth: Bandwidth | None = None) -> Provisioned:
+                        bandwidth: Bandwidth | None = None,
+                        subnet: str | None = None) -> Provisioned:
         async with self._lock:
             if cell_id in self._proxies:
                 raise RuntimeError(f"network for cell {cell_id} already provisioned")
@@ -193,7 +201,7 @@ class CellNetwork:
                 self._resolver)
             net = None
             try:
-                net = await self._mgr.register(cell_id)
+                net = await self._mgr.register(cell_id, subnet=subnet)
                 link = await self._links.setup(net)
                 self._links_up.add(cell_id)
                 # A cell never runs without its bandwidth limit: failure rolls everything back.

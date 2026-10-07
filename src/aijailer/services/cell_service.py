@@ -79,15 +79,16 @@ class CellService:
         self._net_required = network_required(self.engine)
         self._network = (network or get_cell_network()) if self._net_required else None
 
-    async def _provision_network(self, cell: Cell):
+    async def _provision_network(self, cell: Cell, subnet: str | None = None):
         """Build the cell's firewalled link + broker. Raises (and cleans up) on failure."""
         if self._network is None:
             return None
         remember_tenant(cell.id, cell.tenant_id)
         policy = (cell.effective_policy or {}).get("network")
+        extra = {"subnet": subnet} if subnet else {}      # only when pinning a restored guest
         return await self._network.provision(
             cell.id, cell.tenant_id, policy,
-            effective_bandwidth(cell.network_bandwidth_mbps, cell.bandwidth_override))
+            effective_bandwidth(cell.network_bandwidth_mbps, cell.bandwidth_override), **extra)
 
     async def _deprovision_network(self, cell_id: uuid.UUID) -> None:
         if self._network is None:
