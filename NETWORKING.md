@@ -206,6 +206,8 @@ limit rate 20/second burst 5 packets accept
 
 By default, cells cannot communicate with each other. For use cases that require inter-cell communication (e.g., multi-agent systems), explicit configuration is required:
 
+> **Status: design sketch, not implemented.** Nothing in `src/` implements `cell_links` or IP-level connectivity between cells, and the implemented firewall drops all cell-to-cell forwarding (see "Host enforcement" below). The implemented way for two cells to exchange data is a consented, relayed **peer link**; see "Peer links and the PSI example" at the end of this file and PEER_LINKS.md.
+
 ### Linked Cells
 
 ```json
@@ -409,3 +411,52 @@ half of everything present aborts the pass (a bad DB read must not look like a m
 Firecracker (`tests/engine/test_real_jailer.py`): a fresh engine finds the VMM from its argv, refuses to adopt one that never
 started, and kills it and removes its jail once the cell is not live. Not verified without KVM: adopting a *running* guest
 (agent ping over vsock). `restore_vm` remains unimplemented.
+
+### Peer links and the PSI example (implemented)
+
+A peer link (PEER_LINKS.md) gives two consenting cells an encrypted channel **without any packet ever
+flowing between them**. The reference PSI workload (`examples/psi/`) is the worked example. At the network
+layer:
+
+    cell A: psi.py ──127.0.0.1:P──> aijailer-peer ──TCP──> host_ip:broker_port ─┐
+                                                                                ├─ CellProxy ─ PeerHub ─ CellProxy
+    cell B: psi.py ──127.0.0.1:P──> aijailer-peer ──TCP──> host_ip:broker_port ─┘      (inside the host process)
+
+- **Same single allowed destination.** Each cell connects only to its own `host_ip:broker_port`, the one
+  destination the `aj*` input rule already accepts. There are **no new nftables rules, no new ports and no
+  new listeners**; `forward` still drops everything from or to `aj*`. Cells still cannot reach each other's
+  IPs. The relay pairs two connections inside the host process.
+- **Identity is the listener**, as for all broker traffic: a cell can only attach as itself.
+- **The name is never resolved.** The workload sends `CONNECT <link-id>.peer.aijailer.invalid:443` to the
+  proxy; `.invalid` is reserved and has no DNS entry. The proxy diverts it before DNS resolution and before
+  the egress allowlist, so neither DNS policy nor allowlists apply to it (and none are needed). The egress
+  broker's content and credential checks do not see the traffic, which is end-to-end TLS 1.3 between the
+  cells (see SECURITY_MODEL.md, "Peer links and the PSI example workload").
+- **Environment.** When `PEER_ATTESTATION_SECRET` is set the cell also receives
+  `AIJAILER_PEER_ATTEST_PUBKEY` next to the usual proxy variables; `NO_PROXY` stays empty, so nothing is
+  configured to bypass the proxy.
+- **Accounting.** The session crosses the cell's TAP like all other traffic, so by construction the cell's tc
+  shaping and the broker-port connection-rate rule apply to it. I have not tested peer traffic under shaping.
+  Sessions are bounded by the relay itself: lifetime (default 1 h), idle time (5 min) and bytes (1 GiB), and are
+  cut at once when the link is revoked or either cell loses its network. Each session is one `network`
+  audit event with the bytes moved each way.
+
+**What PSI adds at the network layer: nothing.** `psi.py` talks to `aijailer-peer` over **loopback inside the
+guest** (`--connect 127.0.0.1:P`), and the only traffic that leaves the cell is the helper's TLS stream to the
+host proxy described above. The PSI frames are about 256 bytes per element, so the relay byte counts roughly
+reveal set sizes to anyone who can read the audit log.
+
+**Guest requirement: loopback must be up.** The local hand-off between `psi.py` and `aijailer-peer` needs the
+guest's `lo` interface to be up. The guest init (`guest-agent/init_linux.go`, `setupInit`) mounts
+`/proc`, `/sys`, `/dev` and `/tmp` but does not bring `lo` up, and the boot arguments configure only
+`eth0` (`ip=<guest>::<host>:<mask>::eth0:off`). In a fresh network namespace, where `lo` starts down like a
+freshly booted kernel's, a localhost TCP connection fails with `Network is unreachable` until `lo` is
+brought up, and works immediately afterwards. Whether the guest kernel's `ip=` autoconfiguration happens to
+bring `lo` up could not be checked here (no KVM), so until the guest init does it explicitly, treat the
+loopback hand-off as **unverified in a real cell**; the helper's `--stdio` mode does not need loopback.
+
+**Verified / not verified.** Verified: the relay path with real sockets through the real proxy and hub, and PSI
+end to end over it (host network; also with both programs running in the guest rootfs's userland as the
+unprivileged `agent` user, in a chroot, which shares the host's network and has no firewall). Not verified: a
+booted Firecracker cell, the nftables rules in front of a real peer session, shaping of peer traffic, and
+loopback inside a real guest.
