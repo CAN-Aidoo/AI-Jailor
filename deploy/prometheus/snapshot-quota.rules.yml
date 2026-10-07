@@ -1,0 +1,62 @@
+# Snapshot quota alerts for AI Jailer. Metrics: aijailer_snapshot_quota_{used,limit,denied_total}
+# (GET /metrics; see API_DOCUMENTATION.md). `used / limit >= 1` is exactly when snapshot creation
+# starts being refused, so these alerts fire on the enforcement's own condition.
+#
+# Validate:  promtool check rules deploy/prometheus/snapshot-quota.rules.yml
+# Test:      promtool test rules  deploy/prometheus/snapshot-quota.rules.test.yml
+groups:
+  - name: aijailer-snapshot-quota
+    interval: 30s
+    rules:
+      # used/limit per tenant and quota. The per-cell quotas report the tenant's fullest cell.
+      # A zero limit gives +Inf (fires as exhausted: nothing can be created); 0/0 gives NaN (quiet).
+      - record: aijailer:snapshot_quota:ratio
+        expr: aijailer_snapshot_quota_used / aijailer_snapshot_quota_limit
+
+      - alert: SnapshotQuotaNearLimit
+        expr: aijailer:snapshot_quota:ratio >= 0.8 and aijailer:snapshot_quota:ratio < 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.tenant }} is at {{ $value | humanizePercentage }} of its {{ $labels.quota }} snapshot quota"
+          description: >-
+            Snapshot creation will start failing with 429 once the quota is reached. For the
+            per-cell quotas this is the tenant's fullest cell. Delete snapshots
+            (DELETE /v1/snapshots/{id}) or raise the tenant's limit.
+
+      - alert: SnapshotQuotaExhausted
+        expr: aijailer:snapshot_quota:ratio >= 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tenant {{ $labels.tenant }} has used its whole {{ $labels.quota }} snapshot quota"
+          description: >-
+            New snapshots for this tenant (or for its fullest cell, for per-cell quotas) are being
+            refused. A cell whose memory + disk alone exceed a storage quota can never be
+            snapshotted (the reservation is an upper bound): raise that limit.
+
+      # Refusals actually happening (a client is trying and failing), independent of the gauges.
+      - alert: SnapshotQuotaDenials
+        expr: sum by (tenant, quota) (increase(aijailer_snapshot_quota_denied_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.tenant }} was refused {{ $value | humanize }} snapshot(s) in 15m by the {{ $labels.quota }} quota"
+          description: >-
+            The counter is per process and resets on restart; increase() handles resets and the
+            sum covers several workers.
+
+      # The alerts above are silent if the data stops arriving.
+      - alert: SnapshotQuotaMetricsMissing
+        expr: absent(aijailer_snapshot_quota_limit)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No snapshot quota metrics: /metrics is not being scraped or no tenant is active"
+          description: >-
+            Check METRICS_TOKEN (the endpoint answers 404 when unset, 401 for a wrong token) and
+            the scrape job's credentials.

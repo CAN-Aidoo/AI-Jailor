@@ -1,0 +1,102 @@
+# promtool test rules deploy/prometheus/snapshot-quota.rules.test.yml
+rule_files:
+  - snapshot-quota.rules.yml
+evaluation_interval: 30s
+
+tests:
+  - name: near limit fires after 15m, exhausted takes over at 100%
+    interval: 1m
+    input_series:
+      - series: 'aijailer_snapshot_quota_limit{tenant="t1",quota="snapshots"}'
+        values: '100x40'
+      - series: 'aijailer_snapshot_quota_used{tenant="t1",quota="snapshots"}'
+        # 85 for 20m, then 100 (full)
+        values: '85x19 100x20'
+      - series: 'aijailer_snapshot_quota_limit{tenant="t2",quota="snapshots"}'
+        values: '100x40'
+      - series: 'aijailer_snapshot_quota_used{tenant="t2",quota="snapshots"}'
+        values: '50x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SnapshotQuotaNearLimit
+        exp_alerts: []                       # not yet 15m
+      - eval_time: 17m
+        alertname: SnapshotQuotaNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, tenant: t1, quota: snapshots}
+            exp_annotations:
+              summary: "Tenant t1 is at 85% of its snapshots snapshot quota"
+              description: "Snapshot creation will start failing with 429 once the quota is reached. For the per-cell quotas this is the tenant's fullest cell. Delete snapshots (DELETE /v1/snapshots/{id}) or raise the tenant's limit."
+      - eval_time: 28m                       # 100% reached at 20m: near-limit stops, exhausted not yet 5m
+        alertname: SnapshotQuotaNearLimit
+        exp_alerts: []
+      - eval_time: 28m
+        alertname: SnapshotQuotaExhausted
+        exp_alerts:
+          - exp_labels: {severity: critical, tenant: t1, quota: snapshots}
+            exp_annotations:
+              summary: "Tenant t1 has used its whole snapshots snapshot quota"
+              description: "New snapshots for this tenant (or for its fullest cell, for per-cell quotas) are being refused. A cell whose memory + disk alone exceed a storage quota can never be snapshotted (the reservation is an upper bound): raise that limit."
+      - eval_time: 28m
+        alertname: SnapshotQuotaMetricsMissing
+        exp_alerts: []
+
+  - name: zero limit is exhausted, zero over zero is quiet, per-cell quota keyed separately
+    interval: 1m
+    input_series:
+      - series: 'aijailer_snapshot_quota_limit{tenant="t3",quota="snapshots"}'
+        values: '0x20'
+      - series: 'aijailer_snapshot_quota_used{tenant="t3",quota="snapshots"}'
+        values: '3x20'
+      - series: 'aijailer_snapshot_quota_limit{tenant="t4",quota="snapshots"}'
+        values: '0x20'
+      - series: 'aijailer_snapshot_quota_used{tenant="t4",quota="snapshots"}'
+        values: '0x20'
+      - series: 'aijailer_snapshot_quota_limit{tenant="t5",quota="snapshots_per_cell"}'
+        values: '10x20'
+      - series: 'aijailer_snapshot_quota_used{tenant="t5",quota="snapshots_per_cell"}'
+        values: '10x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SnapshotQuotaExhausted
+        exp_alerts:
+          - exp_labels: {severity: critical, tenant: t3, quota: snapshots}
+            exp_annotations:
+              summary: "Tenant t3 has used its whole snapshots snapshot quota"
+              description: "New snapshots for this tenant (or for its fullest cell, for per-cell quotas) are being refused. A cell whose memory + disk alone exceed a storage quota can never be snapshotted (the reservation is an upper bound): raise that limit."
+          - exp_labels: {severity: critical, tenant: t5, quota: snapshots_per_cell}
+            exp_annotations:
+              summary: "Tenant t5 has used its whole snapshots_per_cell snapshot quota"
+              description: "New snapshots for this tenant (or for its fullest cell, for per-cell quotas) are being refused. A cell whose memory + disk alone exceed a storage quota can never be snapshotted (the reservation is an upper bound): raise that limit."
+
+  - name: denials alert on increase, survive a counter reset, and clear
+    interval: 1m
+    input_series:
+      - series: 'aijailer_snapshot_quota_denied_total{tenant="t1",quota="snapshots_per_cell"}'
+        # 0,0,0 then 2 refusals, process restart (reset to 0), 1 more refusal, then quiet
+        values: '0 0 0 1 2 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'aijailer_snapshot_quota_limit{tenant="t1",quota="snapshots"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SnapshotQuotaDenials
+        exp_alerts:
+          - exp_labels: {severity: warning, tenant: t1, quota: snapshots_per_cell}
+            exp_annotations:
+              summary: "Tenant t1 was refused 2 snapshot(s) in 15m by the snapshots_per_cell quota"
+              description: "The counter is per process and resets on restart; increase() handles resets and the sum covers several workers."
+      - eval_time: 35m
+        alertname: SnapshotQuotaDenials
+        exp_alerts: []
+
+  - name: missing metrics alert fires when nothing is scraped
+    interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: SnapshotQuotaMetricsMissing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "No snapshot quota metrics: /metrics is not being scraped or no tenant is active"
+              description: "Check METRICS_TOKEN (the endpoint answers 404 when unset, 401 for a wrong token) and the scrape job's credentials."

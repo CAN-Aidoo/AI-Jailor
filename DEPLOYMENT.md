@@ -388,3 +388,19 @@ For cloud deployments, cell nodes can be auto-scaled:
 | Kafka | Topic replication (built-in) | Continuous | Per topic config | N/A (replicated) |
 | Node Agent config | Git repository | On change | Unlimited | < 15 minutes |
 | TLS certificates | Vault backup | On change | Unlimited | < 30 minutes |
+
+### Snapshot quota alerts
+
+`deploy/prometheus/snapshot-quota.rules.yml` (with promtool unit tests in `snapshot-quota.rules.test.yml` and a scrape
+job in `scrape.example.yml`) alerts on the `/metrics` quota gauges (set `METRICS_TOKEN`; see API_DOCUMENTATION.md):
+
+| Alert | Fires when | Severity |
+|---|---|---|
+| `SnapshotQuotaNearLimit` | a tenant's used/limit is 80-100% of a quota for 15m | warning |
+| `SnapshotQuotaExhausted` | used/limit >= 1 for 5m: creations are being refused | critical |
+| `SnapshotQuotaDenials` | any refusal in the last 15m (a client is trying and failing; counter-reset safe) | warning |
+| `SnapshotQuotaMetricsMissing` | no quota metrics for 10m: scrape broken, wrong/missing token, or no active tenant | warning |
+
+Validate with `promtool check rules` and `promtool test rules`; `tests/deploy/test_prometheus_rules.py` runs both when
+`promtool` is on PATH (or `PROMTOOL=` is set) and always checks that every metric a rule uses is really exported.
+

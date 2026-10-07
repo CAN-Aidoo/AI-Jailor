@@ -1,0 +1,14 @@
+# Example scrape job for AI Jailor's operator metrics (METRICS_TOKEN must be set on the service).
+# Keep the token in a file readable only by Prometheus, never inline.
+scrape_configs:
+  - job_name: aijailer
+    metrics_path: /metrics
+    scrape_interval: 30s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/aijailer-metrics-token
+    static_configs:
+      - targets: ["aijailer.internal:8000"]
+
+rule_files:
+  - /etc/prometheus/rules/snapshot-quota.rules.yml
