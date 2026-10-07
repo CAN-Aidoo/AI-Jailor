@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # Shutdown
+    await audit.close()                    # drain batched events before the final checkpoint pass
     if checkpointer is not None:
         await checkpointer.stop()
     if net_runtime is not None:
@@ -299,7 +300,11 @@ def create_app() -> FastAPI:
         if not hmac.compare_digest(given.encode(), f"Bearer {token}".encode()):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"},
                                 headers={"WWW-Authenticate": "Bearer"})
-        return PlainTextResponse(await quota_metrics.collect(db), media_type=promtext.CONTENT_TYPE)
+        from aijailer.services.audit_service import get_audit_service
+
+        body = await quota_metrics.collect(db) + promtext.render(
+            get_audit_service().prometheus_families())
+        return PlainTextResponse(body, media_type=promtext.CONTENT_TYPE)
 
     # --- Health check ---
     @app.get("/health", tags=["System"])

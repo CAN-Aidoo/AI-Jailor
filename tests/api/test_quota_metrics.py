@@ -126,3 +126,11 @@ def test_exposition_escapes_labels_and_omits_empty_families():
     assert 'm_a{k="a\\"b\\\\c\\nd"} 3' in out and "m_empty" not in out
     assert "# HELP m_a help \\\\ with\\nnewline" in out and "m_f 0.5" in out
     assert out.endswith("\n")
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_includes_the_audit_batch_metrics(client: AsyncClient):
+    text = (await client.get("/metrics", headers=H)).text
+    for name in ("aijailer_audit_batch_pending", "aijailer_audit_batch_queue_capacity",
+                 "aijailer_audit_events_dropped_total", "aijailer_audit_batch_flush_failures_total"):
+        assert f"\n{name} " in "\n" + text, name

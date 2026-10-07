@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     audit_signing_secret: str = Field(default="", alias="AUDIT_SIGNING_SECRET")
     audit_checkpoint_interval_seconds: float = Field(
         default=300.0, alias="AUDIT_CHECKPOINT_INTERVAL_SECONDS")
+    # Group commit for high-volume audit events (network decisions). A hard crash loses up to the
+    # delay; a full queue drops the newest and records an audit_events_dropped marker.
+    audit_batch_max_events: int = Field(default=200, alias="AUDIT_BATCH_MAX_EVENTS")
+    audit_batch_max_delay_ms: float = Field(default=500.0, alias="AUDIT_BATCH_MAX_DELAY_MS")
+    audit_batch_queue_max: int = Field(default=10000, alias="AUDIT_BATCH_QUEUE_MAX")
     # Tenant secret store: "id:base64key[,id2:base64key2]" (32 raw bytes each). Unset => the secret
     # store is DISABLED (API returns 503, brokers get no secrets); there is no insecure default.
     secrets_master_keys: str = Field(default="", alias="SECRETS_MASTER_KEYS")

@@ -419,3 +419,11 @@ Provision it with `deploy/grafana/provisioning/dashboards/aijailer.yml` (mount t
 `tests/deploy/test_grafana_dashboard.py` checks the layout, that only exported metrics are queried, and (with promtool)
 that every query parses as PromQL and the key ones return the right answers on sample series.
 
+### Audit log alerts
+
+`deploy/prometheus/audit.rules.yml` (promtool-tested) watches the audit group-commit writer: `AuditEventsDropped`
+(critical: events were dropped, there is an evidence gap marked in the chain), `AuditBatchWritesFailing` (warning: batch
+writes failing for 5m, events queued in memory) and `AuditBatchBacklog` (warning: queue more than half full for 5m).
+Metrics: `aijailer_audit_batch_pending`, `..._queue_capacity`, `aijailer_audit_events_dropped_total`,
+`..._flush_failures_total`, `..._events_flushed_total` (all on `GET /metrics`).
+

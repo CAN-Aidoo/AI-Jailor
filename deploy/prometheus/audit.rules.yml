@@ -1,0 +1,41 @@
+# Alerts for the audit log's group-commit writer. Metrics: aijailer_audit_* (GET /metrics).
+# Validate: promtool check rules deploy/prometheus/audit.rules.yml
+# Test:     promtool test rules  deploy/prometheus/audit.rules.test.yml
+groups:
+  - name: aijailer-audit
+    interval: 30s
+    rules:
+      # A dropped event is an evidence gap (the chain carries an audit_events_dropped marker saying
+      # how many). Page on it: someone must decide whether the gap matters.
+      - alert: AuditEventsDropped
+        expr: increase(aijailer_audit_events_dropped_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | humanize }} audit event(s) dropped in 15m: the batch queue was full"
+          description: >-
+            The audit database is slower than the event rate or unreachable. Each affected chain has an
+            `audit_events_dropped` marker. Raise AUDIT_BATCH_QUEUE_MAX / fix the database; consider
+            recording the affected event types with record_event (durable) instead.
+
+      - alert: AuditBatchWritesFailing
+        expr: increase(aijailer_audit_batch_flush_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit batch writes have been failing for 5m+ (events are queued and retried)"
+          description: >-
+            Queued events are held in memory and are lost if the process dies, or dropped if the
+            queue fills (see AuditEventsDropped). Check database availability and write errors.
+
+      - alert: AuditBatchBacklog
+        expr: aijailer_audit_batch_pending / aijailer_audit_batch_queue_capacity > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit batch queue is {{ $value | humanizePercentage }} full"
+          description: >-
+            Writes are not keeping up; at 100% new events are dropped. A healthy queue drains within
+            AUDIT_BATCH_MAX_DELAY_MS.

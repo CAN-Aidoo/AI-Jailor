@@ -1,0 +1,64 @@
+rule_files:
+  - audit.rules.yml
+evaluation_interval: 30s
+
+tests:
+  - name: drops page immediately and clear after the window
+    interval: 1m
+    input_series:
+      - series: 'aijailer_audit_events_dropped_total'
+        values: '0 0 0 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AuditEventsDropped
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "5 audit event(s) dropped in 15m: the batch queue was full"
+              description: "The audit database is slower than the event rate or unreachable. Each affected chain has an `audit_events_dropped` marker. Raise AUDIT_BATCH_QUEUE_MAX / fix the database; consider recording the affected event types with record_event (durable) instead."
+      - eval_time: 30m
+        alertname: AuditEventsDropped
+        exp_alerts: []
+
+  - name: failing writes need 5 minutes; a single blip does not alert
+    interval: 1m
+    input_series:
+      - series: 'aijailer_audit_batch_flush_failures_total'
+        values: '0 0 1 2 3 4 5 6 7 8 9 10 11 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12 12'
+      - series: 'aijailer_audit_batch_pending'
+        values: '0x35'
+      - series: 'aijailer_audit_batch_queue_capacity'
+        values: '1000x35'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AuditBatchWritesFailing
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: AuditBatchWritesFailing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Audit batch writes have been failing for 5m+ (events are queued and retried)"
+              description: "Queued events are held in memory and are lost if the process dies, or dropped if the queue fills (see AuditEventsDropped). Check database availability and write errors."
+      - eval_time: 30m
+        alertname: AuditBatchWritesFailing
+        exp_alerts: []
+
+  - name: backlog alerts above half capacity for 5m
+    interval: 1m
+    input_series:
+      - series: 'aijailer_audit_batch_pending'
+        values: '100x5 600x20'
+      - series: 'aijailer_audit_batch_queue_capacity'
+        values: '1000x25'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: AuditBatchBacklog
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: AuditBatchBacklog
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "Audit batch queue is 60% full"
+              description: "Writes are not keeping up; at 100% new events are dropped. A healthy queue drains within AUDIT_BATCH_MAX_DELAY_MS."

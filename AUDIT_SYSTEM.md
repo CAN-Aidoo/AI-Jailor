@@ -404,6 +404,37 @@ fails instead). Checkpoints signed by a different key (after rotating the secret
 `checkpoints_unverifiable`, not trusted and not counted as tampering; anyone who holds the signing secret AND database
 write access can forge history, so keep the secret out of the database's reach (secret manager / KMS).
 
-**Limits.** One database write (and connection checkout) per event; high-volume sources such as per-request proxy
-decisions will want batching or the Kafka path. Verification streams a chain in pages of 5000 but is O(chain length).
+**Limits.** Verification streams a chain in pages of 5000 but is O(chain length). Per-event writes are the default for
+anything that must survive a crash; see group commit below for high-volume events.
+
+### Group commit (batched writes)
+
+Two ways to record an event, chosen by the caller:
+
+| | `record_event(...)` (default) | `submit_event(...)` |
+|---|---|---|
+| Returns | after the commit; the stored event | immediately (synchronous, no await); `False` if dropped |
+| Durable on return | yes | **no** |
+| Use for | lifecycle, secrets, quota changes, anything that must survive a crash | per-request network decisions (the proxy sink uses this) |
+
+`submit_event` queues the event; a background writer commits everything pending in **one transaction** (all chains in
+one commit) once `AUDIT_BATCH_MAX_EVENTS` (200) are queued or `AUDIT_BATCH_MAX_DELAY_MS` (500) after the oldest. The
+event keeps the time it *happened*. Measured on SQLite (WAL, local disk, 2000 events over 20 chains): 316 events/s with a
+commit per event vs ~6000 events/s with group commit (callers blocked ~6 us per event). PostgreSQL over a network was not
+measured; the gain there comes from the same place (one round trip and one fsync per batch instead of per event).
+
+What it trades away, deliberately and visibly:
+* **Crash window.** A hard crash loses what is still queued (at most the delay). A clean shutdown drains the queue
+  (`close()`, before the final checkpoint pass).
+* **Backpressure = drop, never block.** The queue is bounded (`AUDIT_BATCH_QUEUE_MAX`, 10000). When full, the *newest*
+  events are dropped, counted (`aijailer_audit_events_dropped_total`), logged, and the next write adds an
+  `audit_events_dropped` marker (critical, with the count) **to the affected chain**: a gap is part of the signed record,
+  never silent. Alert: `AuditEventsDropped`.
+* **Database outage.** The batch stays queued (up to the bound) and is retried with backoff; counters
+  `..._flush_failures_total` and alert `AuditBatchWritesFailing`/`AuditBatchBacklog` say so.
+* **Order.** Within a chain, order is submission order. A durable `record_event` flushes the queue first, so a chain never
+  reorders what happened; `query_events`, `verify` and `checkpoint` flush first too (read-your-writes in-process).
+  Other processes see an event only after its flush.
+* **Atomicity.** A batch is all-or-nothing; on a sequence conflict with another writer the whole batch is rebuilt on the
+  new heads and retried.
 

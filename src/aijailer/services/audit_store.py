@@ -37,6 +37,8 @@ class AuditStore(Protocol):
 
     async def append(self, tenant_id: uuid.UUID, cell_id: uuid.UUID,
                      build: Callable[[str], AuditEvent]) -> AuditEvent: ...
+    async def append_batch(self, items: list[tuple[uuid.UUID, uuid.UUID, Callable[[str], AuditEvent]]]
+                           ) -> list[AuditEvent]: ...
     async def query(self, tenant_id: uuid.UUID, cell_id: uuid.UUID | None, event_type,
                     severity, start_time: datetime | None, end_time: datetime | None,
                     limit: int) -> list[AuditEvent]: ...
@@ -72,6 +74,9 @@ class MemoryAuditStore:
         self._last_hash[key] = event.event_hash
         self.events.append(event)
         return event
+
+    async def append_batch(self, items):
+        return [await self.append(t, c, b) for t, c, b in items]
 
     async def query(self, tenant_id, cell_id, event_type, severity, start_time, end_time, limit):
         results = []
@@ -133,26 +138,42 @@ class DbAuditStore:
             previous_hash=r.previous_hash, event_hash=r.event_hash)
 
     async def append(self, tenant_id, cell_id, build):
-        """Read the chain head, build the next event on it, insert at head+1. The unique
-        (tenant, cell, seq) constraint is the lock: a concurrent writer that extended the same
-        head makes this insert fail, and we simply retry on the new head."""
+        return (await self.append_batch([(tenant_id, cell_id, build)]))[0]
+
+    async def append_batch(self, items):
+        """Append many events in ONE transaction (one commit instead of one per event).
+
+        Items of the same chain are chained in the order given; items of different chains are
+        independent. Per chain: read the head, build each event on its predecessor, insert at
+        head+1.... The unique (tenant, cell, seq) constraint is the lock: a concurrent writer that
+        extended any of these heads makes the commit fail as a whole (nothing is written) and
+        the batch is rebuilt on the new heads and retried. All-or-nothing."""
         for attempt in range(self.ATTEMPTS):
             async with self._sf() as s:
-                last = (await s.execute(
-                    select(AuditEventRow.seq, AuditEventRow.event_hash)
-                    .where(AuditEventRow.tenant_id == tenant_id, AuditEventRow.cell_id == cell_id)
-                    .order_by(AuditEventRow.seq.desc()).limit(1))).first()
-                seq, prev = (last[0] + 1, last[1]) if last else (1, "")
-                e = build(prev)
-                s.add(AuditEventRow(
-                    id=e.id, tenant_id=e.tenant_id, cell_id=e.cell_id, seq=seq,
-                    event_type=_plain(e.event_type), severity=_plain(e.severity),
-                    timestamp=e.timestamp, details=e.details, source_ip=e.source_ip,
-                    api_key_id=e.api_key_id, request_id=e.request_id,
-                    previous_hash=e.previous_hash, event_hash=e.event_hash))
+                heads: dict[tuple, tuple[int, str]] = {}
+                built: list[AuditEvent] = []
+                for tenant_id, cell_id, build in items:
+                    key = (tenant_id, cell_id)
+                    if key not in heads:
+                        last = (await s.execute(
+                            select(AuditEventRow.seq, AuditEventRow.event_hash)
+                            .where(AuditEventRow.tenant_id == tenant_id,
+                                   AuditEventRow.cell_id == cell_id)
+                            .order_by(AuditEventRow.seq.desc()).limit(1))).first()
+                        heads[key] = (last[0], last[1]) if last else (0, "")
+                    seq, prev = heads[key]
+                    e = build(prev)
+                    heads[key] = (seq + 1, e.event_hash)
+                    built.append(e)
+                    s.add(AuditEventRow(
+                        id=e.id, tenant_id=e.tenant_id, cell_id=e.cell_id, seq=seq + 1,
+                        event_type=_plain(e.event_type), severity=_plain(e.severity),
+                        timestamp=e.timestamp, details=e.details, source_ip=e.source_ip,
+                        api_key_id=e.api_key_id, request_id=e.request_id,
+                        previous_hash=e.previous_hash, event_hash=e.event_hash))
                 try:
                     await s.commit()
-                    return e
+                    return built
                 except IntegrityError:
                     await s.rollback()
                 except OperationalError as exc:        # SQLite writer lock; PG never lands here

@@ -22,6 +22,7 @@ from aijailer.services.attestation import (
     sign_statement,
     verify_envelope,
 )
+from aijailer.services.audit_batcher import AuditBatcher
 from aijailer.services.audit_store import AuditStore, CheckpointRecord, MemoryAuditStore
 
 logger = structlog.get_logger(__name__)
@@ -41,10 +42,14 @@ class AuditService:
 
     Storage is pluggable: in-memory for dev/tests, the database for real deployments."""
 
-    def __init__(self, signer: Signer | None = None, store: AuditStore | None = None) -> None:
+    def __init__(self, signer: Signer | None = None, store: AuditStore | None = None,
+                 batch_max_events: int = 200, batch_max_delay: float = 0.5,
+                 batch_queue_max: int = 10_000) -> None:
         self._store: AuditStore = store or MemoryAuditStore()
         self._events = getattr(self._store, "events", None)   # memory backend only (tests)
         self._signer = signer or Ed25519Signer.generate()
+        self._batch_cfg = (batch_max_events, batch_max_delay, batch_queue_max)
+        self._batcher: AuditBatcher | None = None
 
     @property
     def durable(self) -> bool:
@@ -70,6 +75,7 @@ class AuditService:
         transparency-log signed tree head) can.
         """
         key = f"{tenant_id}:{cell_id}"
+        await self.flush()
         n, head = await self._store.head(tenant_id, cell_id)
         statement = make_statement(
             f"audit-chain/{key}", head.ljust(64, "0"),
@@ -94,6 +100,23 @@ class AuditService:
         return done
 
     # ------------------------------------------------------------------ write / read
+    def _builder(self, tenant_id, cell_id, event_type, severity, details, source_ip,
+                 api_key_id, request_id):
+        # What is hashed must equal what is stored and read back: normalise details to plain
+        # JSON now (UUIDs, datetimes... exactly as model_dump(mode="json") would). The timestamp
+        # is when the thing HAPPENED, fixed here even if the write is batched.
+        base = dict(
+            id=uuid.uuid4(), timestamp=datetime.now(UTC).replace(tzinfo=None),
+            tenant_id=tenant_id, cell_id=cell_id, event_type=event_type, severity=severity,
+            details=to_jsonable_python(details or {}), source_ip=source_ip,
+            api_key_id=api_key_id, request_id=request_id)
+
+        def build(previous_hash: str) -> AuditEvent:
+            event = AuditEvent(**base, previous_hash=previous_hash)
+            event.event_hash = self._compute_hash(event, previous_hash)
+            return event
+        return build
+
     async def record_event(
         self,
         tenant_id: uuid.UUID,
@@ -105,21 +128,82 @@ class AuditService:
         api_key_id: uuid.UUID | None = None,
         request_id: str | None = None,
     ) -> AuditEvent:
-        """Record a new audit event with hash chain integrity."""
-        # What is hashed must equal what is stored and read back: normalise details to plain
-        # JSON now (UUIDs, datetimes... exactly as model_dump(mode="json") would).
-        base = dict(
-            id=uuid.uuid4(), timestamp=datetime.now(UTC).replace(tzinfo=None),
-            tenant_id=tenant_id, cell_id=cell_id, event_type=event_type, severity=severity,
-            details=to_jsonable_python(details or {}), source_ip=source_ip,
-            api_key_id=api_key_id, request_id=request_id)
-
-        def build(previous_hash: str) -> AuditEvent:
-            event = AuditEvent(**base, previous_hash=previous_hash)
-            event.event_hash = self._compute_hash(event, previous_hash)
-            return event
-
+        """Record a new audit event with hash chain integrity. Durable when this returns: use it
+        for anything that must survive a crash (see ``submit_event`` for the batched path)."""
+        build = self._builder(tenant_id, cell_id, event_type, severity, details, source_ip,
+                              api_key_id, request_id)
+        if self._batcher is not None and self._batcher.pending:
+            await self._batcher.flush()      # keep this chain in the order things happened
         return await self._store.append(tenant_id, cell_id, build)
+
+    # ------------------------------------------------------------------ batched path
+    @property
+    def batcher(self) -> AuditBatcher:
+        if self._batcher is None:
+            n, delay, qmax = self._batch_cfg
+
+            def marker(t, c, count):
+                return self._builder(t, c, EventType.RESOURCE_ALERT, Severity.CRITICAL,
+                                     {"action": "audit_events_dropped", "count": count,
+                                      "reason": "batch queue full"}, None, None, None)
+            self._batcher = AuditBatcher(self._store.append_batch, marker, n, delay, qmax)
+        return self._batcher
+
+    def submit_event(
+        self,
+        tenant_id: uuid.UUID,
+        cell_id: uuid.UUID,
+        event_type: EventType,
+        severity: Severity = Severity.INFO,
+        details: dict | None = None,
+        source_ip: str | None = None,
+        api_key_id: uuid.UUID | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Queue an event for group commit. Synchronous and non-blocking (safe in callbacks).
+
+        NOT durable on return: a hard crash loses up to the batch delay of events, and a full
+        queue drops the newest (recorded as an ``audit_events_dropped`` gap marker). Use only for
+        high-volume, individually low-stakes events (per-request network decisions). Needs a
+        running event loop. Returns False if the event was dropped."""
+        build = self._builder(tenant_id, cell_id, event_type, severity, details, source_ip,
+                              api_key_id, request_id)
+        return self.batcher.submit(tenant_id, cell_id, build)
+
+    async def flush(self) -> None:
+        """Write everything submitted so far."""
+        if self._batcher is not None:
+            await self._batcher.flush()
+
+    async def close(self) -> None:
+        if self._batcher is not None:
+            await self._batcher.close()
+
+    def prometheus_families(self) -> list:
+        m = self.batch_metrics()
+        b = self._batcher
+        cap = b.queue_max if b else self._batch_cfg[2]
+        return [
+            ("aijailer_audit_batch_pending", "gauge",
+             "Audit events queued for group commit, not yet written.", [({}, m["pending"])]),
+            ("aijailer_audit_batch_queue_capacity", "gauge",
+             "Capacity of the audit batch queue (AUDIT_BATCH_QUEUE_MAX).", [({}, cap)]),
+            ("aijailer_audit_events_dropped_total", "counter",
+             "Audit events dropped because the batch queue was full (a gap marker is in the chain).",
+             [({}, m["dropped_total"])]),
+            ("aijailer_audit_batch_flush_failures_total", "counter",
+             "Audit batch writes that failed (the batch is kept and retried).",
+             [({}, m["flush_failures_total"])]),
+            ("aijailer_audit_batch_events_flushed_total", "counter",
+             "Audit events written through group commit.", [({}, m["flushed_total"])]),
+        ]
+
+    def batch_metrics(self) -> dict:
+        b = self._batcher
+        return {"pending": b.pending if b else 0, "dropped_total": b.dropped_total if b else 0,
+                "flushed_total": b.flushed_total if b else 0,
+                "flushes_total": b.flushes_total if b else 0,
+                "flush_failures_total": b.flush_failures_total if b else 0}
 
     async def query_events(
         self,
@@ -132,12 +216,14 @@ class AuditService:
         limit: int = 100,
     ) -> list[AuditEvent]:
         """Query audit events (newest first) with filters."""
+        await self.flush()                   # see what this process has submitted
         return await self._store.query(
             tenant_id, cell_id, event_type, severity, start_time, end_time, limit)
 
     # ------------------------------------------------------------------ verification
     async def verify(self, tenant_id: uuid.UUID, cell_id: uuid.UUID) -> ChainReport:
         """Verify chain integrity AND consistency with every signed checkpoint."""
+        await self.flush()
         cps = await self._store.checkpoints(tenant_id, cell_id)
         mine = [c for c in cps if c.key_id == self._signer.keyid]
         wanted = {c.length for c in mine if c.length > 0}
@@ -212,6 +298,15 @@ class AuditConfigError(RuntimeError):
     """The audit log is misconfigured in a way that would silently weaken it."""
 
 
+def _batch_kwargs(s) -> dict:
+    if s.audit_batch_max_events < 1 or s.audit_batch_queue_max < s.audit_batch_max_events \
+            or s.audit_batch_max_delay_ms < 1:
+        raise AuditConfigError("AUDIT_BATCH_* must be positive and QUEUE_MAX >= MAX_EVENTS")
+    return {"batch_max_events": s.audit_batch_max_events,
+            "batch_max_delay": s.audit_batch_max_delay_ms / 1000.0,
+            "batch_queue_max": s.audit_batch_queue_max}
+
+
 def build_audit_service() -> AuditService:
     """Pick the backend from settings. Outside dev the audit log is durable (database) by default,
     and a database-backed log REQUIRES a configured signing secret: with an ephemeral key every
@@ -229,7 +324,7 @@ def build_audit_service() -> AuditService:
     if backend == "memory":
         if s.environment != "dev":
             logger.warning("audit.volatile_backend", note="audit history is lost on restart")
-        return AuditService(signer=signer)
+        return AuditService(signer=signer, **_batch_kwargs(s))
     if signer is None:
         if s.environment != "dev":
             raise AuditConfigError(
@@ -239,7 +334,8 @@ def build_audit_service() -> AuditService:
     from aijailer.db.base import async_session_factory
     from aijailer.services.audit_store import DbAuditStore
 
-    return AuditService(signer=signer, store=DbAuditStore(async_session_factory))
+    return AuditService(signer=signer, store=DbAuditStore(async_session_factory),
+                        **_batch_kwargs(s))
 
 
 # Process-wide instance

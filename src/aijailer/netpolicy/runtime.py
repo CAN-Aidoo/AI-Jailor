@@ -10,7 +10,6 @@ from aijailer.netpolicy.nft import NetAllocator, NetPolicyManager
 
 _network: CellNetwork | None = None
 _tenant_of: dict[uuid.UUID, uuid.UUID] = {}
-_bg: set[asyncio.Task] = set()
 
 
 def remember_tenant(cell_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
@@ -18,17 +17,16 @@ def remember_tenant(cell_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
 
 
 def _audit_sink(cell_id: uuid.UUID, event: dict) -> None:
-    """Proxy decisions -> audit chain. Sync callback from the proxy; schedule the write."""
+    """Proxy decisions -> audit chain. Sync callback from the proxy, one call per request: queued
+    for group commit (see AuditService.submit_event for what that trades away)."""
     tenant = _tenant_of.get(cell_id)
     if tenant is None:
         return
     from aijailer.services.audit_service import get_audit_service
     denied = event.get("decision") != "allow"
-    task = asyncio.get_running_loop().create_task(get_audit_service().record_event(
+    get_audit_service().submit_event(
         tenant_id=tenant, cell_id=cell_id, event_type=EventType.NETWORK,
-        severity=Severity.WARNING if denied else Severity.INFO, details=event))
-    _bg.add(task)
-    task.add_done_callback(_bg.discard)
+        severity=Severity.WARNING if denied else Severity.INFO, details=event)
 
 
 def network_required(engine) -> bool:

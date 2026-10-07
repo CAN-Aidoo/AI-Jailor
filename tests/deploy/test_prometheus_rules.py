@@ -53,3 +53,25 @@ def test_promtool_check_and_unit_tests_pass():
                  ["test", "rules", "snapshot-quota.rules.test.yml"]):
         p = subprocess.run([PROMTOOL, *args], cwd=DIR, capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, p.stdout + p.stderr
+
+
+# ------------------------------------------------------------------ audit rules
+AUDIT_RULES = DIR / "audit.rules.yml"
+
+
+def test_audit_rules_use_only_metrics_the_service_exports():
+    from aijailer.services import audit_service
+    exported = set(re.findall(r'"(aijailer_audit_[a-z_]+)"',
+                              pathlib.Path(audit_service.__file__).read_text()))
+    used = set()
+    for g in yaml.safe_load(AUDIT_RULES.read_text())["groups"]:
+        for r in g["rules"]:
+            used |= set(re.findall(r"\baijailer_audit_[a-z_]+", r["expr"]))
+    assert used and used <= exported, used - exported
+
+
+@pytest.mark.skipif(not PROMTOOL, reason="promtool not found (set PROMTOOL)")
+def test_promtool_check_and_unit_tests_pass_for_audit_rules():
+    for args in (["check", "rules", str(AUDIT_RULES)], ["test", "rules", "audit.rules.test.yml"]):
+        p = subprocess.run([PROMTOOL, *args], cwd=DIR, capture_output=True, text=True, timeout=120)
+        assert p.returncode == 0, p.stdout + p.stderr
