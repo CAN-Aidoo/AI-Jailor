@@ -110,11 +110,15 @@ class TenantQuotaService:
             setattr(t, k, v)
         await self.db.flush()
         if changed:
+            # Inside THIS transaction (which also holds the tenant row lock): the new limits and
+            # the record of who set them commit together or not at all. The caller must commit
+            # before reporting success (the admin routes do).
             await self.audit.record_event(
                 tenant_id=t.id, cell_id=NIL, event_type=EventType.LIFECYCLE,
                 severity=Severity.WARNING,
                 details={"action": action, "actor": actor,
-                         "from": {k: before[k] for k in changed}, "to": changed})
+                         "from": {k: before[k] for k in changed}, "to": changed},
+                session=self.db)
         return await self._state(t)
 
     # ------------------------------------------------------------------ history

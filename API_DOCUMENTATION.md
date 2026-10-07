@@ -376,6 +376,11 @@ Every change is audited (action `quota_override_set` / `quota_override_reset`, s
 values); no-op requests are not. Changes take the same tenant row lock as snapshot reservations, so they cannot
 interleave with one.
 
+**Durability.** The new limits and their audit record are written in **one database transaction** and committed
+*before* the response is sent: a `200` means both are durable; any failure (including a failed commit) returns an error
+with neither applied, so there is never a change without its record, or a record of a change that did not happen. With
+`AUDIT_BACKEND=memory` (dev) the audit event cannot join the transaction and is not durable (`durable: false`).
+
 #### GET /v1/snapshots/quota
 
 `{"data": {"count": 3, "max_count": 100, "bytes_used": 1073741824, "max_bytes": 53687091200}}`

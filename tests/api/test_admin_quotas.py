@@ -254,19 +254,13 @@ async def test_tampering_with_the_stored_history_is_reported(client: AsyncClient
 
 @pytest.mark.asyncio
 async def test_quota_history_survives_a_restart_with_the_database_audit_log(
-        client: AsyncClient, test_tenant, tmp_path, monkeypatch):
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    from aijailer.db.base import Base
-    from aijailer.models.audit_log import AuditCheckpointRow, AuditEventRow
+        client: AsyncClient, test_tenant, db_engine, monkeypatch):
     from aijailer.services import audit_service as asv
     from aijailer.services.attestation import Ed25519Signer
     from aijailer.services.audit_store import DbAuditStore
-    eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/a.db", connect_args={"timeout": 30})
-    async with eng.begin() as c:
-        await c.run_sync(lambda s: Base.metadata.create_all(
-            s, tables=[AuditEventRow.__table__, AuditCheckpointRow.__table__]))
-    sf = async_sessionmaker(eng, expire_on_commit=False)
+    # Same database as the app: quota changes write their audit event inside the request's own
+    # transaction, so the audit store must point at the database the request session uses.
+    sf = async_sessionmaker(db_engine, expire_on_commit=False)
 
     def boot():                                                   # a "process start"
         monkeypatch.setattr(asv, "_audit_service", asv.AuditService(
@@ -278,4 +272,3 @@ async def test_quota_history_survives_a_restart_with_the_database_audit_log(
     d = (await client.get(aurl(test_tenant.id), headers=OP)).json()["data"]
     assert d["durable"] is True and d["chain_intact"] is True
     assert [e["to"]["max_snapshot_count"] for e in d["events"]] == [9, 7]
-    await eng.dispose()

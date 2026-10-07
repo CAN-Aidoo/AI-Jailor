@@ -39,6 +39,8 @@ class AuditStore(Protocol):
                      build: Callable[[str], AuditEvent]) -> AuditEvent: ...
     async def append_batch(self, items: list[tuple[uuid.UUID, uuid.UUID, Callable[[str], AuditEvent]]]
                            ) -> list[AuditEvent]: ...
+    async def append_in_session(self, session, tenant_id: uuid.UUID, cell_id: uuid.UUID,
+                                build: Callable[[str], AuditEvent]) -> AuditEvent: ...
     async def query(self, tenant_id: uuid.UUID, cell_id: uuid.UUID | None, event_type,
                     severity, start_time: datetime | None, end_time: datetime | None,
                     limit: int) -> list[AuditEvent]: ...
@@ -77,6 +79,9 @@ class MemoryAuditStore:
 
     async def append_batch(self, items):
         return [await self.append(t, c, b) for t, c, b in items]
+
+    async def append_in_session(self, session, tenant_id, cell_id, build):
+        return await self.append(tenant_id, cell_id, build)      # no transaction to join
 
     async def query(self, tenant_id, cell_id, event_type, severity, start_time, end_time, limit):
         results = []
@@ -140,6 +145,42 @@ class DbAuditStore:
     async def append(self, tenant_id, cell_id, build):
         return (await self.append_batch([(tenant_id, cell_id, build)]))[0]
 
+    @staticmethod
+    async def _read_head(s, tenant_id, cell_id) -> tuple[int, str]:
+        last = (await s.execute(
+            select(AuditEventRow.seq, AuditEventRow.event_hash)
+            .where(AuditEventRow.tenant_id == tenant_id, AuditEventRow.cell_id == cell_id)
+            .order_by(AuditEventRow.seq.desc()).limit(1))).first()
+        return (last[0], last[1]) if last else (0, "")
+
+    @staticmethod
+    def _row(e: AuditEvent, seq: int) -> AuditEventRow:
+        return AuditEventRow(
+            id=e.id, tenant_id=e.tenant_id, cell_id=e.cell_id, seq=seq,
+            event_type=_plain(e.event_type), severity=_plain(e.severity),
+            timestamp=e.timestamp, details=e.details, source_ip=e.source_ip,
+            api_key_id=e.api_key_id, request_id=e.request_id,
+            previous_hash=e.previous_hash, event_hash=e.event_hash)
+
+    async def append_in_session(self, session, tenant_id, cell_id, build):
+        """Append INSIDE the caller's transaction: the event becomes durable exactly when the
+        caller's transaction commits and is discarded if it rolls back, so a change and its audit
+        record are atomic (neither can exist without the other). Each attempt runs in a SAVEPOINT,
+        so losing the (tenant, cell, seq) race to another writer only retries this insert and
+        leaves the caller's other work in the transaction intact."""
+        for attempt in range(self.ATTEMPTS):
+            seq, prev = await self._read_head(session, tenant_id, cell_id)
+            e = build(prev)
+            try:
+                async with session.begin_nested():
+                    session.add(self._row(e, seq + 1))
+                    await session.flush()
+                return e
+            except IntegrityError:
+                pass
+            await asyncio.sleep(random.uniform(0, 0.005 * (attempt + 1)))
+        raise AuditWriteError("could not append to the audit chain (contention)")
+
     async def append_batch(self, items):
         """Append many events in ONE transaction (one commit instead of one per event).
 
@@ -155,22 +196,12 @@ class DbAuditStore:
                 for tenant_id, cell_id, build in items:
                     key = (tenant_id, cell_id)
                     if key not in heads:
-                        last = (await s.execute(
-                            select(AuditEventRow.seq, AuditEventRow.event_hash)
-                            .where(AuditEventRow.tenant_id == tenant_id,
-                                   AuditEventRow.cell_id == cell_id)
-                            .order_by(AuditEventRow.seq.desc()).limit(1))).first()
-                        heads[key] = (last[0], last[1]) if last else (0, "")
+                        heads[key] = await self._read_head(s, tenant_id, cell_id)
                     seq, prev = heads[key]
                     e = build(prev)
                     heads[key] = (seq + 1, e.event_hash)
                     built.append(e)
-                    s.add(AuditEventRow(
-                        id=e.id, tenant_id=e.tenant_id, cell_id=e.cell_id, seq=seq + 1,
-                        event_type=_plain(e.event_type), severity=_plain(e.severity),
-                        timestamp=e.timestamp, details=e.details, source_ip=e.source_ip,
-                        api_key_id=e.api_key_id, request_id=e.request_id,
-                        previous_hash=e.previous_hash, event_hash=e.event_hash))
+                    s.add(self._row(e, seq + 1))
                 try:
                     await s.commit()
                     return built

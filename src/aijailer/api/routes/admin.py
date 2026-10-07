@@ -59,14 +59,18 @@ async def update_quotas(tenant_id: uuid.UUID, body: QuotaUpdate,
     if any(v is None for v in changes.values()):
         from aijailer.core.exceptions import AiJailerError
         raise AiJailerError("quota values must be integers, not null", code="invalid_quota")
-    return ApiResponse(data=_view(await TenantQuotaService(db).update(tenant_id, changes, actor)))
+    state = await TenantQuotaService(db).update(tenant_id, changes, actor)
+    await db.commit()          # the change AND its audit record are durable before we say so
+    return ApiResponse(data=_view(state))
 
 
 @router.delete("/tenants/{tenant_id}/quotas", response_model=ApiResponse[dict])
 async def reset_quotas(tenant_id: uuid.UUID, actor: str = Depends(require_operator),
                        db: AsyncSession = Depends(get_db)):
     """Reset all four snapshot limits to the platform defaults."""
-    return ApiResponse(data=_view(await TenantQuotaService(db).reset(tenant_id, actor)))
+    state = await TenantQuotaService(db).reset(tenant_id, actor)
+    await db.commit()
+    return ApiResponse(data=_view(state))
 
 
 @router.get("/tenants/{tenant_id}/quotas/audit", response_model=ApiResponse[dict])

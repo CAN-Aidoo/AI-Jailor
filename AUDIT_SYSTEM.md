@@ -407,15 +407,24 @@ write access can forge history, so keep the secret out of the database's reach (
 **Limits.** Verification streams a chain in pages of 5000 but is O(chain length). Per-event writes are the default for
 anything that must survive a crash; see group commit below for high-volume events.
 
-### Group commit (batched writes)
+### Durability levels and group commit
 
-Two ways to record an event, chosen by the caller:
+Three ways to record an event, chosen by the caller (strongest last in the table's reading order of guarantees):
 
-| | `record_event(...)` (default) | `submit_event(...)` |
-|---|---|---|
-| Returns | after the commit; the stored event | immediately (synchronous, no await); `False` if dropped |
-| Durable on return | yes | **no** |
-| Use for | lifecycle, secrets, quota changes, anything that must survive a crash | per-request network decisions (the proxy sink uses this) |
+| | `submit_event(...)` | `record_event(...)` (default) | `record_event(..., session=db)` |
+|---|---|---|---|
+| Returns | immediately (sync, no await); `False` if dropped | after its own commit; the stored event | after the insert in the caller's transaction |
+| Durable | **no** (lost on a crash, batched) | yes, on its own | exactly when the caller commits |
+| Atomic with the change it describes | no | **no**: a later rollback leaves the event, a failed audit write after the change leaves it unaudited | **yes**: both commit or both roll back |
+| Use for | per-request network decisions (the proxy sink) | lifecycle, secrets: anything that must survive a crash | changes whose record must never disagree with reality: **tenant quota overrides** |
+
+Transactional mode (`session=`): the event is inserted inside a SAVEPOINT in the caller's transaction, so losing the
+(tenant, cell, seq) race to another writer retries only that insert and keeps the caller's other work. The caller must
+commit before reporting success (the admin routes do, so a `200` means durable). Only the database backend can do this;
+the memory backend accepts the argument and ignores it. A caller that holds a row lock (the quota change holds the tenant
+row) holds it until commit, which is the intended serialisation. Not exercised against PostgreSQL by the test suite.
+
+#### Group commit (batched writes)
 
 `submit_event` queues the event; a background writer commits everything pending in **one transaction** (all chains in
 one commit) once `AUDIT_BATCH_MAX_EVENTS` (200) are queued or `AUDIT_BATCH_MAX_DELAY_MS` (500) after the oldest. The

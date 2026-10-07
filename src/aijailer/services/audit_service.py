@@ -127,13 +127,25 @@ class AuditService:
         source_ip: str | None = None,
         api_key_id: uuid.UUID | None = None,
         request_id: str | None = None,
+        session=None,
     ) -> AuditEvent:
-        """Record a new audit event with hash chain integrity. Durable when this returns: use it
-        for anything that must survive a crash (see ``submit_event`` for the batched path)."""
+        """Record a new audit event with hash chain integrity.
+
+        Three durability levels, strongest last:
+          * ``submit_event``: queued, lost on a crash (high-volume events only);
+          * ``record_event(...)``: committed on its own before this returns, so it survives a
+            crash, but is independent of the caller's transaction (a later rollback leaves the
+            event behind; a failed audit write after the change leaves the change unaudited);
+          * ``record_event(..., session=db)``: written INSIDE the caller's transaction, so the
+            event and the change it describes commit or roll back together. Durable exactly when
+            the caller commits (commit before reporting success). Use for changes whose audit
+            record must never disagree with reality (quota overrides)."""
         build = self._builder(tenant_id, cell_id, event_type, severity, details, source_ip,
                               api_key_id, request_id)
         if self._batcher is not None and self._batcher.pending:
             await self._batcher.flush()      # keep this chain in the order things happened
+        if session is not None:
+            return await self._store.append_in_session(session, tenant_id, cell_id, build)
         return await self._store.append(tenant_id, cell_id, build)
 
     # ------------------------------------------------------------------ batched path
