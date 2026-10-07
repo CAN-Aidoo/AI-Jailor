@@ -42,6 +42,10 @@ HOP_BY_HOP = {"connection", "proxy-connection", "proxy-authorization", "proxy-au
 
 AuditSink = Callable[[dict], None]
 
+# CONNECT <link-id>.peer.aijailer.invalid:443 reaches the peer-link relay. ".invalid" is reserved
+# (RFC 6761) and never resolves, so the name can only ever be meaningful to this proxy.
+PEER_SUFFIX = ".peer.aijailer.invalid"
+
 
 class _BadRequest(Exception):
     def __init__(self, status: int, msg: str):
@@ -107,8 +111,10 @@ class CellProxy:
     def __init__(self, cell_id: str, bind_ip: str, port: int, broker: EgressBroker,
                  audit: AuditSink | None = None, ssl_context: ssl.SSLContext | None = None,
                  max_concurrent: int = 64, connect_timeout: float = 10.0,
-                 idle_timeout: float = 300.0, total_timeout: float = 120.0) -> None:
+                 idle_timeout: float = 300.0, total_timeout: float = 120.0,
+                 peer_hub=None) -> None:
         self.cell_id, self._ip, self._port = cell_id, bind_ip, port
+        self._peer_hub = peer_hub      # peerlink.hub.PeerHub, or None when peer links are off
         self._broker, self._audit = broker, audit or (lambda e: None)
         self._ssl = ssl_context or ssl.create_default_context()
         self._sem = asyncio.Semaphore(max_concurrent)
@@ -148,7 +154,9 @@ class CellProxy:
             start = time.monotonic()
             event: dict = {"cell_id": self.cell_id}
             try:
-                await asyncio.wait_for(self._serve(r, w, event), self._total)
+                deferred = await asyncio.wait_for(self._serve(r, w, event), self._total)
+                if deferred is not None:      # a peer session: bounded by the hub's own limits,
+                    await deferred()          # not by the short per-request total timeout
             except _BadRequest as e:
                 event.update(decision="deny", reason=e.msg, status=e.status)
                 await _respond(w, e.status, e.msg)
@@ -178,9 +186,30 @@ class CellProxy:
         if "transfer-encoding" in names:
             raise _BadRequest(501, "Transfer-Encoding is not supported")
         if method == "CONNECT":
+            host = target.rpartition(":")[0].strip("[]").lower()
+            if host.endswith(PEER_SUFFIX):
+                return await self._peer(r, w, host[: -len(PEER_SUFFIX)], event)
             await self._connect(r, w, target, event)
         else:
             await self._forward(r, w, method, target, headers, event)
+        return None
+
+    # -- peer links: <link-id>.peer.aijailer.invalid, relayed by the hub, never resolved --
+    async def _peer(self, r, w, link_id: str, event: dict):
+        event.update(host=f"{link_id}{PEER_SUFFIX}", method="CONNECT", peer_link=link_id)
+        if self._peer_hub is None:
+            raise _BadRequest(403, "peer links are not enabled")
+        # This cell's identity is the listener that accepted the connection, never a header.
+        auth = await self._peer_hub.authorize(link_id, self.cell_id)
+        if auth is None:
+            raise _BadRequest(403, "peer link not available")   # same answer for every reason
+        event.update(decision="allow", reason="peer link", role=auth.role)
+        w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await w.drain()
+
+        async def run():
+            await self._peer_hub.attach(auth, r, w, event)
+        return run
 
     # -- CONNECT: allowlisted TLS tunnel --
     async def _connect(self, r, w, target: str, event: dict) -> None:
