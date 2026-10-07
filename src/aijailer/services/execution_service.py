@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aijailer.core.config import get_settings
+from aijailer.core.exec_env import validate_exec_environment
 from aijailer.core.exceptions import (
     CellNotRunningError,
     ExecutionTimeoutError,
@@ -58,6 +59,7 @@ class ExecutionService:
         3. Send command to MicroVM engine
         4. Record result, audit event, and resource usage
         """
+        environment = validate_exec_environment(environment)     # before anything is persisted
         cell = await self.cell_service.get_cell(cell_id, tenant_id)
         if cell.status != "running":
             raise CellNotRunningError(str(cell_id), cell.status)
@@ -92,6 +94,7 @@ class ExecutionService:
                 command=command,
                 timeout=timeout_seconds,
                 user=user,
+                env=environment,
             )
 
             execution.status = "completed"

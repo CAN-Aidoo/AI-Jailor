@@ -184,6 +184,25 @@ Execute a command in a cell.
 }
 ```
 
+**`environment`** is applied to this command only, on top of the cell's own environment (the settings it was
+created with, plus the variables the platform injects). A variable set here overrides the same name from cell
+creation, and nothing leaks into later commands. The guest starts every command with a minimal environment
+(`PATH`, `LANG`, `HOME`, `USER`) and none of the guest agent's own, so `PATH` and `LANG` can be overridden.
+Values are taken literally, with no expansion.
+
+Rules, enforced with `400 invalid_environment` before anything runs or is stored:
+- at most 100 variables; names of letters, digits and underscores, not starting with a digit, at most 128
+  characters; values at most 8,192 bytes with no NUL byte; at most 64 KiB in total;
+- names the platform manages are **refused, not ignored**: the proxy variables (`http_proxy`, `https_proxy`,
+  `no_proxy`, in any letter case) and anything starting with `AIJAILER_` (any case);
+- `HOME` and `USER` are set by the guest agent from the account the command runs as and cannot be set.
+
+The rules are a guard against confusion, not a security boundary: a command can always export whatever it likes
+itself, and what a cell can reach is enforced by the host firewall. **Do not put secrets in `environment`:** the
+request's environment is stored as given in the execution record (no application-level encryption or redaction). Use the secret store (`/v1/secrets`),
+which injects credentials at the egress broker so they never enter the cell. `working_directory` is accepted
+but not yet applied to the command.
+
 **Response** (200 OK, non-streaming):
 
 ```json
@@ -761,6 +780,7 @@ X-RateLimit-Reset: 1705312260
 | `invalid_clone` | 400 | Clone request tried to change the snapshot's resources |
 | `image_not_found` | 404 | Specified base image does not exist |
 | `invalid_policy` | 400 | Policy definition is invalid |
+| `invalid_environment` | 400 | The `environment` of an exec request is invalid or names a platform-managed variable (nothing ran) |
 | `spending_cap_reached` | 402 | Tenant spending cap exceeded |
 | `rate_limited` | 429 | Too many requests |
 | `unauthorized` | 401 | Invalid or missing authentication |
@@ -881,8 +901,7 @@ Loopback adds **no routes, fields or error codes**. It is part of the environmen
 
       NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost curl -s http://127.0.0.1:8080/
 
-- **Known gap: the `environment` field of `/exec` has no effect today.** The request's `environment` and
-  `working_directory` are stored with the execution record but are not passed to the guest (the engine call
-  takes only the command, timeout and user), so variables set there (for example a different `NO_PROXY`) do nothing. The cell-creation
-  `environment` cannot override the platform's proxy variables either (the platform's values win). Until that is
-  fixed, set variables inline in the command as shown above.
+- **`environment` on `/exec` works, but not for the proxy variables.** Variables in the request's `environment`
+  reach the command (see "Execution" above), but `NO_PROXY`/`no_proxy` and the other proxy variables are
+  platform-managed and refused there. To change the proxy bypass for one command, set it inline in the command as
+  shown above. `working_directory` is still accepted but not applied.

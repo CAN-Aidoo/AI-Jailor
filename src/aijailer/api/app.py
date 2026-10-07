@@ -157,6 +157,7 @@ def create_app() -> FastAPI:
             "snapshot_not_found": 404,
             "peer_link_not_found": 404,
             "peer_link_invalid": 400,
+            "invalid_environment": 400,
             "peer_link_conflict": 409,
             "peer_link_limit": 429,
             "peer_links_disabled": 503,

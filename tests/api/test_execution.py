@@ -46,3 +46,69 @@ async def test_gate_enforce_blocks_dangerous_script(client: AsyncClient, monkeyp
     ok = await client.post(f"/v1/cells/{cell_id}/exec/script",
                            json={"script": "print('hi')", "interpreter": "/usr/bin/python3"})
     assert ok.status_code == 200
+
+
+# ---------------------------------------------------------------- per-command environment
+async def _running_cell(client):
+    return (await client.post("/v1/cells", json={"name": "env-test", "image": "base-python"})).json()["data"]["id"]
+
+
+@pytest.fixture
+def captured_exec(monkeypatch):
+    """Record what ExecutionService hands to the engine."""
+    from aijailer.engine.microvm import ExecResult, get_microvm_engine
+    seen = []
+
+    async def fake(cell_id, command, timeout=30, user="agent", env=None):
+        seen.append({"command": command, "user": user, "env": env})
+        return ExecResult(0, "ok\n", "", 1, 1, 1)
+    monkeypatch.setattr(get_microvm_engine(), "exec_command", fake)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_the_requests_environment_reaches_the_engine(client: AsyncClient, captured_exec):
+    cell_id = await _running_cell(client)
+    r = await client.post(f"/v1/cells/{cell_id}/exec",
+                          json={"command": "env", "environment": {"DEBUG": "true", "PATH": "/opt/bin"}})
+    assert r.status_code == 200
+    assert captured_exec == [{"command": "env", "user": "agent", "env": {"DEBUG": "true", "PATH": "/opt/bin"}}]
+
+
+@pytest.mark.asyncio
+async def test_no_environment_means_an_empty_one(client: AsyncClient, captured_exec):
+    cell_id = await _running_cell(client)
+    assert (await client.post(f"/v1/cells/{cell_id}/exec", json={"command": "true"})).status_code == 200
+    assert captured_exec[0]["env"] == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env", [
+    {"A=B": "x"}, {"1A": "x"}, {"": "x"}, {"A": "x\u0000y"},
+    {"HTTP_PROXY": "http://evil:1"}, {"no_proxy": ""}, {"AIJAILER_PEER_ATTEST_PUBKEY": "x"}, {"HOME": "/"},
+    {f"V{i}": "x" for i in range(101)},
+], ids=["equals", "digit", "empty", "nul", "proxy", "no_proxy", "aijailer", "home", "too-many"])
+async def test_a_bad_environment_is_a_400_and_nothing_runs_or_is_stored(client: AsyncClient, captured_exec, env):
+    cell_id = await _running_cell(client)
+    r = await client.post(f"/v1/cells/{cell_id}/exec", json={"command": "true", "environment": env})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_environment"
+    assert captured_exec == []                                                    # never reached the engine
+    history = (await client.get(f"/v1/cells/{cell_id}/executions")).json()["data"]
+    assert history == []                                                          # and no record was created
+
+
+@pytest.mark.asyncio
+async def test_the_script_endpoint_is_unchanged(client: AsyncClient, captured_exec):
+    cell_id = await _running_cell(client)
+    r = await client.post(f"/v1/cells/{cell_id}/exec/script", json={"script": "print(1)", "interpreter": "/usr/bin/python3"})
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_valid_request_is_recorded_so_the_empty_history_above_means_something(client: AsyncClient, captured_exec):
+    cell_id = await _running_cell(client)
+    assert (await client.post(f"/v1/cells/{cell_id}/exec",
+                              json={"command": "true", "environment": {"OK": "1"}})).status_code == 200
+    history = (await client.get(f"/v1/cells/{cell_id}/executions")).json()["data"]
+    assert len(history) == 1 and history[0]["command"] == "true"

@@ -127,9 +127,11 @@ class MicroVMEngine(ABC):
 
     @abstractmethod
     async def exec_command(
-        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
+        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent",
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
-        """Execute a command inside a microVM via the cell agent."""
+        """Execute a command inside a microVM via the cell agent. ``env`` is the per-command environment,
+        applied over the cell's own; callers validate it first (``core.exec_env``)."""
 
     async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
         """Pause + dump memory/device state. Optional capability."""
@@ -218,7 +220,8 @@ class SimulatedMicroVMEngine(MicroVMEngine):
         return await self.create_vm(config)
 
     async def exec_command(
-        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
+        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent",
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
         """Simulate command execution."""
         return ExecResult(

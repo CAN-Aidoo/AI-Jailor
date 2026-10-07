@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -99,9 +102,9 @@ func runExec(req *Request, cfg execConfig) map[string]any {
 		}
 	}
 	// Minimal, explicit environment: nothing from the agent's own env leaks in.
-	env := []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + home, "USER=" + userName, "LANG=C.UTF-8"}
-	for k, v := range req.Env {
-		env = append(env, k+"="+v)
+	env, err := buildEnv(req.Env, home, userName)
+	if err != nil {
+		return errReply("%v", err)
 	}
 	cmd.Env = env
 	stdout := &limitedBuffer{max: MaxOutput}
@@ -199,4 +202,53 @@ func runExec(req *Request, cfg execConfig) map[string]any {
 		"timed_out":        timedOut,
 		"output_truncated": stdout.truncated || stderr.truncated,
 	}
+}
+
+// validEnvName reports whether name is a portable environment variable name. A name containing '=' would
+// make "k=v" ambiguous (a different variable than the one that was asked for), and an empty or NUL-bearing
+// one cannot be passed to execve at all.
+func validEnvName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c == '_', c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// buildEnv returns the command's environment: the agent's defaults, overridden by the request's variables.
+// Each name appears exactly once (a duplicate would make the winner depend on which program reads it) and
+// the order is fixed. HOME and USER belong to the account the command runs as and cannot be overridden.
+func buildEnv(req map[string]string, home, userName string) ([]string, error) {
+	m := map[string]string{"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+	for k, v := range req {
+		if !validEnvName(k) {
+			return nil, fmt.Errorf("invalid environment variable name %q", k)
+		}
+		if strings.IndexByte(v, 0) >= 0 {
+			return nil, fmt.Errorf("the value of %s contains a NUL byte", k)
+		}
+		if k == "HOME" || k == "USER" {
+			return nil, fmt.Errorf("environment variable %s is set by the agent and cannot be overridden", k)
+		}
+		m[k] = v
+	}
+	m["HOME"], m["USER"] = home, userName
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+m[k])
+	}
+	return out, nil
 }

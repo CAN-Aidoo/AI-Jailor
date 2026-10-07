@@ -209,6 +209,29 @@ async def test_exec_passes_cell_environment_to_agent(env):
     assert seen["env"] == {"http_proxy": "http://10.200.0.1:3128"}
 
 
+@pytest.mark.asyncio
+async def test_exec_env_is_applied_over_the_cells_own_environment_for_that_command_only(env):
+    tmp, _ = env
+    holder, seen = {}, []
+    eng = await make_engine(tmp, holder)
+
+    async def fake_agent(uds, port, cmd, timeout, user, env=None):
+        seen.append(env)
+        from aijailer.engine.microvm import ExecResult
+        return ExecResult(0, "", "", 1)
+
+    eng._agent_call = fake_agent
+    cid = uuid.uuid4()
+    await eng.create_vm(VMConfig(cell_id=cid, image="base-python",
+                                 environment={"http_proxy": "http://10.200.0.1:3128", "FOO": "from-creation"}))
+    await eng.exec_command(cid, "true", env={"FOO": "from-exec", "BAR": "1"})
+    await eng.exec_command(cid, "true")
+    await eng.exec_command(cid, "true", env={})
+    base = {"http_proxy": "http://10.200.0.1:3128", "FOO": "from-creation"}
+    assert seen[0] == {"http_proxy": "http://10.200.0.1:3128", "FOO": "from-exec", "BAR": "1"}   # exec wins, extras added
+    assert seen[1] == base and seen[2] == base       # and it did not leak into the cell's stored environment
+
+
 def test_jailer_argv_joins_cell_netns_only_when_given():
     s = Settings()
     with_ns = fc.jailer_argv(s, "abc", 512, 1, "/run/netns/ajcell1")

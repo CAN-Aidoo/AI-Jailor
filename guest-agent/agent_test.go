@@ -345,3 +345,103 @@ func TestNoNewPrivsReachesEveryWorkload(t *testing.T) {
 		}
 	}
 }
+
+func envOf(t *testing.T, r map[string]any) map[string]string {
+	t.Helper()
+	if e, ok := r["error"]; ok {
+		t.Fatalf("unexpected error: %v", e)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(r["stdout"].(string)), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			if _, dup := out[k]; dup {
+				t.Fatalf("variable %s appears twice in the command's environment:\n%s", k, r["stdout"])
+			}
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func TestRequestEnvOverridesDefaultsExactlyOnce(t *testing.T) {
+	r := exec1(t, "/usr/bin/env", func(q *Request) { // absolute: the PATH override below hides the lookup
+		q.Env = map[string]string{"PATH": "/custom/bin", "LANG": "de_DE.UTF-8", "FOO": "bar", "EMPTY": ""}
+	})
+	got := envOf(t, r)
+	if got["PATH"] != "/custom/bin" || got["LANG"] != "de_DE.UTF-8" || got["FOO"] != "bar" {
+		t.Fatalf("overrides not applied: %v", got)
+	}
+	if v, ok := got["EMPTY"]; !ok || v != "" {
+		t.Fatalf("an empty value must still be set: %v", got)
+	}
+	if got["HOME"] == "" || got["USER"] != "agent" {
+		t.Fatalf("agent-managed variables missing: %v", got)
+	}
+}
+
+func TestValuesAreTakenLiterallyNotInterpreted(t *testing.T) {
+	r := exec1(t, `printf '%s' "$V"`, func(q *Request) {
+		q.Env = map[string]string{"V": "a b=c $(echo hacked) `x` \"q\" 'r'\nline2"}
+	})
+	if got := r["stdout"].(string); got != "a b=c $(echo hacked) `x` \"q\" 'r'\nline2" {
+		t.Fatalf("value was altered or interpreted: %q", got)
+	}
+}
+
+func TestEnvHomeAndUserCannotBeOverridden(t *testing.T) {
+	for _, name := range []string{"HOME", "USER"} {
+		r := exec1(t, "true", func(q *Request) { q.Env = map[string]string{name: "x"} })
+		if e, ok := r["error"].(string); !ok || !strings.Contains(e, name) {
+			t.Fatalf("%s override must be refused, got %v", name, r)
+		}
+	}
+}
+
+func TestMalformedEnvNamesAndValuesAreRefused(t *testing.T) {
+	cases := map[string]map[string]string{
+		"empty name":        {"": "x"},
+		"equals in name":    {"A=B": "x"},
+		"leading digit":     {"1A": "x"},
+		"space in name":     {"A B": "x"},
+		"dash in name":      {"A-B": "x"},
+		"NUL in name":       {"A\x00B": "x"},
+		"NUL in value":      {"A": "x\x00y"},
+		"overlong name":     {strings.Repeat("A", 129): "x"},
+		"non-ASCII in name": {"Ä": "x"},
+	}
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := exec1(t, "true", func(q *Request) { q.Env = env })
+			if _, ok := r["error"]; !ok {
+				t.Fatalf("accepted: %v", r)
+			}
+		})
+	}
+}
+
+func TestBuildEnvIsDeterministicAndSorted(t *testing.T) {
+	req := map[string]string{"Z": "1", "A": "2", "M": "3"}
+	first, err := buildEnv(req, "/home/agent", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		again, _ := buildEnv(req, "/home/agent", "agent")
+		if strings.Join(again, "\x00") != strings.Join(first, "\x00") {
+			t.Fatalf("order changed between calls:\n%v\n%v", first, again)
+		}
+	}
+	for i := 1; i < len(first); i++ {
+		if first[i-1] > first[i] {
+			t.Fatalf("not sorted: %v", first)
+		}
+	}
+}
+
+func TestNulInValueIsRefusedUpFrontAndNamesTheVariable(t *testing.T) {
+	r := exec1(t, "true", func(q *Request) { q.Env = map[string]string{"SECRET_TOKEN": "x\x00y"} })
+	e, _ := r["error"].(string)
+	if !strings.Contains(e, "SECRET_TOKEN") || strings.Contains(e, "start failed") {
+		t.Fatalf("want an up-front refusal naming the variable, got %q", e)
+	}
+}

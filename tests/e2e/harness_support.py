@@ -111,13 +111,13 @@ class ChrootAgentEngine(MicroVMEngine):
         if vm:
             self._killpg(vm["proc"])
 
-    async def exec_command(self, cell_id, command, timeout=30, user="agent"):
+    async def exec_command(self, cell_id, command, timeout=30, user="agent", env=None):
         vm = self._vm(cell_id)
         if vm["info"].status != VMStatus.RUNNING:
             raise RuntimeError(f"cell is {vm['info'].status.value}, cannot exec")
         r, w = await asyncio.open_unix_connection(vm["info"].vsock_path)
         body = json.dumps({"op": "exec", "cmd": command, "timeout": timeout, "user": user,
-                           "env": vm["env"]}).encode()
+                           "env": {**vm["env"], **(env or {})}}).encode()
         w.write(struct.pack(">I", len(body)) + body)
         await w.drain()
         (n,) = struct.unpack(">I", await asyncio.wait_for(r.readexactly(4), timeout + 10))
