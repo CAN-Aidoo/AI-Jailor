@@ -88,8 +88,42 @@ Protected:
 - **The operator still sees metadata** (who connects to whom, when, how many bytes) and can deny service.
   Peer sessions are audited as network events. The operator can also read a cell's memory (see
   SECURITY_MODEL.md): this feature does not change the trust model for the cells themselves.
-- No protocol for the actual joint computation is provided by the platform. `examples/psi/` is a reference
-  two-party PSI workload (semi-honest, demo-grade; see its README for what it does not protect).
+- No protocol for the actual joint computation is provided by the platform; see "Example workload" below
+  for a demo-grade PSI that runs on top of the channel.
+
+## Example workload: private set intersection
+
+`examples/psi/` ([README](./examples/psi/README.md)) is a reference two-party PSI that runs **on top of** a
+peer link, to show the intended shape: the platform supplies the attested, encrypted channel, and the
+computation runs inside the cells. One party (the receiver) learns which of its items the other party
+also has; the other (the sender) learns only how many items the receiver submitted. Neither learns the
+other's non-matching items. It is DDH-based in the RFC 3526 2048-bit group, standard library only, so it
+runs on the stock guest image's Python 3.12.
+
+Inside each cell, `aijailer-peer` exposes the channel as a local socket and the program just uses it:
+
+    aijailer-peer --link $LINK --listen 127.0.0.1:7000 &
+    python3 psi.py --role receiver --items mine.txt --context $LINK --connect 127.0.0.1:7000   # one side
+    python3 psi.py --role sender   --items mine.txt --context $LINK --connect 127.0.0.1:7000   # other side
+
+Use the link id as `--context`, so a transcript cannot be replayed under another link. The PSI roles
+(receiver/sender) are independent of the link roles (initiator/responder).
+
+What the peer link adds, and what it does not:
+- The link guarantees *who* the other side is (an attested cell and tenant, optionally pinned) and that
+  the platform relay cannot read or alter the exchange. It says nothing about whether the peer behaves.
+- The PSI is **semi-honest only**: a malicious sender can lie about its set or the result.
+- A receiver may submit any items, so with low-entropy identifiers (phone numbers, e-mail addresses,
+  small ID ranges) it can enumerate candidates and learn the sender's whole set. Use high-entropy
+  identifiers or limit what each side may submit.
+- Both sides learn each other's set size. It is demo-grade and slow (about 0.1 s per item pair); for
+  production use a reviewed library.
+
+Verified: protocol tests plus the whole stack (PSI, `aijailer-peer`, the real proxy and relay, mutual
+TLS); and a run with both programs executing in the guest rootfs's own userland (its Python 3.12 and
+no `cryptography`, as the unprivileged `agent` user) against the host-side proxy and relay. That second
+run was a chroot, **not** a booted cell: it had no microVM boundary, guest agent, seccomp or egress
+firewall. Not verified: PSI inside a real Firecracker cell (no KVM available here).
 
 ## Operating notes and limits
 
