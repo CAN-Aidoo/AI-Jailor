@@ -404,3 +404,18 @@ job in `scrape.example.yml`) alerts on the `/metrics` quota gauges (set `METRICS
 Validate with `promtool check rules` and `promtool test rules`; `tests/deploy/test_prometheus_rules.py` runs both when
 `promtool` is on PATH (or `PROMTOOL=` is set) and always checks that every metric a rule uses is really exported.
 
+### Snapshot quota dashboard
+
+`deploy/grafana/snapshot-quota.dashboard.json` (Grafana 10/11, uid `aijailer-snapshot-quota`) plots the same `/metrics`
+gauges the alerts use. Variables: `Prometheus` datasource and `Tenant` (multi, default All). Panels: counts of quotas at
+100% and at 80-100%, refusals in the last hour, tenants exported (0 = nothing scraped); a table of the 25 fullest quotas;
+the fullest tenant per quota over time (dashed lines at the 80% alert and the 100% refusal level); count and storage
+usage per tenant and for each tenant's fullest cell; absolute storage bytes; refusals by tenant and quota; and a table of
+**projected days until full** for quotas that are growing (6h trend, under 30 days; a projection from a noisy signal,
+not a promise). It queries the raw metrics only, so it works without the recording rules loaded.
+
+Provision it with `deploy/grafana/provisioning/dashboards/aijailer.yml` (mount the JSON at
+`/var/lib/grafana/dashboards/aijailer`) and a Prometheus datasource (`provisioning/datasources/prometheus.example.yml`).
+`tests/deploy/test_grafana_dashboard.py` checks the layout, that only exported metrics are queried, and (with promtool)
+that every query parses as PromQL and the key ones return the right answers on sample series.
+
