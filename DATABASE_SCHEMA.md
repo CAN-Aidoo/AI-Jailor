@@ -565,3 +565,21 @@ One row per consented cell-to-cell link: `id`, `initiator_tenant_id`/`initiator_
 `purpose` (<= 64), `created_at`, `accepted_at`, `expires_at`, `revoked_at`, `revoked_by_tenant_id`.
 Check: initiator and responder cells differ. Indexes on both tenants and both cells. Expiry is evaluated
 at read time and at every relay attach; there is no cleanup dependency. See PEER_LINKS.md.
+
+### Private set intersection (no schema)
+
+The reference PSI workload (`examples/psi/`, see PEER_LINKS.md) adds **no tables, columns or migrations**
+and the platform stores none of its data. Items, blinded values and the computed intersection exist only in
+the memory of the two cells; the relay carries them inside TLS it cannot read, and nothing is persisted.
+
+What the platform database does hold when PSI runs is the ordinary peer-link record, and nothing PSI-specific:
+- the `peer_links` row above (which two cells, which tenants, `purpose`, lifetime, status);
+- hash-chained `audit_events` on both tenants' chains: the link lifecycle (`peer_link_proposed`,
+  `peer_link_requested`, `peer_link_accepted`, `peer_link_revoked`) and one `network` event per relay session
+  with `decision`, `reason`, `role`, `peer_link`, `session_id` and the bytes moved in each direction.
+
+Byte counts are the one thing that reveals anything about the exchange: the PSI frames are about 256 bytes
+per element (`API_DOCUMENTATION.md` has the layout), so anyone who can read the audit log can roughly estimate
+how many items each side submitted (from the bytes in each direction, plus a small fixed TLS overhead). The
+two parties already learn each other's set sizes in the protocol; the point is that the operator and
+auditors can too. Pad the sets with dummy items if that matters for your use.
