@@ -41,6 +41,7 @@ from aijailer.api.routes import (
     compliance as compliance_route,
     admin as admin_route,
     metrics as metrics_route,
+    peer_links as peer_links_route,
 )
 
 logger = structlog.get_logger(__name__)
@@ -154,6 +155,11 @@ def create_app() -> FastAPI:
             "cell_not_found": 404,
             "policy_not_found": 404,
             "snapshot_not_found": 404,
+            "peer_link_not_found": 404,
+            "peer_link_invalid": 400,
+            "peer_link_conflict": 409,
+            "peer_link_limit": 429,
+            "peer_links_disabled": 503,
             "tenant_not_found": 404,
             "invalid_quota": 400,
             "snapshot_not_available": 409,
@@ -281,6 +287,7 @@ def create_app() -> FastAPI:
     app.include_router(compliance_route.router)
     app.include_router(metrics_route.router)
     app.include_router(admin_route.router)
+    app.include_router(peer_links_route.router)
 
     # --- Prometheus (operator): disabled unless METRICS_TOKEN is set ---
     @app.get("/metrics", tags=["System"], include_in_schema=False)

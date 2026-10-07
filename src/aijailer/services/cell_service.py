@@ -96,6 +96,12 @@ class CellService:
         errors = await self._network.deprovision(cell_id)
         if errors:
             logger.error("cell.network.teardown_incomplete", cell_id=str(cell_id), errors=errors)
+        if get_settings().peer_attestation_secret:
+            # A cell that loses its network (stop, destroy, restore, failed start) loses its peer
+            # links: they are about a running guest, and any live session is cut now.
+            from aijailer.netpolicy.runtime import get_peer_hub
+            from aijailer.peerlink.service import PeerLinkService
+            await PeerLinkService(self.db, get_peer_hub()).revoke_for_cell(cell_id)
 
     async def _effective_policy(self, tenant_id: uuid.UUID, policy_id: uuid.UUID) -> dict | None:
         """Compile the cell's security policy once, at creation (cells keep that version).

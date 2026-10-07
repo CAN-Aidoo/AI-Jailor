@@ -159,7 +159,9 @@ class CellNetwork:
                  audit: Callable[[uuid.UUID, dict], None] | None = None,
                  proxy_factory: Callable[..., CellProxy] = CellProxy, resolver=None,
                  scan: Callable[[], discovery.HostNetState] = discovery.scan_host,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 extra_env: dict | None = None) -> None:
+        self._extra_env = dict(extra_env or {})     # platform-owned env every cell gets (merged last)
         self._scan, self._clock = scan, clock
         self._since: dict[uuid.UUID, float] = {}
         self._resolver = resolver
@@ -228,10 +230,9 @@ class CellNetwork:
     def _proxy_url(net: CellNet) -> str:
         return f"http://{net.host_ip}:{net.broker_port}"
 
-    @staticmethod
-    def _proxy_env(url: str) -> dict:
+    def _proxy_env(self, url: str) -> dict:
         return {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
-                "NO_PROXY": ""}
+                "NO_PROXY": "", **self._extra_env}
 
     def env_for(self, cell_id: uuid.UUID) -> dict:
         """The platform-injected guest environment of a provisioned cell ({} if none); lets a

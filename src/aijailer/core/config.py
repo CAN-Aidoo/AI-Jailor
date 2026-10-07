@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     audit_batch_max_events: int = Field(default=200, alias="AUDIT_BATCH_MAX_EVENTS")
     audit_batch_max_delay_ms: float = Field(default=500.0, alias="AUDIT_BATCH_MAX_DELAY_MS")
     audit_batch_queue_max: int = Field(default=10000, alias="AUDIT_BATCH_QUEUE_MAX")
+    # Peer links (two cells talking end-to-end encrypted through the platform): enabled iff a signing
+    # secret is configured. It derives the Ed25519 key that attests which certificate belongs to which
+    # cell; keep it out of the database's reach. Cells receive the PUBLIC key in their environment.
+    peer_attestation_secret: str = Field(default="", alias="PEER_ATTESTATION_SECRET")
+    peer_link_default_ttl_seconds: int = Field(default=3600, alias="PEER_LINK_DEFAULT_TTL_SECONDS")
+    peer_link_max_ttl_seconds: int = Field(default=86400, alias="PEER_LINK_MAX_TTL_SECONDS")
+    peer_link_max_open_per_tenant: int = Field(default=50, alias="PEER_LINK_MAX_OPEN_PER_TENANT")
+    peer_wait_seconds: float = Field(default=60.0, alias="PEER_WAIT_SECONDS")
+    peer_session_max_seconds: float = Field(default=3600.0, alias="PEER_SESSION_MAX_SECONDS")
+    peer_session_idle_seconds: float = Field(default=300.0, alias="PEER_SESSION_IDLE_SECONDS")
+    peer_session_max_bytes: int = Field(default=1 << 30, alias="PEER_SESSION_MAX_BYTES")
     # Tenant secret store: "id:base64key[,id2:base64key2]" (32 raw bytes each). Unset => the secret
     # store is DISABLED (API returns 503, brokers get no secrets); there is no insecure default.
     secrets_master_keys: str = Field(default="", alias="SECRETS_MASTER_KEYS")

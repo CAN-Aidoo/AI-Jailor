@@ -50,15 +50,58 @@ def peek_cell_network() -> CellNetwork | None:
     return _network
 
 
+_peer_hub = None
+
+
+def get_peer_hub():
+    """The process-wide peer relay, or None when peer links are not configured
+    (PEER_ATTESTATION_SECRET unset). The hub's signing key never leaves this process; cells only
+    ever receive the public half."""
+    global _peer_hub
+    s = get_settings()
+    if not s.peer_attestation_secret:
+        return None
+    if _peer_hub is None:
+        from aijailer.peerlink.hub import PeerHub
+        from aijailer.peerlink.service import authorize_attach
+        from aijailer.services.attestation import Ed25519Signer
+        _peer_hub = PeerHub(
+            authorize_attach, Ed25519Signer.from_secret(s.peer_attestation_secret),
+            wait_seconds=s.peer_wait_seconds, session_seconds=s.peer_session_max_seconds,
+            idle_seconds=s.peer_session_idle_seconds, max_bytes=s.peer_session_max_bytes)
+    return _peer_hub
+
+
+def peer_public_key_b64() -> str | None:
+    """The platform's peer-attestation public key (raw 32 bytes, base64): injected into every cell
+    as AIJAILER_PEER_ATTEST_PUBKEY so a cell can verify attestations without trusting the network."""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    hub = get_peer_hub()
+    if hub is None:
+        return None
+    raw = hub._signer.public_key.public_bytes(serialization.Encoding.Raw,
+                                              serialization.PublicFormat.Raw)
+    return base64.b64encode(raw).decode()
+
+
 def get_cell_network() -> CellNetwork:
     global _network
     if _network is None:
+        from aijailer.agentsec.proxy import CellProxy
         from aijailer.db.base import async_session_factory
         from aijailer.secretstore.runtime import DbSecretProvider
         s = get_settings()
         mgr = NetPolicyManager(allocator=NetAllocator(s.cell_net_pool), broker_port=s.broker_port)
+        hub, pub = get_peer_hub(), peer_public_key_b64()
+        kwargs = {}
+        if hub is not None:
+            kwargs = dict(
+                proxy_factory=lambda *a, **k: CellProxy(*a, peer_hub=hub, **k),
+                extra_env={"AIJAILER_PEER_ATTEST_PUBKEY": pub})
         _network = CellNetwork(mgr, NetnsLinkOps(s.jailer_uid, s.jailer_gid), audit=_audit_sink,
-                               secrets=DbSecretProvider(async_session_factory))
+                               secrets=DbSecretProvider(async_session_factory), **kwargs)
     return _network
 
 
