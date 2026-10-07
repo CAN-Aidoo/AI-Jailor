@@ -103,7 +103,8 @@ async def start_network_runtime(engine, interval: float = 5.0,
         from aijailer.netpolicy.reconciler import NetworkReconciler
         s = get_settings()
         reconciler = NetworkReconciler(net, session_factory, s.reconcile_interval_seconds,
-                                       s.reconcile_grace_seconds, s.reconcile_stuck_seconds)
+                                       s.reconcile_grace_seconds, s.reconcile_stuck_seconds,
+                                       engine=engine)
         # Inline first pass: adopt networks that survived a restart before taking traffic.
         await reconciler.start(initial_pass=True)
     return NetworkRuntime(stop, task, reconciler)

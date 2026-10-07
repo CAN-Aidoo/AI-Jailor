@@ -113,6 +113,18 @@ async def main():
             res["start"] = "failed"
             res["start_error"] = str(exc)[:400]
         pid = vm["fc_pid"]
+        # --- control-plane restart: a NEW engine has no memory of this VM ---
+        eng2 = FirecrackerEngine(kvm_path="/dev/null")
+        found = await asyncio.to_thread(eng2._scan_vmms)
+        res["restart_scan_finds_vmm"] = found.get(cid) == [pid]
+        rep = await eng2.reconcile({cid: {}}, set(), grace=0)     # DB says live, VMM never started
+        res["restart_live_not_started"] = {"unresponsive": rep.unresponsive == [cid],
+                                           "adopted": bool(rep.adopted)}
+        rep = await eng2.reconcile({}, set(), grace=0)            # DB says not live -> orphan
+        await asyncio.sleep(0.3)
+        res["restart_orphan_killed"] = rep.orphans_killed == [cid] and not rep.errors
+        res["restart_orphan_vmm_gone"] = not os.path.exists(f"/proc/{pid}")
+        res["restart_orphan_jail_removed"] = not os.path.exists(vm["jail"])
         await eng._teardown(vm)
         await asyncio.sleep(0.3)
         res["vmm_gone"] = not os.path.exists(f"/proc/{pid}")

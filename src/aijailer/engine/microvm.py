@@ -73,6 +73,28 @@ class ExecResult:
     output_truncated: bool = False
 
 
+@dataclass
+class EngineSweepReport:
+    """What one engine reconciliation pass found and did (see FirecrackerEngine.reconcile)."""
+
+    adopted: list[uuid.UUID] = field(default_factory=list)    # live cell, VMM survived a restart
+    orphans_killed: list[uuid.UUID] = field(default_factory=list)  # VMM with no live cell
+    leftovers_removed: list[uuid.UUID] = field(default_factory=list)  # jail/cgroup, no VMM
+    dead: list[uuid.UUID] = field(default_factory=list)       # live cell whose VMM is gone
+    unresponsive: list[uuid.UUID] = field(default_factory=list)  # live cell, VMM not answering
+    skipped_young: list[uuid.UUID] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    aborted: bool = False
+
+    @property
+    def broken(self) -> list[uuid.UUID]:
+        return [*self.dead, *self.unresponsive]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.adopted or self.orphans_killed or self.leftovers_removed or self.dead)
+
+
 class MicroVMEngine(ABC):
     """Abstract interface for MicroVM management."""
 
@@ -119,6 +141,12 @@ class MicroVMEngine(ABC):
     @abstractmethod
     async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
         """Get current status and info for a microVM."""
+
+    async def reconcile(self, live: dict[uuid.UUID, dict], protected: set[uuid.UUID],
+                        grace: float = 120.0) -> "EngineSweepReport | None":
+        """Make the host's VMM processes/files match the set of cells the database says are live
+        (``live`` maps cell id -> guest environment). Engines with no host state return None."""
+        return None
 
 
 class SimulatedMicroVMEngine(MicroVMEngine):

@@ -211,12 +211,25 @@ class CellNetwork:
             self._tenants[cell_id] = tenant_id
             self._policies[cell_id] = network_policy
             self._since[cell_id] = self._clock()
-            url = f"http://{net.host_ip}:{net.broker_port}"
+            url = self._proxy_url(net)
             logger.info("cell.network.provisioned", cell_id=str(cell_id), ifname=net.ifname,
                         guest_ip=str(net.guest_ip), skipped=skipped)
-            env = {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
-                   "NO_PROXY": ""}
-            return Provisioned(net, link, url, env, skipped)
+            return Provisioned(net, link, url, self._proxy_env(url), skipped)
+
+    @staticmethod
+    def _proxy_url(net: CellNet) -> str:
+        return f"http://{net.host_ip}:{net.broker_port}"
+
+    @staticmethod
+    def _proxy_env(url: str) -> dict:
+        return {"http_proxy": url, "HTTP_PROXY": url, "https_proxy": url, "HTTPS_PROXY": url,
+                "NO_PROXY": ""}
+
+    def env_for(self, cell_id: uuid.UUID) -> dict:
+        """The platform-injected guest environment of a provisioned cell ({} if none); lets a
+        re-adopted VM get the same proxy settings it was created with."""
+        net = self._nets.get(cell_id)
+        return self._proxy_env(self._proxy_url(net)) if net is not None else {}
 
     async def refresh_secrets(self, tenant_id: uuid.UUID | None = None,
                               fail_closed: bool = False) -> int:

@@ -385,3 +385,27 @@ Changing limits at runtime (`PUT /v1/cells/{id}/bandwidth`): applied to the kern
 never leaves the database claiming a limit the cell does not have. If the persist fails after a successful apply, or anyone
 alters the qdiscs by hand, the reconciler compares `read_shaping` with the database every sweep and restores the database's
 value (`shaping_repaired` in the sweep report). The database is the single source of truth.
+
+### Engine-side reconciliation (`FirecrackerEngine.reconcile`)
+
+Jailed VMMs outlive the control plane, but the engine's in-memory `_vms` does not. The same reconciler pass
+(after the network sweep, same DB snapshot) therefore also compares the **host's VMMs and jails** with the cells the
+database calls live. Identity comes only from what we can prove: a jail directory named exactly `<uuid>` under
+`<JAILER_CHROOT_BASE>/<exec name>/`, and a process whose `argv[0]` is the Firecracker binary with `--id <uuid>`
+(pid reuse cannot fool it: the argv is re-checked before every kill). Anything else is never touched.
+
+| Found | DB says | Action |
+|---|---|---|
+| VMM (+jail) | live, VMM answers (API state + agent ping) | **adopted**: handle rebuilt with the cell's env (DB environment + proxy env) |
+| VMM | live, no answer / not started | reported `unresponsive`, cell marked `error`; reaped as an orphan next pass |
+| nothing running | live | reported `dead`, cell marked `error`, jail removed |
+| managed VMM exited | live | same as dead |
+| VMM and/or jail/cgroup | not live (stopped-in-DB, error, destroyed, unknown) | SIGKILL, wait, remove jail + cgroup |
+| anything | creating/stopping/destroying, or `create_vm` in flight here | never touched |
+| jail younger than `RECONCILE_GRACE_SECONDS` | not live | skipped (may be another process's launch) |
+
+A STOPPED VM this process still manages is kept until `destroy_cell`. Removing more than 5 VMs that are also more than
+half of everything present aborts the pass (a bad DB read must not look like a mass leak). Verified against the real jailer +
+Firecracker (`tests/engine/test_real_jailer.py`): a fresh engine finds the VMM from its argv, refuses to adopt one that never
+started, and kills it and removes its jail once the cell is not live. Not verified without KVM: adopting a *running* guest
+(agent ping over vsock). `restore_vm` remains unimplemented.

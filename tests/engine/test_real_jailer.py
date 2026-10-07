@@ -90,3 +90,12 @@ def test_the_only_thing_missing_is_kvm(r):
 
 def test_teardown_leaves_nothing(r):
     assert r["vmm_gone"] is True and r["jail_removed"] is True
+
+
+def test_reconcile_after_restart_finds_and_reaps_the_real_vmm(r):
+    """A fresh engine (no memory) identifies the real jailer-spawned VMM by its argv, refuses to
+    adopt one that never started, and kills + cleans it once the cell is no longer live."""
+    assert r["restart_scan_finds_vmm"] is True
+    assert r["restart_live_not_started"] == {"unresponsive": True, "adopted": False}
+    assert r["restart_orphan_killed"] is True
+    assert r["restart_orphan_vmm_gone"] is True and r["restart_orphan_jail_removed"] is True

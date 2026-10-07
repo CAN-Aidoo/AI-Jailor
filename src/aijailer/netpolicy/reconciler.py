@@ -33,7 +33,11 @@ PROTECTED_STATUSES = ("creating", "stopping", "destroying")
 class NetworkReconciler:
     def __init__(self, network: CellNetwork, session_factory: Callable,
                  interval: float = 30.0, grace: float = 120.0, stuck_after: float = 600.0,
-                 on_report: Callable[[SweepReport], Awaitable[None] | None] | None = None) -> None:
+                 on_report: Callable[[SweepReport], Awaitable[None] | None] | None = None,
+                 engine=None) -> None:
+        self._engine = engine          # optional: also reconcile VMM processes/jails
+        self.last_engine_report = None
+        self._envs: dict[uuid.UUID, dict] = {}
         self._net, self._sessions = network, session_factory
         self._interval, self._grace, self._on_report = interval, grace, on_report
         self._stuck_after = stuck_after
@@ -54,9 +58,12 @@ class NetworkReconciler:
         async with self._sessions() as db:
             rows = await db.execute(select(
                 Cell.id, Cell.tenant_id, Cell.status, Cell.effective_policy,
-                Cell.network_bandwidth_mbps, Cell.updated_at, Cell.bandwidth_override))
-            for cid, tenant, status, policy, mbps, updated, override in rows:
+                Cell.network_bandwidth_mbps, Cell.updated_at, Cell.bandwidth_override,
+                Cell.environment))
+            self._envs = {}
+            for cid, tenant, status, policy, mbps, updated, override, env in rows:
                 if status in LIVE_STATUSES:
+                    self._envs[cid] = dict(env or {})
                     live[cid] = LiveCell(tenant, (policy or {}).get("network"),
                                          effective_bandwidth(mbps, override))
                 elif status in PROTECTED_STATUSES:
@@ -83,6 +90,27 @@ class NetworkReconciler:
                     cell.error_message = f"stuck in '{was}' (owner process died; reconciler)"
             await db.commit()
 
+    async def _reconcile_engine(self, live, protected, stuck) -> list[uuid.UUID]:
+        """Engine-side sweep. A stuck cell is no longer protected: its VMM is an orphan too."""
+        guest_env = {cid: {**self._envs.get(cid, {}), **self._net.env_for(cid)} for cid in live}
+        try:
+            rep = await self._engine.reconcile(guest_env, protected, self._grace)
+        except Exception as exc:
+            self.failures += 1
+            logger.error("engine.reconcile.crashed", error=str(exc))
+            return []
+        self.last_engine_report = rep
+        if rep is None:
+            return []
+        if rep.aborted or rep.errors:
+            logger.error("engine.reconcile.problem", aborted=rep.aborted, errors=rep.errors)
+        if rep.changed or rep.unresponsive:
+            logger.warning("engine.reconcile.changed", adopted=len(rep.adopted),
+                           orphans=len(rep.orphans_killed), leftovers=len(rep.leftovers_removed),
+                           dead=[str(c) for c in rep.dead],
+                           unresponsive=[str(c) for c in rep.unresponsive])
+        return rep.broken
+
     async def run_once(self) -> SweepReport | None:
         """One reconciliation pass. Returns None (and changes nothing) if the DB is unreadable."""
         self.runs += 1
@@ -94,9 +122,12 @@ class NetworkReconciler:
             return None
         report = await self._net.sweep(live, protected, self._grace)
         self.last_report = report
-        if report.broken or stuck:
+        engine_broken: list[uuid.UUID] = []
+        if self._engine is not None:
+            engine_broken = await self._reconcile_engine(live, protected, stuck)
+        if report.broken or stuck or engine_broken:
             try:
-                await self._mark_broken(report.broken, stuck)
+                await self._mark_broken([*report.broken, *engine_broken], stuck)
             except Exception as exc:
                 report.errors.append(f"mark broken: {exc}")
         if report.aborted or report.errors:

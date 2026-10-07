@@ -32,6 +32,7 @@ import httpx
 
 from aijailer.core.config import get_settings
 from aijailer.engine.microvm import (
+    EngineSweepReport,
     EngineUnavailable,
     ExecResult,
     MicroVMEngine,
@@ -39,6 +40,7 @@ from aijailer.engine.microvm import (
     VMInfo,
     VMStatus,
 )
+from aijailer.netpolicy.cell_network import MASS_REMOVAL_FRACTION, MASS_REMOVAL_MIN
 
 _MAX_FRAME = 16 * 1024 * 1024
 
@@ -56,6 +58,13 @@ class FirecrackerAPI:
         r = await self._client.request(method, path, json=body)
         if r.status_code >= 300:
             raise RuntimeError(f"firecracker {method} {path} -> {r.status_code}: {r.text}")
+
+    async def state(self) -> str:
+        """Instance state as reported by the VMM: "Not started" | "Running" | "Paused"."""
+        r = await self._client.get("/")
+        if r.status_code >= 300:
+            raise RuntimeError(f"firecracker GET / -> {r.status_code}: {r.text}")
+        return str(r.json().get("state", ""))
 
     async def configure(self, cfg: dict) -> None:
         await self._call("PUT", "/boot-source", cfg["boot-source"])
@@ -223,7 +232,8 @@ class FirecrackerEngine(MicroVMEngine):
 
     def __init__(self, spawner: Spawner | None = None, kvm_path: str = "/dev/kvm",
                  api_factory: Callable[[str], FirecrackerAPI] = FirecrackerAPI,
-                 agent_call=agent_exec, chown=os.chown) -> None:
+                 agent_call=agent_exec, chown=os.chown, proc_root: str = "/proc",
+                 cgroup_root: str = "/sys/fs/cgroup") -> None:
         self.settings = get_settings()
         self._spawner = spawner or _default_spawner
         self._kvm = kvm_path
@@ -232,6 +242,9 @@ class FirecrackerEngine(MicroVMEngine):
         self._chown = chown
         self._vms: dict[uuid.UUID, dict] = {}
         self._next_cid = 3  # 0-2 reserved by the vsock spec
+        self._proc, self._cgroup = Path(proc_root), Path(cgroup_root)
+        self._launching: set[uuid.UUID] = set()      # create_vm in flight: reconcile must not touch
+        self._reconcile_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ layout
     def _exec_name(self) -> str:
@@ -387,12 +400,19 @@ class FirecrackerEngine(MicroVMEngine):
             return None
 
     async def create_vm(self, config: VMConfig) -> VMInfo:
-        vm = await self._launch(config)
+        self._launching.add(config.cell_id)           # held until the VM is registered below
         try:
-            await vm["api"].start()
-        except BaseException:
-            await self._teardown(vm)
-            raise
+            vm = await self._launch(config)
+            try:
+                await vm["api"].start()
+            except BaseException:
+                await self._teardown(vm)
+                raise
+            return self._register(config, vm)
+        finally:
+            self._launching.discard(config.cell_id)
+
+    def _register(self, config: VMConfig, vm: dict) -> VMInfo:
         info = VMInfo(cell_id=config.cell_id, status=VMStatus.RUNNING, pid=vm["fc_pid"],
                       internal_ip=config.network.guest_ip if config.network else None,
                       vsock_path=str(vm["root"] / JAIL_VSOCK))
@@ -416,11 +436,13 @@ class FirecrackerEngine(MicroVMEngine):
 
     async def _teardown(self, vm: dict) -> None:
         """Kill the VMM, close the API client, remove the jail and its cgroup. Idempotent."""
-        self._kill_pid(vm.get("fc_pid"))
-        if vm.get("fc_pid"):  # wait until it is really gone before deleting its files
+        pids = [p for p in (vm.get("fc_pid"), *vm.get("extra_pids", ())) if p]
+        for pid in pids:
+            self._kill_pid(pid)
+        for pid in pids:  # wait until they are really gone before deleting their files
             for _ in range(100):
                 try:
-                    os.kill(vm["fc_pid"], 0)
+                    os.kill(pid, 0)
                 except ProcessLookupError:
                     break
                 await asyncio.sleep(0.02)
@@ -432,7 +454,7 @@ class FirecrackerEngine(MicroVMEngine):
         jail = vm.get("jail")
         if jail is not None:
             shutil.rmtree(jail, ignore_errors=True)
-            cg = Path("/sys/fs/cgroup") / self._exec_name() / jail.name
+            cg = self._cgroup / self._exec_name() / jail.name
             try:
                 cg.rmdir()  # the jailer creates it; it is only removable once empty
             except OSError:
@@ -506,6 +528,154 @@ class FirecrackerEngine(MicroVMEngine):
             raise RuntimeError(f"cell is {vm['info'].status.value}, cannot exec")
         return await self._agent_call(vm["info"].vsock_path, self.settings.agent_vsock_port,
                                       command, timeout, user, env=vm["env"])
+
+    # ------------------------------------------------------------- reconciliation
+    # A control-plane restart loses ``self._vms`` while jailed VMMs keep running (the jailer
+    # daemonizes them). ``reconcile`` re-derives the truth from the host: jail directories
+    # (``<base>/<exec>/<uuid>``) and VMM processes (argv ``<exec> --id <uuid>``), compared with the
+    # cells the database says are live. Only things whose name proves they are ours are touched.
+    def _scan_jails(self) -> dict[uuid.UUID, tuple[Path, float]]:
+        base = Path(self.settings.jailer_chroot_base) / self._exec_name()
+        out: dict[uuid.UUID, tuple[Path, float]] = {}
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            return out
+        for e in entries:
+            try:
+                cid = uuid.UUID(e.name)
+                if str(cid) == e.name and e.is_dir() and not e.is_symlink():
+                    out[cid] = (e, e.stat().st_mtime)
+            except (ValueError, OSError):
+                continue  # not ours: never touch what we cannot identify
+        return out
+
+    def _scan_vmms(self) -> dict[uuid.UUID, list[int]]:
+        """VMM processes by cell id, from /proc cmdlines (``firecracker ... --id <uuid>``)."""
+        out: dict[uuid.UUID, list[int]] = {}
+        try:
+            names = os.listdir(self._proc)
+        except OSError:
+            return out
+        for n in names:
+            if n.isdigit():
+                cid = self._vmm_cell_id(int(n))
+                if cid is not None:
+                    out.setdefault(cid, []).append(int(n))
+        return out
+
+    def _vmm_cell_id(self, pid: int) -> uuid.UUID | None:
+        try:
+            argv = (self._proc / str(pid) / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            return None
+        if not argv or Path(argv[0].decode(errors="replace")).name != self._exec_name():
+            return None
+        try:
+            i = argv.index(b"--id")
+            return uuid.UUID(argv[i + 1].decode())
+        except (ValueError, IndexError):
+            return None
+
+    def _vmm_alive(self, pid: int | None, cell_id: uuid.UUID) -> bool:
+        """True only if ``pid`` is still THE VMM of this cell (guards against pid reuse)."""
+        return bool(pid) and self._vmm_cell_id(pid) == cell_id
+
+    async def _kill_orphan(self, cid: uuid.UUID, pids: list[int], jail: Path | None) -> None:
+        await self._teardown({"fc_pid": None, "jail": jail,
+                              "extra_pids": pids})
+
+    async def _adopt(self, cid: uuid.UUID, pid: int, jail: Path | None, env: dict) -> bool:
+        """Rebuild the in-memory handle for a VMM that survived a restart. False if it does not
+        answer (the caller reports it; the cell is then marked error and cleaned next pass)."""
+        if jail is None:
+            return False
+        root = jail / "root"
+        api = self._api_factory(str(root / JAIL_API_SOCK))
+        try:
+            state = await asyncio.wait_for(api.state(), 5)
+            if state not in ("Running", "Paused"):
+                raise RuntimeError(f"unexpected VMM state {state!r}")
+            status = VMStatus.PAUSED if state == "Paused" else VMStatus.RUNNING
+            if status == VMStatus.RUNNING:
+                await agent_ping(str(root / JAIL_VSOCK), self.settings.agent_vsock_port, 3.0)
+        except Exception:
+            try:
+                await api.close()
+            except Exception:
+                pass
+            return False
+        info = VMInfo(cell_id=cid, status=status, pid=pid, vsock_path=str(root / JAIL_VSOCK))
+        self._vms[cid] = {"root": root, "jail": jail, "cid": None, "api": api, "fc_pid": pid,
+                          "env": dict(env or {}), "info": info}
+        return True
+
+    async def reconcile(self, live: dict[uuid.UUID, dict], protected: set[uuid.UUID],
+                        grace: float = 120.0) -> EngineSweepReport:
+        report = EngineSweepReport()
+        async with self._reconcile_lock:
+            try:
+                jails = await asyncio.to_thread(self._scan_jails)
+                vmms = await asyncio.to_thread(self._scan_vmms)
+            except Exception as exc:
+                report.errors.append(f"scan: {exc}")
+                return report
+            now = time.time()
+            skip = protected | set(self._launching)
+            doomed: list[uuid.UUID] = []          # not live, not ours to keep
+            for cid in set(jails) | set(vmms) | set(self._vms):
+                if cid in live or cid in skip:
+                    continue
+                vm = self._vms.get(cid)
+                if vm is not None and vm["info"].status == VMStatus.STOPPED:
+                    continue                       # stopped, kept until destroy_cell
+                if cid not in self._vms and cid in jails and now - jails[cid][1] < grace:
+                    report.skipped_young.append(cid)   # may be a launch from another process
+                    continue
+                doomed.append(cid)
+            present = len(set(jails) | set(vmms) | set(self._vms))
+            if len(doomed) > MASS_REMOVAL_MIN and len(doomed) > MASS_REMOVAL_FRACTION * present:
+                report.aborted = True
+                report.errors.append(f"refusing to remove {len(doomed)} of {present} VMs in one "
+                                     "sweep (database read looks wrong?)")
+                doomed = []
+            for cid in doomed:
+                try:
+                    pids = vmms.get(cid, [])
+                    vm = self._vms.pop(cid, None)
+                    if vm is not None and self._vmm_alive(vm.get("fc_pid"), cid):
+                        pids = list({*pids, vm["fc_pid"]})
+                    jail = (vm or {}).get("jail") or (jails[cid][0] if cid in jails else None)
+                    if vm is not None and vm.get("api") is not None:
+                        try:
+                            await vm["api"].close()
+                        except Exception:
+                            pass
+                    await self._kill_orphan(cid, pids, jail)
+                    (report.orphans_killed if pids else report.leftovers_removed).append(cid)
+                except Exception as exc:
+                    report.errors.append(f"{cid}: {exc}")
+            for cid, env in live.items():
+                if cid in skip:
+                    continue
+                try:
+                    vm = self._vms.get(cid)
+                    if vm is not None:
+                        if vm["info"].status in (VMStatus.RUNNING, VMStatus.PAUSED) \
+                                and not self._vmm_alive(vm.get("fc_pid"), cid):
+                            self._vms.pop(cid, None)
+                            await self._teardown({**vm, "fc_pid": None})
+                            report.dead.append(cid)
+                    elif cid in vmms:
+                        if await self._adopt(cid, vmms[cid][0], jails.get(cid, (None,))[0], env):
+                            report.adopted.append(cid)
+                        else:
+                            report.unresponsive.append(cid)
+                    else:
+                        report.dead.append(cid)    # DB says live, nothing is running
+                except Exception as exc:
+                    report.errors.append(f"{cid}: {exc}")
+        return report
 
     async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
         vm = self._vms.get(cell_id)

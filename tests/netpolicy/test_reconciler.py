@@ -17,6 +17,9 @@ class FakeNet:
     def __init__(self):
         self.calls, self.report, self.raise_exc = [], SweepReport(), None
 
+    def env_for(self, cell_id):
+        return {"http_proxy": f"http://proxy/{str(cell_id)[:4]}"}
+
     async def sweep(self, live, protected, grace):
         self.calls.append((live, protected, grace))
         if self.raise_exc:
@@ -176,3 +179,39 @@ async def test_stuck_in_flight_cells_lose_protection_and_are_marked_error(world)
         assert "stuck in 'creating'" in (await db.get(Cell, ids["creating"])).error_message
         assert (await db.get(Cell, ids["destroying"])).status == "error"
         assert (await db.get(Cell, ids["stopping"])).status == "stopping"
+
+
+class FakeEngine:
+    def __init__(self):
+        self.calls, self.report, self.raise_exc = [], None, None
+
+    async def reconcile(self, live, protected, grace):
+        self.calls.append((live, protected, grace))
+        if self.raise_exc:
+            raise self.raise_exc
+        return self.report
+
+
+@pytest.mark.asyncio
+async def test_engine_gets_live_cells_with_guest_env_and_broken_ones_are_marked(world, db_session):
+    from aijailer.engine.microvm import EngineSweepReport
+    sessions, ids, _ = world
+    eng, net = FakeEngine(), FakeNet()
+    eng.report = EngineSweepReport(dead=[ids["running"]], unresponsive=[ids["paused"]])
+    await NetworkReconciler(net, sessions, grace=9, engine=eng).run_once()
+    live, protected, grace = eng.calls[0]
+    assert set(live) == {ids["ready"], ids["running"], ids["paused"]} and grace == 9
+    assert live[ids["running"]]["http_proxy"].startswith("http://proxy/")   # network env merged
+    assert protected == {ids["creating"], ids["stopping"], ids["destroying"]}
+    async with sessions() as db:
+        for k, want in (("running", "error"), ("paused", "error"), ("ready", "ready")):
+            assert (await db.get(Cell, ids[k])).status == want
+
+
+@pytest.mark.asyncio
+async def test_engine_failure_does_not_break_the_network_sweep(world):
+    sessions, ids, _ = world
+    eng, net = FakeEngine(), FakeNet()
+    eng.raise_exc = RuntimeError("boom")
+    rec = NetworkReconciler(net, sessions, engine=eng)
+    assert await rec.run_once() is not None and len(net.calls) == 1 and rec.failures == 1
