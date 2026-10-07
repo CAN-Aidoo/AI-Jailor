@@ -3,8 +3,9 @@ owner/admin must not be able to raise the limits that bound them. Disabled (404)
 
 import hmac
 import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, StrictInt
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,3 +67,19 @@ async def reset_quotas(tenant_id: uuid.UUID, actor: str = Depends(require_operat
                        db: AsyncSession = Depends(get_db)):
     """Reset all four snapshot limits to the platform defaults."""
     return ApiResponse(data=_view(await TenantQuotaService(db).reset(tenant_id, actor)))
+
+
+@router.get("/tenants/{tenant_id}/quotas/audit", response_model=ApiResponse[dict])
+async def quota_audit(
+    tenant_id: uuid.UUID,
+    limit: int = Query(50, ge=1, le=500),
+    before: datetime | None = Query(None, description="Exclusive upper bound; use next_before"),
+    action: str | None = Query(None, description="quota_override_set | quota_override_reset"),
+    _: str = Depends(require_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """Who changed the tenant's snapshot quota limits, when, from what to what (newest first).
+    Read from the tenant's hash-chained audit log, which is verified on every call
+    (`chain_intact`). While the audit store is in-memory (`durable: false`) history before the
+    last restart is not available."""
+    return ApiResponse(data=await TenantQuotaService(db).history(tenant_id, limit, before, action))

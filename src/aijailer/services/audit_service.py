@@ -23,6 +23,8 @@ from aijailer.services.attestation import (
 class AuditService:
     """In-memory audit event store for MVP. Production uses ClickHouse."""
 
+    durable = False   # history is lost on restart; endpoints that serve it must say so
+
     def __init__(self, signer: Signer | None = None) -> None:
         self._events: list[AuditEvent] = []
         self._last_hash: dict[str, str] = {}  # per (tenant_id, cell_id) chain

@@ -167,3 +167,86 @@ async def test_update_takes_the_tenant_row_lock(monkeypatch):
     with pytest.raises(RuntimeError):
         await TenantQuotaService(Db()).get(uuid.uuid4())
     assert "FOR UPDATE" in seen[0] and "FOR UPDATE" not in seen[1]
+
+
+# ------------------------------------------------------------------ audit endpoint
+def aurl(tid):
+    return url(tid) + "/audit"
+
+
+@pytest.mark.asyncio
+async def test_audit_endpoint_needs_the_operator_token(client: AsyncClient, test_tenant, test_api_key, monkeypatch):
+    u = aurl(test_tenant.id)
+    assert (await client.get(u)).status_code == 401
+    assert (await client.get(u, headers={"Authorization": f"Bearer {test_api_key}"})).status_code == 401
+    assert (await client.get(u, headers=OP)).status_code == 200
+    monkeypatch.setenv("ADMIN_TOKEN", "")
+    assert (await client.get(u, headers=OP)).status_code == 404
+    monkeypatch.setenv("ADMIN_TOKEN", "op-secret")
+    assert (await client.get(aurl(uuid.uuid4()), headers=OP)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_history_lists_changes_newest_first_with_from_to_and_integrity(client: AsyncClient, test_tenant):
+    u = url(test_tenant.id)
+    await client.patch(u, headers=OP, json={"max_snapshot_count": 7})
+    await client.patch(u, headers=OP, json={"max_snapshot_count": 7})                  # no-op: no entry
+    await client.patch(u, headers=OP, json={"max_snapshot_count": 9, "max_snapshots_per_cell": 2})
+    await client.delete(u, headers=OP)
+    d = (await client.get(aurl(test_tenant.id), headers=OP)).json()["data"]
+    assert [e["action"] for e in d["events"]] == [
+        "quota_override_reset", "quota_override_set", "quota_override_set"]
+    reset, second, first = d["events"]
+    assert first["from"] == {"max_snapshot_count": 100} and first["to"] == {"max_snapshot_count": 7}
+    assert second["from"] == {"max_snapshot_count": 7, "max_snapshots_per_cell": 10}
+    assert second["to"] == {"max_snapshot_count": 9, "max_snapshots_per_cell": 2}
+    assert reset["to"] == {"max_snapshot_count": 100, "max_snapshots_per_cell": 10}   # only what changed
+    assert all(e["actor"] == "operator" and e["timestamp"].endswith("Z") for e in d["events"])
+    assert all(len(e["event_hash"]) == 64 for e in d["events"])
+    assert d["events"][0]["previous_hash"] == d["events"][1]["event_hash"]          # chained
+    assert d["chain_intact"] is True and d["durable"] is False and d["next_before"] is None
+
+
+@pytest.mark.asyncio
+async def test_history_is_per_tenant_and_excludes_other_event_kinds(client: AsyncClient, test_tenant, db_engine):
+    other = Tenant(name="o", slug=f"o-{uuid.uuid4().hex[:6]}", status="active", tier="pro", max_concurrent_cells=2)
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        s.add(other)
+        await s.commit()
+    await client.patch(url(other.id), headers=OP, json={"max_snapshot_count": 3})
+    await client.post("/v1/cells", json={"name": "c", "image": "base-python"})       # lifecycle event, other cell
+    d = (await client.get(aurl(test_tenant.id), headers=OP)).json()["data"]
+    assert d["events"] == []
+    assert len((await client.get(aurl(other.id), headers=OP)).json()["data"]["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_pagination_and_action_filter(client: AsyncClient, test_tenant):
+    u = url(test_tenant.id)
+    for n in (11, 12, 13, 14, 15):
+        await client.patch(u, headers=OP, json={"max_snapshot_count": n})
+    await client.delete(u, headers=OP)
+    got, before = [], None
+    while True:
+        q = f"?limit=2" + (f"&before={before}" if before else "")
+        d = (await client.get(aurl(test_tenant.id) + q, headers=OP)).json()["data"]
+        got += [e["id"] for e in d["events"]]
+        assert len(d["events"]) <= 2
+        before = d["next_before"]
+        if not before:
+            break
+    assert len(got) == 6 == len(set(got))                                  # every event once, no overlap
+    only = (await client.get(aurl(test_tenant.id) + "?action=quota_override_reset", headers=OP)).json()["data"]
+    assert [e["action"] for e in only["events"]] == ["quota_override_reset"]
+    for bad in ("?action=nope", "?limit=0", "?limit=501", "?before=notadate"):
+        assert (await client.get(aurl(test_tenant.id) + bad, headers=OP)).status_code in (400, 422), bad
+
+
+@pytest.mark.asyncio
+async def test_tampering_with_the_stored_history_is_reported(client: AsyncClient, test_tenant):
+    await client.patch(url(test_tenant.id), headers=OP, json={"max_snapshot_count": 7})
+    audit = get_audit_service()
+    ev = next(e for e in audit._events if e.tenant_id == test_tenant.id)
+    ev.details["to"] = {"max_snapshot_count": 100}                       # someone rewrites history
+    d = (await client.get(aurl(test_tenant.id), headers=OP)).json()["data"]
+    assert d["chain_intact"] is False

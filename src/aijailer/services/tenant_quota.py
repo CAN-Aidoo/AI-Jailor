@@ -7,6 +7,7 @@ reservation that is reading the limits."""
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -115,3 +116,38 @@ class TenantQuotaService:
                 details={"action": action, "actor": actor,
                          "from": {k: before[k] for k in changed}, "to": changed})
         return await self._state(t)
+
+    # ------------------------------------------------------------------ history
+    ACTIONS = ("quota_override_set", "quota_override_reset")
+
+    async def history(self, tenant_id: uuid.UUID, limit: int = 50, before: datetime | None = None,
+                      action: str | None = None) -> dict:
+        """Quota override changes, newest first, from the tenant's audit chain.
+
+        ``before`` is an exclusive upper bound (pass the previous page's ``next_before``). The
+        chain is verified on every call: ``chain_intact`` false means the stored history was
+        altered or truncated and the entries cannot be trusted. ``durable`` is false while the
+        audit store is in-memory: history older than the last restart is not available."""
+        if action is not None and action not in self.ACTIONS:
+            raise _err(f"action must be one of {', '.join(self.ACTIONS)}", "invalid_quota")
+        await self._tenant(tenant_id)
+        end = None
+        if before is not None:       # events carry naive UTC timestamps
+            end = before.astimezone(UTC).replace(tzinfo=None) if before.tzinfo else before
+        events = await self.audit.query_events(
+            tenant_id, cell_id=NIL, event_type=EventType.LIFECYCLE, end_time=end, limit=10**9)
+        wanted = (action,) if action else self.ACTIONS
+        events = [e for e in events if e.details.get("action") in wanted]
+        if end is not None:
+            events = [e for e in events if e.timestamp < end]            # exclusive
+        page, more = events[:limit], len(events) > limit
+        return {
+            "events": [{
+                "id": str(e.id), "timestamp": e.timestamp.isoformat() + "Z",
+                "action": e.details["action"], "actor": e.details.get("actor"),
+                "from": e.details.get("from"), "to": e.details.get("to"),
+                "previous_hash": e.previous_hash, "event_hash": e.event_hash} for e in page],
+            "next_before": page[-1].timestamp.isoformat() + "Z" if more else None,
+            "chain_intact": await self.audit.verify_chain(tenant_id, NIL),
+            "durable": bool(getattr(self.audit, "durable", False)),
+        }
