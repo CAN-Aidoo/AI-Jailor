@@ -19,6 +19,9 @@ mkdir -p "$OUT"; cd "$OUT"
 echo "$SHA256  ubuntu.squashfs" | sha256sum -c - >/dev/null || { echo "CHECKSUM MISMATCH" >&2; exit 1; }
 rm -rf tree && unsquashfs -q -d tree ubuntu.squashfs
 install -D -m 0755 "$AGENT" tree/sbin/aijailer-agent
+# Peer-link client (PEER_LINKS.md): optional, installed when built next to the agent.
+PEER="$(dirname "$AGENT")/aijailer-peer"
+[ -x "$PEER" ] && install -D -m 0755 "$PEER" tree/usr/sbin/aijailer-peer
 # Unprivileged workload user. The agent refuses to run workloads as uid 0. The uid must be FREE in the
 # base image: the CI rootfs already has `ubuntu` at 1000, and sharing a uid would hand the workload
 # that user's files.

@@ -803,3 +803,21 @@ creating/stopping/destroying/destroyed/error cells return 409.
 Response: `{configured: {down_kbit, up_kbit}, source: "default"|"override", enforced: {...}|null, min_kbit, max_kbit}`
 (`enforced` is null when the cell currently has no network). Errors: 400 `invalid_bandwidth`, 404, 409 `invalid_state_transition`,
 502 `bandwidth_apply_failed` (nothing was persisted), 503 `cell_network_unavailable`.
+
+## Peer links (`/v1/peer-links`)
+
+Attested, end-to-end encrypted cell-to-cell channels with two-sided consent. Full description, wire
+protocol and threat model: PEER_LINKS.md. All routes need `PEER_ATTESTATION_SECRET` (else 503
+`peer_links_disabled`). Writers: owner/admin; readers: owner/admin/auditor.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/peer-links` | body `{cell_id, peer_cell_id, ttl_seconds?, purpose?}`; 201; `pending` unless both cells are yours |
+| GET | `/v1/peer-links` | links you are a party to; `?include_inactive=true` adds revoked/expired |
+| GET | `/v1/peer-links/{id}` | 404 for non-parties |
+| POST | `/v1/peer-links/{id}/accept` | responder cell's tenant only |
+| DELETE | `/v1/peer-links/{id}` | either party; cuts a live session |
+| GET | `/v1/peer-links/attestation-key` | platform Ed25519 public key (base64 raw) |
+
+Error codes: `peer_link_not_found` 404, `peer_link_invalid` 400, `peer_link_conflict` 409,
+`peer_link_limit` 429, `peer_links_disabled` 503.

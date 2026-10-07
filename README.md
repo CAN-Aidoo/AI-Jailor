@@ -92,6 +92,7 @@ AI Jailer provides microVM-based isolation where every agent session runs in its
 | [API_DOCUMENTATION.md](./API_DOCUMENTATION.md) | REST, gRPC, and WebSocket API specs |
 | [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md) | Database design and data models |
 | [AUDIT_SYSTEM.md](./AUDIT_SYSTEM.md) | Audit logging and compliance framework |
+| [PEER_LINKS.md](./PEER_LINKS.md) | Attested, end-to-end encrypted cell-to-cell channels (two-sided consent, threat model) |
 | [STATE_MANAGEMENT.md](./STATE_MANAGEMENT.md) | Snapshot, restore, and persistent state |
 | [RESOURCE_MANAGEMENT.md](./RESOURCE_MANAGEMENT.md) | Quotas, metering, and cost controls |
 | [SDK_SPECIFICATION.md](./SDK_SPECIFICATION.md) | Client SDK design for Python, Node, Go |

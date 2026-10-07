@@ -557,3 +557,11 @@ All schema changes managed via Alembic (SQLAlchemy migrations):
 previous_hash, event_hash)` with `UNIQUE (tenant_id, cell_id, seq)`; `audit_checkpoints(id, tenant_id, cell_id, length, head,
 key_id, envelope, created_at)`. Append-only (PostgreSQL triggers reject UPDATE/DELETE). See AUDIT_SYSTEM.md.
 
+
+### peer_links (migration 008)
+
+One row per consented cell-to-cell link: `id`, `initiator_tenant_id`/`initiator_cell_id`,
+`responder_tenant_id`/`responder_cell_id`, `status` (`pending`|`active`|`revoked`, check-constrained),
+`purpose` (<= 64), `created_at`, `accepted_at`, `expires_at`, `revoked_at`, `revoked_by_tenant_id`.
+Check: initiator and responder cells differ. Indexes on both tenants and both cells. Expiry is evaluated
+at read time and at every relay attach; there is no cleanup dependency. See PEER_LINKS.md.
