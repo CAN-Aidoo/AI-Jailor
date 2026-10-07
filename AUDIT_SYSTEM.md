@@ -424,6 +424,14 @@ commit before reporting success (the admin routes do, so a `200` means durable).
 the memory backend accepts the argument and ignores it. A caller that holds a row lock (the quota change holds the tenant
 row) holds it until commit, which is the intended serialisation. Not exercised against PostgreSQL by the test suite.
 
+Concurrency is tested by invariants, not timing (`tests/api/test_quota_concurrency.py`): 40 random concurrent PATCH/DELETEs
+must replay, in audit order from the defaults, to exactly the stored limits with every event's `from` equal to the state at
+that point (no lost update, no change based on a stale read, no unrecorded change); 30 writers to one field leave a single
+linear chain of values; quota events and other writers on the same chain lose nothing and leave `seq` gap-free; and while an
+operator lowers a limit, parallel snapshot creations never exceed the limit in force and leave no dangling reservation.
+SQLite has no row locks, so those tests run every transaction as `BEGIN IMMEDIATE` (a coarser, database-wide stand-in for
+the tenant row's `FOR UPDATE`): they verify the logic built on top of the lock, not the PostgreSQL lock itself.
+
 #### Group commit (batched writes)
 
 `submit_event` queues the event; a background writer commits everything pending in **one transaction** (all chains in
