@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aijailer.api.middleware.auth import AuthContext, authenticate
+from aijailer.core.exceptions import AiJailerError
 from aijailer.db.base import get_db
 from aijailer.schemas.common import ApiResponse
 from aijailer.schemas.snapshots import (
@@ -14,8 +15,15 @@ from aijailer.schemas.snapshots import (
     RestoreRequest,
     SnapshotResponse,
 )
+from aijailer.services.snapshot_service import SnapshotService
 
 router = APIRouter(tags=["Snapshots"])
+
+
+def _view(s) -> SnapshotResponse:
+    return SnapshotResponse(
+        id=s.id, cell_id=s.cell_id, name=s.name, description=s.description, status=s.status,
+        total_size_bytes=s.total_size_bytes, created_at=s.created_at, completed_at=s.completed_at)
 
 
 @router.post(
@@ -29,45 +37,11 @@ async def create_snapshot(
     auth: AuthContext = Depends(authenticate),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a snapshot of a cell.
-
-    In production:
-    1. Pause VM via Firecracker API
-    2. Dump memory state
-    3. Snapshot overlay filesystem + persistent volume
-    4. Upload to object storage
-    5. Resume VM
-    """
-    from datetime import datetime, timezone
-
-    from aijailer.models.snapshot import Snapshot
-
-    snapshot = Snapshot(
-        tenant_id=auth.tenant_id,
-        cell_id=cell_id,
-        name=body.name,
-        description=body.description,
-        status="creating",
-        cell_config={},
-    )
-    db.add(snapshot)
-    await db.flush()
-
-    # MVP: Immediately mark as available
-    snapshot.status = "available"
-    snapshot.completed_at = datetime.now(timezone.utc)
-
-    return ApiResponse(
-        data=SnapshotResponse(
-            id=snapshot.id,
-            cell_id=snapshot.cell_id,
-            name=snapshot.name,
-            description=snapshot.description,
-            status=snapshot.status,
-            created_at=snapshot.created_at,
-            completed_at=snapshot.completed_at,
-        )
-    )
+    """Snapshot a running/paused cell (memory + VM state + disk). The guest is paused briefly
+    and resumed. Backends without snapshot support answer 501."""
+    snap = await SnapshotService(db).create_snapshot(
+        cell_id, auth.tenant_id, body.name, body.description)
+    return ApiResponse(data=_view(snap))
 
 
 @router.get(
@@ -84,24 +58,9 @@ async def list_snapshots(
     from aijailer.models.snapshot import Snapshot
 
     result = await db.execute(
-        select(Snapshot).where(
-            Snapshot.cell_id == cell_id, Snapshot.tenant_id == auth.tenant_id
-        )
-    )
-    snapshots = result.scalars().all()
-    return ApiResponse(
-        data=[
-            SnapshotResponse(
-                id=s.id,
-                cell_id=s.cell_id,
-                name=s.name,
-                status=s.status,
-                created_at=s.created_at,
-                completed_at=s.completed_at,
-            )
-            for s in snapshots
-        ]
-    )
+        select(Snapshot).where(Snapshot.cell_id == cell_id, Snapshot.tenant_id == auth.tenant_id)
+        .order_by(Snapshot.created_at))
+    return ApiResponse(data=[_view(s) for s in result.scalars().all()])
 
 
 @router.post("/v1/cells/{cell_id}/restore", response_model=ApiResponse[dict])
@@ -111,14 +70,16 @@ async def restore_cell(
     auth: AuthContext = Depends(authenticate),
     db: AsyncSession = Depends(get_db),
 ):
-    """Restore a cell from a snapshot."""
-    return ApiResponse(
-        data={
-            "cell_id": str(cell_id),
-            "snapshot_id": body.snapshot_id,
-            "status": "restoring",
-        }
-    )
+    """Restore the cell from one of ITS snapshots. Destructive: the cell's current VM is
+    replaced. Keeps the cell's current security policy and bandwidth. 409 if the snapshot's
+    guest address is held by another cell."""
+    try:
+        snapshot_id = uuid.UUID(body.snapshot_id)
+    except ValueError:
+        raise AiJailerError("snapshot_id is not a valid id", code="snapshot_not_found") from None
+    cell = await SnapshotService(db).restore_cell(cell_id, auth.tenant_id, snapshot_id)
+    return ApiResponse(data={"cell_id": str(cell.id), "snapshot_id": str(snapshot_id),
+                             "status": cell.status})
 
 
 @router.post(
@@ -132,11 +93,46 @@ async def clone_from_snapshot(
     auth: AuthContext = Depends(authenticate),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new cell from a snapshot."""
-    return ApiResponse(
-        data={
-            "snapshot_id": str(snapshot_id),
-            "name": body.name,
-            "status": "creating",
-        }
-    )
+    """New cell from a snapshot. Keeps the snapshot's resources (``resources`` is rejected) and
+    its guest address, so it works only while no other cell holds that address."""
+    policy = None
+    if body.security_policy_id:
+        try:
+            policy = uuid.UUID(body.security_policy_id)
+        except ValueError:
+            raise AiJailerError("security_policy_id is not a valid id",
+                                code="policy_not_found") from None
+    cell = await SnapshotService(db).clone_snapshot(
+        snapshot_id, auth.tenant_id, body.name, policy,
+        resources_requested=body.resources is not None)
+    return ApiResponse(data={"id": str(cell.id), "cell_id": str(cell.id),
+                             "snapshot_id": str(snapshot_id), "name": cell.name,
+                             "status": cell.status})
+
+
+@router.get("/v1/snapshots/quota", response_model=ApiResponse[dict])
+async def snapshot_quota(
+    cell_id: uuid.UUID | None = None,
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """The tenant's snapshot usage against its limits (count and total bytes; in-flight
+    snapshots are counted at their reserved size). With ``cell_id`` it also reports that cell's
+    count and bytes against the per-cell limits."""
+    q = await SnapshotService(db).quota(auth.tenant_id, cell_id)
+    data = {"count": q.count, "max_count": q.max_count,
+            "bytes_used": q.bytes_used, "max_bytes": q.max_bytes}
+    if cell_id is not None:
+        data.update(cell_count=q.cell_count, max_per_cell=q.max_per_cell,
+                    cell_bytes=q.cell_bytes, max_bytes_per_cell=q.max_bytes_per_cell)
+    return ApiResponse(data=data)
+
+
+@router.delete("/v1/snapshots/{snapshot_id}", status_code=204)
+async def delete_snapshot(
+    snapshot_id: uuid.UUID,
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a snapshot and its stored data; frees quota."""
+    await SnapshotService(db).delete_snapshot(snapshot_id, auth.tenant_id)

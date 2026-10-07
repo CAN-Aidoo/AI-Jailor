@@ -366,3 +366,92 @@ The hash chain verification process detects any gaps in the event stream. If a g
 2. Gap metadata recorded (which events are missing, time range).
 3. Recovery attempted from node-local buffers if available.
 4. Compliance reports for the affected time range flagged with a gap warning.
+
+## Current implementation: database-backed log (what actually runs today)
+
+The Kafka -> ClickHouse pipeline above is the target architecture. Today the audit log is written **directly to the
+application database** by `AuditService` (`services/audit_service.py`) through a pluggable store
+(`services/audit_store.py`):
+
+| `AUDIT_BACKEND` | Behaviour |
+|---|---|
+| `auto` (default) | `memory` when `AIJAILER_ENV=dev`, otherwise `db` |
+| `db` | `audit_events` + `audit_checkpoints` tables (migration `007_audit_log`) |
+| `memory` | volatile; history is lost on restart (a warning is logged outside dev; `durable: false` in API responses) |
+
+**Chains.** One hash chain per (tenant, cell); non-cell events (secrets, quota changes) use the nil cell id. Each event
+hashes every field plus its predecessor's hash, and has a per-chain `seq`. `UNIQUE (tenant_id, cell_id, seq)` is the write
+lock: two writers extending the same head cannot both succeed, the loser re-reads the head and retries (so concurrent
+writers never fork or lose a chain). Each append is its own short transaction on its own session, so an audit record
+survives a request that later rolls back, and never depends on one. A failed append raises: the operation that needed
+the record is not silently unaudited.
+
+**Append-only.** On PostgreSQL the migration installs `BEFORE UPDATE OR DELETE` triggers that reject any change to
+`audit_events` and `audit_checkpoints`, even from the application role. Retention or erasure therefore needs a deliberate
+privileged procedure (disable the trigger, re-anchor the chain, record that you did). *Not exercised by the test suite*
+(SQLite has no such triggers); verify on your Postgres.
+
+**Checkpoints.** A bare hash chain cannot see tail truncation or a consistent rebuild of the whole chain. A background task
+(`AUDIT_CHECKPOINT_INTERVAL_SECONDS`, default 300, plus a final pass on clean shutdown) signs (head hash, length) with
+Ed25519 (DSSE/in-toto) for every chain that grew and stores it. `verify` checks every link, every hash, and that each
+checkpoint's head is still at its position. Deleting head or middle rows, editing any field, truncating after a checkpoint
+and rebuilding consistently are all detected (tests); events written after the last checkpoint can still be truncated
+undetected, bounded by the interval.
+
+**Signing key.** `AUDIT_SIGNING_SECRET` derives the key (HKDF). It is **required** with the database backend outside dev:
+an ephemeral key would orphan every earlier checkpoint on restart and silently disable truncation detection (startup
+fails instead). Checkpoints signed by a different key (after rotating the secret) are reported as
+`checkpoints_unverifiable`, not trusted and not counted as tampering; anyone who holds the signing secret AND database
+write access can forge history, so keep the secret out of the database's reach (secret manager / KMS).
+
+**Limits.** Verification streams a chain in pages of 5000 but is O(chain length). Per-event writes are the default for
+anything that must survive a crash; see group commit below for high-volume events.
+
+### Durability levels and group commit
+
+Three ways to record an event, chosen by the caller (strongest last in the table's reading order of guarantees):
+
+| | `submit_event(...)` | `record_event(...)` (default) | `record_event(..., session=db)` |
+|---|---|---|---|
+| Returns | immediately (sync, no await); `False` if dropped | after its own commit; the stored event | after the insert in the caller's transaction |
+| Durable | **no** (lost on a crash, batched) | yes, on its own | exactly when the caller commits |
+| Atomic with the change it describes | no | **no**: a later rollback leaves the event, a failed audit write after the change leaves it unaudited | **yes**: both commit or both roll back |
+| Use for | per-request network decisions (the proxy sink) | lifecycle, secrets: anything that must survive a crash | changes whose record must never disagree with reality: **tenant quota overrides** |
+
+Transactional mode (`session=`): the event is inserted inside a SAVEPOINT in the caller's transaction, so losing the
+(tenant, cell, seq) race to another writer retries only that insert and keeps the caller's other work. The caller must
+commit before reporting success (the admin routes do, so a `200` means durable). Only the database backend can do this;
+the memory backend accepts the argument and ignores it. A caller that holds a row lock (the quota change holds the tenant
+row) holds it until commit, which is the intended serialisation. Not exercised against PostgreSQL by the test suite.
+
+Concurrency is tested by invariants, not timing (`tests/api/test_quota_concurrency.py`): 40 random concurrent PATCH/DELETEs
+must replay, in audit order from the defaults, to exactly the stored limits with every event's `from` equal to the state at
+that point (no lost update, no change based on a stale read, no unrecorded change); 30 writers to one field leave a single
+linear chain of values; quota events and other writers on the same chain lose nothing and leave `seq` gap-free; and while an
+operator lowers a limit, parallel snapshot creations never exceed the limit in force and leave no dangling reservation.
+SQLite has no row locks, so those tests run every transaction as `BEGIN IMMEDIATE` (a coarser, database-wide stand-in for
+the tenant row's `FOR UPDATE`): they verify the logic built on top of the lock, not the PostgreSQL lock itself.
+
+#### Group commit (batched writes)
+
+`submit_event` queues the event; a background writer commits everything pending in **one transaction** (all chains in
+one commit) once `AUDIT_BATCH_MAX_EVENTS` (200) are queued or `AUDIT_BATCH_MAX_DELAY_MS` (500) after the oldest. The
+event keeps the time it *happened*. Measured on SQLite (WAL, local disk, 2000 events over 20 chains): 316 events/s with a
+commit per event vs ~6000 events/s with group commit (callers blocked ~6 us per event). PostgreSQL over a network was not
+measured; the gain there comes from the same place (one round trip and one fsync per batch instead of per event).
+
+What it trades away, deliberately and visibly:
+* **Crash window.** A hard crash loses what is still queued (at most the delay). A clean shutdown drains the queue
+  (`close()`, before the final checkpoint pass).
+* **Backpressure = drop, never block.** The queue is bounded (`AUDIT_BATCH_QUEUE_MAX`, 10000). When full, the *newest*
+  events are dropped, counted (`aijailer_audit_events_dropped_total`), logged, and the next write adds an
+  `audit_events_dropped` marker (critical, with the count) **to the affected chain**: a gap is part of the signed record,
+  never silent. Alert: `AuditEventsDropped`.
+* **Database outage.** The batch stays queued (up to the bound) and is retried with backoff; counters
+  `..._flush_failures_total` and alert `AuditBatchWritesFailing`/`AuditBatchBacklog` say so.
+* **Order.** Within a chain, order is submission order. A durable `record_event` flushes the queue first, so a chain never
+  reorders what happened; `query_events`, `verify` and `checkpoint` flush first too (read-your-writes in-process).
+  Other processes see an event only after its flush.
+* **Atomicity.** A batch is all-or-nothing; on a sequence conflict with another writer the whole batch is rebuilt on the
+  new heads and retried.
+

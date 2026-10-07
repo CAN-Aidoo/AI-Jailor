@@ -6,18 +6,22 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from aijailer.core.config import get_settings
 from aijailer.core.exceptions import AiJailerError
 from aijailer.core.logging import configure_logging
+from aijailer.db.base import get_db
 
 from aijailer.api.routes import (
     cells,
     execution,
     policies,
+    secrets as secrets_route,
     audit,
     files,
     snapshots,
@@ -35,7 +39,9 @@ from aijailer.api.routes import (
     constraints as constraints_route,
     immune as immune_route,
     compliance as compliance_route,
+    admin as admin_route,
     metrics as metrics_route,
+    peer_links as peer_links_route,
 )
 
 logger = structlog.get_logger(__name__)
@@ -52,9 +58,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # In-memory stores for MVP
     app.state.rate_limit_store = {}
 
+    # Host network enforcement: required for engines that attach a NIC. Failing to install
+    # the firewall aborts startup (fail closed).
+    from aijailer.engine.microvm import get_microvm_engine
+    from aijailer.netpolicy.runtime import start_network_runtime
+
+    from aijailer.db.base import async_session_factory
+
+    from aijailer.secretstore.runtime import startup_check
+
+    await startup_check()
+
+    # Audit log: build now so a misconfiguration (e.g. no signing secret with the database
+    # backend) stops startup instead of the first request; checkpoint durable chains periodically.
+    from aijailer.services.audit_service import AuditCheckpointer, get_audit_service
+
+    audit = get_audit_service()
+    checkpointer = None
+    if audit.durable:
+        checkpointer = AuditCheckpointer(audit, settings.audit_checkpoint_interval_seconds)
+        checkpointer.start()
+    net_runtime = await start_network_runtime(
+        get_microvm_engine(), session_factory=async_session_factory)
+
     yield
 
     # Shutdown
+    await audit.close()                    # drain batched events before the final checkpoint pass
+    if checkpointer is not None:
+        await checkpointer.stop()
+    if net_runtime is not None:
+        await net_runtime.stop()
     app.state.rate_limit_store.clear()
     logger.info("app.shutdown")
 
@@ -106,12 +140,37 @@ def create_app() -> FastAPI:
     )
 
     # --- Exception handlers ---
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        """Same shape as FastAPI's default 422, minus ``input``/``ctx``: pydantic reports the
+        WHOLE request body for a missing field, which would echo secrets (secret values, cell
+        environment variables) into responses, proxies and error trackers."""
+        errors = [{"type": e.get("type"), "loc": list(e.get("loc", [])), "msg": e.get("msg")}
+                  for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": errors})
+
     @app.exception_handler(AiJailerError)
     async def aijailer_error_handler(request: Request, exc: AiJailerError):
         status_map = {
             "cell_not_found": 404,
             "policy_not_found": 404,
             "snapshot_not_found": 404,
+            "peer_link_not_found": 404,
+            "peer_link_invalid": 400,
+            "peer_link_conflict": 409,
+            "peer_link_limit": 429,
+            "peer_links_disabled": 503,
+            "tenant_not_found": 404,
+            "invalid_quota": 400,
+            "snapshot_not_available": 409,
+            "snapshot_address_in_use": 409,
+            "snapshot_cell_mismatch": 400,
+            "invalid_clone": 400,
+            "snapshot_corrupt": 422,
+            "snapshot_unsupported": 501,
+            "snapshot_failed": 502,
+            "snapshot_delete_failed": 500,
+            "restore_failed": 502,
             "image_not_found": 404,
             "cell_not_running": 409,
             "invalid_state_transition": 409,
@@ -124,6 +183,14 @@ def create_app() -> FastAPI:
             "unauthorized": 401,
             "forbidden": 403,
             "invalid_policy": 400,
+            "invalid_bandwidth": 400,
+            "cell_network_unavailable": 503,
+            "bandwidth_apply_failed": 502,
+            "secret_not_found": 404,
+            "secret_conflict": 409,
+            "secret_limit": 429,
+            "invalid_secret": 400,
+            "secret_store_unavailable": 503,
             "internal_error": 500,
         }
         status_code = status_map.get(exc.code, 500)
@@ -202,6 +269,7 @@ def create_app() -> FastAPI:
     app.include_router(cells.router)
     app.include_router(execution.router)
     app.include_router(policies.router)
+    app.include_router(secrets_route.router)
     app.include_router(audit.router)
     app.include_router(files.router)
     app.include_router(snapshots.router)
@@ -218,6 +286,32 @@ def create_app() -> FastAPI:
     app.include_router(immune_route.router)
     app.include_router(compliance_route.router)
     app.include_router(metrics_route.router)
+    app.include_router(admin_route.router)
+    app.include_router(peer_links_route.router)
+
+    # --- Prometheus (operator): disabled unless METRICS_TOKEN is set ---
+    @app.get("/metrics", tags=["System"], include_in_schema=False)
+    async def prometheus_metrics(request: Request, db: AsyncSession = Depends(get_db)):
+        import hmac
+
+        from fastapi.responses import PlainTextResponse
+
+        from aijailer.core import promtext
+        from aijailer.core.config import get_settings
+        from aijailer.services import quota_metrics
+
+        token = get_settings().metrics_token
+        if not token:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        given = request.headers.get("authorization", "")
+        if not hmac.compare_digest(given.encode(), f"Bearer {token}".encode()):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"},
+                                headers={"WWW-Authenticate": "Bearer"})
+        from aijailer.services.audit_service import get_audit_service
+
+        body = await quota_metrics.collect(db) + promtext.render(
+            get_audit_service().prometheus_families())
+        return PlainTextResponse(body, media_type=promtext.CONTENT_TYPE)
 
     # --- Health check ---
     @app.get("/health", tags=["System"])

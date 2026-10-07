@@ -174,3 +174,44 @@ class TestCertificateSigning:
             tenant_id="tenant-abc",
         )
         assert cert is not None
+
+
+class TestAttestationIntegrity:
+    """Signature is real: tampering, wrong key and expiry must fail."""
+
+    def _issue(self, gen, code="def f(): return 1"):
+        return gen.generate(code=code, intent=_make_intent(), constraints_applied=["x"],
+                            components_used=[], tenant_id="t")
+
+    def test_verifies(self, generator):
+        cert = self._issue(generator)
+        assert generator.verify(cert, code="def f(): return 1")
+
+    def test_code_swap_detected(self, generator):
+        cert = self._issue(generator)
+        assert not generator.verify(cert, code="def f(): return 2")
+
+    def test_field_tamper_detected(self, generator):
+        cert = self._issue(generator)
+        cert.constraints_applied = []
+        assert not generator.verify(cert)
+
+    def test_hash_tamper_detected(self, generator):
+        cert = self._issue(generator)
+        cert.code_hash = "sha256:" + "0" * 64
+        assert not generator.verify(cert)
+
+    def test_other_key_rejects(self, generator):
+        cert = self._issue(generator)
+        other = CertificateGenerator(signing_key="a-different-key-material-xxxxxxxx")
+        assert not other.verify(cert)
+
+    def test_expired(self, generator):
+        from datetime import datetime, timedelta, timezone
+        cert = self._issue(generator)
+        assert not generator.verify(cert, now=datetime.now(timezone.utc) + timedelta(days=400))
+
+    def test_unsigned_rejected(self, generator):
+        cert = self._issue(generator)
+        cert.attestation = None
+        assert not generator.verify(cert)

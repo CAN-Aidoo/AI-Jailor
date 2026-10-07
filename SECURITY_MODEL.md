@@ -58,7 +58,7 @@ AI Jailer's entire value proposition is security. Every architectural decision i
 **Mitigations**:
 - No shared kernel between cells (each has its own)
 - No shared memory between cells (separate EPT page tables)
-- No cell-to-cell network by default (cells cannot discover each other's IPs)
+- No cell-to-cell network by default (cells cannot discover each other's IPs). The one explicit exception is a consented peer link, which is never IP connectivity between cells; see "Peer links and the PSI example workload"
 - Each cell's TAP device has isolated nftables rules
 - Separate block devices per cell (no shared storage)
 - Base images are read-only — no write contamination between cells
@@ -179,6 +179,92 @@ AI Jailer's entire value proposition is security. Every architectural decision i
 - API anomaly detection (unusual request patterns)
 - Authentication failure monitoring
 - Infrastructure change monitoring
+
+## Peer links and the PSI example workload
+
+A peer link (PEER_LINKS.md) lets two specific cells exchange data through the platform. It is a deliberate,
+narrow exception to T2 (no cell-to-cell network) and it is also a data channel, so it belongs in the T4
+analysis. The reference PSI workload (`examples/psi/`) is the worked example of using it.
+
+### What the exception is, and is not
+
+- **Not IP connectivity.** Cells still cannot see or address each other. Each cell opens a CONNECT to a
+  reserved name on its *own* proxy; the platform relay pairs the two sides. nftables isolation is unchanged.
+- **Consent from both owners**, re-checked on every connection (link active, unexpired, both cells running,
+  both still owned by the agreed tenants). Either party can revoke at any time and a live session is cut at
+  once. Links between two cells of one tenant need no second consent. A link is revoked automatically when
+  either cell stops or is destroyed.
+- **Bounded**: one open link per cell pair, a per-tenant limit on open links, and per-session lifetime, idle
+  and byte limits (defaults: 1 hour, 5 minutes, 1 GiB).
+- **Audited** on both tenants' hash chains: the link lifecycle, and one network event per session with the
+  bytes moved each way.
+
+### Residual risks
+
+| Risk | Detail | Mitigation |
+|---|---|---|
+| Exfiltration to the peer | A peer link is an opaque channel. A compromised or malicious cell can send anything to the peer cell, and the egress broker's content and credential checks do not see it. | The peer's owner has consented to receive from that cell; the link is scoped to one cell pair, time-limited, byte-capped and revocable. Do not link a cell that holds data it must never release. |
+| Platform man-in-the-middle | Identity rests on the platform's signed attestation. A compromised platform could attest a certificate it controls. | Pin the peer's certificate hash out of band (`aijailer-peer --identity-file`, `--pin`). The platform then cannot impersonate either side. |
+| Operator visibility | The operator sees who connects to whom, when, and how many bytes; it can deny service. | Stated trust model: the operator is trusted for availability and metadata, not for the content of the exchange. The operator can still read cell memory (T7). |
+| Peer misbehaviour | The link authenticates the peer; it does not make the peer honest. | Application-level protocol design (see below). |
+| Local socket takeover | `aijailer-peer --listen` serves one local TCP connection and does not authenticate it: the first process in the cell to connect becomes the channel's endpoint, and any process in the cell can reach it. | The link authenticates the *cell*, not processes inside it, so this is within the trust model. Bind `127.0.0.1` only, start the workload right after the helper's `listening` event, or use `--stdio` from a parent process (no listening socket). Do not put mutually untrusting workloads in one cell that shares a peer link. |
+
+### Loopback inside the cell
+
+The guest init brings the cell's loopback interface up (`bringUpLoopback`, `guest-agent/init_linux.go`); a
+freshly booted kernel starts with `lo` down, which made `127.0.0.1` unreachable and broke the local hand-off
+to `aijailer-peer` (see NETWORKING.md). Turning it on is a deliberate, small change to what code inside a cell
+can do, so its security effect is stated here.
+
+- **No new host-facing surface.** Loopback traffic stays inside the guest kernel. It never crosses the TAP, so
+  it is invisible to the host's nftables rules, which filter the cell's `aj*` interface and are unchanged. A
+  service bound to `127.0.0.1` is not reachable from outside the cell.
+- **Not a trust boundary.** Processes in a cell share one trust domain, and the untrusted agent code is the
+  workload itself. With loopback up it can run local servers and talk to other processes in its own cell, and it
+  can connect to the peer helper's local socket (see "Residual risks"). It could already share data between its
+  own processes through files, pipes and sockets; loopback adds no capability that crosses the cell boundary.
+- **The workload cannot control the interface.** It runs as a non-root user with `no_new_privs`, so it cannot
+  reconfigure interfaces. Checked: as the unprivileged `agent` uid (3000) in the guest rootfs, `lo` reads as up
+  and an attempt to bring it down fails with `EPERM`.
+- **Fails closed.** If bringing `lo` up fails, the init logs it and carries on; localhost then stays unreachable
+  and local helpers break loudly (`Network is unreachable`). It never widens access.
+- **Not audited.** Loopback traffic between processes in a cell is not logged or visible to the platform, like
+  other intra-cell activity. Only what leaves the cell (through the broker or a peer link) is audited.
+- **Guest kernel surface.** Loopback TCP uses the same in-guest network stack that `eth0` already exposes to the
+  workload, so it should add no new kernel code path of note (reasoning, not measured); guest-kernel exploitation remains covered by T1.
+
+### PSI workload
+
+`psi.py` computes a two-party private set intersection over the link: the receiver learns which of its items
+the sender also has, the sender learns only the receiver's set size, and neither learns the other's other
+items. The platform never sees items, blinded values or the result; they are inside end-to-end TLS 1.3.
+
+Security properties and limits of the demo (full list in `examples/psi/README.md`):
+- **Semi-honest only.** A malicious sender can lie about its set or the results; nothing proves it used the
+  set it claims. Do not treat the output as authenticated against a hostile peer.
+- **Low-entropy identifiers can be enumerated.** The receiver may submit any items, so with phone numbers,
+  e-mail addresses or small ID ranges it can test every candidate and learn the sender's whole set. This is
+  inherent to PSI. Use high-entropy identifiers or restrict what each side may submit.
+- **Hostile input is handled safely**: every received element must be a quadratic residue other than 1 and
+  p-1 (rejects small-subgroup elements that could leak key bits), counts are bounded before allocation, and
+  malformed or truncated frames end the run with an error.
+- **Sizes leak** to both parties and, through relay byte counts in the audit log, approximately to the
+  operator and auditors (the frames are about 256 bytes per element). Pad the sets if this matters.
+- Not constant-time, pure-Python, and demo-grade (about 0.1 s per item pair). For production use a reviewed
+  PSI library.
+
+### What has and has not been verified
+
+Verified: protocol and hostile-input tests (eight deliberately broken variants are each caught); the whole
+stack (PSI, `aijailer-peer`, the real proxy and relay, mutual TLS); and a run with both programs executing
+in the guest rootfs's userland as the unprivileged `agent` user. That last run was a chroot, not a booted
+cell: no microVM boundary, guest agent, seccomp or egress firewall was involved.
+For loopback: unit tests in a fresh network namespace, the real agent run as PID 1 in fresh PID, mount and
+network namespaces inside the guest rootfs, and the `EPERM` check as uid 3000 (a plain uid check, not under the
+agent's full hardening).
+Not verified: peer links, PSI or the loopback change inside a real Firecracker cell (no KVM was available; a fresh
+network namespace is assumed to mirror a freshly booted kernel's `lo` state), the claim that loopback adds no
+notable guest-kernel surface (reasoning, not measured), and the PostgreSQL paths of the peer-link lifecycle.
 
 ## Security Policy Framework
 

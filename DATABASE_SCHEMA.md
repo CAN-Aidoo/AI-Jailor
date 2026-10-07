@@ -29,6 +29,9 @@ CREATE TABLE tenants (
     max_concurrent_cells INTEGER NOT NULL DEFAULT 10,
     max_persistent_storage_gb INTEGER NOT NULL DEFAULT 50,
     max_snapshot_count INTEGER NOT NULL DEFAULT 100,
+    max_snapshots_per_cell INTEGER NOT NULL DEFAULT 10,
+    max_snapshot_storage_per_cell_gb INTEGER NOT NULL DEFAULT 10,
+    max_snapshot_storage_gb INTEGER NOT NULL DEFAULT 50,  -- total snapshot bytes
     spending_cap_cents INTEGER,  -- NULL = no cap
 
     -- Settings
@@ -547,3 +550,36 @@ All schema changes managed via Alembic (SQLAlchemy migrations):
 - Every migration is tested against a production-like dataset before deployment.
 - Zero-downtime migrations only (no table locks on large tables).
 - New columns added as nullable first, backfilled, then made non-nullable.
+
+### audit_events / audit_checkpoints (migration 007)
+
+`audit_events(id, tenant_id, cell_id, seq, event_type, severity, timestamp, details, source_ip, api_key_id, request_id,
+previous_hash, event_hash)` with `UNIQUE (tenant_id, cell_id, seq)`; `audit_checkpoints(id, tenant_id, cell_id, length, head,
+key_id, envelope, created_at)`. Append-only (PostgreSQL triggers reject UPDATE/DELETE). See AUDIT_SYSTEM.md.
+
+
+### peer_links (migration 008)
+
+One row per consented cell-to-cell link: `id`, `initiator_tenant_id`/`initiator_cell_id`,
+`responder_tenant_id`/`responder_cell_id`, `status` (`pending`|`active`|`revoked`, check-constrained),
+`purpose` (<= 64), `created_at`, `accepted_at`, `expires_at`, `revoked_at`, `revoked_by_tenant_id`.
+Check: initiator and responder cells differ. Indexes on both tenants and both cells. Expiry is evaluated
+at read time and at every relay attach; there is no cleanup dependency. See PEER_LINKS.md.
+
+### Private set intersection (no schema)
+
+The reference PSI workload (`examples/psi/`, see PEER_LINKS.md) adds **no tables, columns or migrations**
+and the platform stores none of its data. Items, blinded values and the computed intersection exist only in
+the memory of the two cells; the relay carries them inside TLS it cannot read, and nothing is persisted.
+
+What the platform database does hold when PSI runs is the ordinary peer-link record, and nothing PSI-specific:
+- the `peer_links` row above (which two cells, which tenants, `purpose`, lifetime, status);
+- hash-chained `audit_events` on both tenants' chains: the link lifecycle (`peer_link_proposed`,
+  `peer_link_requested`, `peer_link_accepted`, `peer_link_revoked`) and one `network` event per relay session
+  with `decision`, `reason`, `role`, `peer_link`, `session_id` and the bytes moved in each direction.
+
+Byte counts are the one thing that reveals anything about the exchange: the PSI frames are about 256 bytes
+per element (`API_DOCUMENTATION.md` has the layout), so anyone who can read the audit log can roughly estimate
+how many items each side submitted (from the bytes in each direction, plus a small fixed TLS overhead). The
+two parties already learn each other's set sizes in the protocol; the point is that the operator and
+auditors can too. Pad the sets with dummy items if that matters for your use.

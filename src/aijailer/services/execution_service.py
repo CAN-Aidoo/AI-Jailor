@@ -11,13 +11,20 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aijailer.core.exceptions import CellNotRunningError, ExecutionTimeoutError
+from aijailer.core.config import get_settings
+from aijailer.core.exceptions import (
+    CellNotRunningError,
+    ExecutionTimeoutError,
+    PolicyViolationError,
+)
 from aijailer.engine.microvm import get_microvm_engine
 from aijailer.models.audit import EventType, Severity
 from aijailer.models.cell import Cell
 from aijailer.models.execution import Execution
 from aijailer.services.audit_service import get_audit_service
 from aijailer.services.cell_service import CellService
+from aijailer.services.certificate_generator import get_certificate_generator
+from aijailer.services.execution_gate import ExecutionGate
 from aijailer.services.resource_service import get_resource_governor
 
 logger = structlog.get_logger(__name__)
@@ -169,6 +176,17 @@ class ExecutionService:
         cell = await self.cell_service.get_cell(cell_id, tenant_id)
         if cell.status != "running":
             raise CellNotRunningError(str(cell_id), cell.status)
+
+        gate_mode = get_settings().execution_gate_mode
+        if gate_mode != "off":
+            language = "python" if "python" in interpreter else "bash"
+            decision = ExecutionGate(get_certificate_generator(),
+                                     enforce=gate_mode == "enforce").decide(script, language)
+            logger.info("execution.gate", cell_id=str(cell_id), tier=int(decision.tier),
+                        basis=decision.basis, blocked=decision.blocked, reasons=decision.reasons)
+            if decision.blocked:
+                raise PolicyViolationError(
+                    "script rejected by execution gate: " + "; ".join(decision.reasons[:3]))
 
         execution = Execution(
             cell_id=cell_id,

@@ -248,7 +248,7 @@ class TestHashing:
         h = Hashing()
         with pytest.raises(SecurityViolation):
             import asyncio
-            asyncio.get_event_loop().run_until_complete(h.hash_password("short"))
+            asyncio.run(h.hash_password("short"))
 
     def test_rejects_weak_config(self):
         from aijailer.certified_components.crypto.hashing import (

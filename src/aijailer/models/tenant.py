@@ -3,8 +3,9 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import DateTime, ForeignKey, Integer, String, func
+from sqlalchemy.dialects.postgresql import UUID
+from aijailer.db.types import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from aijailer.db.base import Base
@@ -23,6 +24,11 @@ class Tenant(Base):
     max_concurrent_cells: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     max_persistent_storage_gb: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     max_snapshot_count: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    # Total bytes of snapshot bundles (memory dumps dominate): count alone does not bound disk use.
+    # Keeps one runaway cell (or agent loop) from using the whole tenant allowance.
+    max_snapshots_per_cell: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    max_snapshot_storage_per_cell_gb: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    max_snapshot_storage_gb: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     spending_cap_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Settings
@@ -57,7 +63,7 @@ class User(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str | None] = mapped_column(String(255))
@@ -79,7 +85,7 @@ class ApiKey(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True
     )
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)

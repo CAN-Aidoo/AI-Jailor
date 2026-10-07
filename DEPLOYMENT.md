@@ -388,3 +388,42 @@ For cloud deployments, cell nodes can be auto-scaled:
 | Kafka | Topic replication (built-in) | Continuous | Per topic config | N/A (replicated) |
 | Node Agent config | Git repository | On change | Unlimited | < 15 minutes |
 | TLS certificates | Vault backup | On change | Unlimited | < 30 minutes |
+
+### Snapshot quota alerts
+
+`deploy/prometheus/snapshot-quota.rules.yml` (with promtool unit tests in `snapshot-quota.rules.test.yml` and a scrape
+job in `scrape.example.yml`) alerts on the `/metrics` quota gauges (set `METRICS_TOKEN`; see API_DOCUMENTATION.md):
+
+| Alert | Fires when | Severity |
+|---|---|---|
+| `SnapshotQuotaNearLimit` | a tenant's used/limit is 80-100% of a quota for 15m | warning |
+| `SnapshotQuotaExhausted` | used/limit >= 1 for 5m: creations are being refused | critical |
+| `SnapshotQuotaDenials` | any refusal in the last 15m (a client is trying and failing; counter-reset safe) | warning |
+| `SnapshotQuotaMetricsMissing` | no quota metrics for 10m: scrape broken, wrong/missing token, or no active tenant | warning |
+
+Validate with `promtool check rules` and `promtool test rules`; `tests/deploy/test_prometheus_rules.py` runs both when
+`promtool` is on PATH (or `PROMTOOL=` is set) and always checks that every metric a rule uses is really exported.
+
+### Snapshot quota dashboard
+
+`deploy/grafana/snapshot-quota.dashboard.json` (Grafana 10/11, uid `aijailer-snapshot-quota`) plots the same `/metrics`
+gauges the alerts use. Variables: `Prometheus` datasource and `Tenant` (multi, default All). Panels: counts of quotas at
+100% and at 80-100%, refusals in the last hour, tenants exported (0 = nothing scraped); a table of the 25 fullest quotas;
+the fullest tenant per quota over time (dashed lines at the 80% alert and the 100% refusal level); count and storage
+usage per tenant and for each tenant's fullest cell; absolute storage bytes; refusals by tenant and quota; and a table of
+**projected days until full** for quotas that are growing (6h trend, under 30 days; a projection from a noisy signal,
+not a promise). It queries the raw metrics only, so it works without the recording rules loaded.
+
+Provision it with `deploy/grafana/provisioning/dashboards/aijailer.yml` (mount the JSON at
+`/var/lib/grafana/dashboards/aijailer`) and a Prometheus datasource (`provisioning/datasources/prometheus.example.yml`).
+`tests/deploy/test_grafana_dashboard.py` checks the layout, that only exported metrics are queried, and (with promtool)
+that every query parses as PromQL and the key ones return the right answers on sample series.
+
+### Audit log alerts
+
+`deploy/prometheus/audit.rules.yml` (promtool-tested) watches the audit group-commit writer: `AuditEventsDropped`
+(critical: events were dropped, there is an evidence gap marked in the chain), `AuditBatchWritesFailing` (warning: batch
+writes failing for 5m, events queued in memory) and `AuditBatchBacklog` (warning: queue more than half full for 5m).
+Metrics: `aijailer_audit_batch_pending`, `..._queue_capacity`, `aijailer_audit_events_dropped_total`,
+`..._flush_failures_total`, `..._events_flushed_total` (all on `GET /metrics`).
+

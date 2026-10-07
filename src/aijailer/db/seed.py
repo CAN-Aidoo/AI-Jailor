@@ -40,6 +40,9 @@ async def seed_data():
             max_concurrent_cells=1000,
             max_persistent_storage_gb=1000,
             max_snapshot_count=10000,
+            max_snapshot_storage_gb=5000,
+            max_snapshots_per_cell=100,
+            max_snapshot_storage_per_cell_gb=500,
         )
         db.add(admin_tenant)
         await db.flush()
@@ -54,6 +57,9 @@ async def seed_data():
             max_concurrent_cells=50,
             max_persistent_storage_gb=100,
             max_snapshot_count=500,
+            max_snapshot_storage_gb=200,
+            max_snapshots_per_cell=20,
+            max_snapshot_storage_per_cell_gb=20,
         )
         db.add(demo_tenant)
         await db.flush()

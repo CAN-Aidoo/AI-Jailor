@@ -43,7 +43,7 @@ async def test_tenant(db_session: AsyncSession):
         max_concurrent_cells=100,
     )
     db_session.add(tenant)
-    await db_session.flush()
+    await db_session.commit()
     return tenant
 
 
@@ -60,7 +60,7 @@ async def test_api_key(db_session: AsyncSession, test_tenant: Tenant):
         status="active",
     )
     db_session.add(api_key)
-    await db_session.flush()
+    await db_session.commit()
     return raw_key
 
 
@@ -72,7 +72,12 @@ async def client(db_engine, db_session, test_tenant, test_api_key):
 
     async def override_get_db():
         async with session_factory() as session:
-            yield session
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
 
     app.dependency_overrides[get_db] = override_get_db
 

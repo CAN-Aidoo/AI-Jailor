@@ -9,7 +9,8 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
+from aijailer.db.types import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from aijailer.db.base import Base

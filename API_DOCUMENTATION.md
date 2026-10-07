@@ -297,7 +297,9 @@ List files in a directory inside a cell.
 
 #### POST /v1/cells/{cell_id}/snapshots
 
-Create a snapshot of a cell.
+Snapshot a `ready`/`running`/`paused` cell (memory + VM state + disk; the guest is paused briefly and resumed).
+The bundle is stored under `SNAPSHOT_DIR/<tenant>/<snapshot>` with a sha256 per file. Backends without snapshot
+support answer `501 snapshot_unsupported`; other failures `502 snapshot_failed` (no snapshot row is kept).
 
 **Request Body**:
 
@@ -316,11 +318,78 @@ Create a snapshot of a cell.
     "id": "snap_abc123",
     "cell_id": "cell_abc123def456",
     "name": "after-setup",
-    "status": "creating",
+    "status": "available",
+    "total_size_bytes": 268435456,
     "created_at": "2025-01-15T10:40:00Z"
   }
 }
 ```
+
+**Quotas**: each tenant has `max_snapshot_count`, `max_snapshots_per_cell` (default 10), `max_snapshot_storage_per_cell_gb` (default 10) and
+`max_snapshot_storage_gb` (tenant total bytes, since memory dumps dominate; the per-cell limits stop one cell or agent
+loop taking the whole allowance). All four are checked, and the slot reserved, before the guest is touched; exceeding either answers
+`429 resource_limit_exceeded` (`snapshots` / `snapshots_per_cell` / `snapshot_storage_per_cell` / `snapshot_storage`). A cell whose memory + disk
+alone exceed its per-cell size limit can never be snapshotted (the reservation is an upper bound). A snapshot being created counts at an upper-bound
+estimate (memory + configured disk) until its real size is known; a failed one gives its reservation back, and one stuck
+in `creating` longer than `RECONCILE_STUCK_SECONDS` (owner died) is expired so a crash cannot wedge the quota.
+
+#### GET /metrics (operator, Prometheus)
+
+Disabled (404) unless `METRICS_TOKEN` is set; then requires `Authorization: Bearer <METRICS_TOKEN>` (401 otherwise).
+Not tenant-scoped: it exports every active tenant, so scrape it from your monitoring network only.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `aijailer_snapshot_quota_used` | gauge | `tenant`, `quota` | In use: snapshots (count quotas) or bytes (storage quotas); the per-cell quotas report the tenant's **fullest cell** |
+| `aijailer_snapshot_quota_limit` | gauge | `tenant`, `quota` | The limit, same units |
+| `aijailer_snapshot_quota_denied_total` | counter | `tenant`, `quota` | Creations refused because that quota was reached (per process; resets on restart) |
+
+`quota` is one of `snapshots`, `snapshot_storage`, `snapshots_per_cell`, `snapshot_storage_per_cell`. Counting follows
+the enforcement rules exactly (in-flight counts, failed/stuck do not), so `used / limit >= 1` is the condition that starts
+refusing requests. Example alert: `max by (tenant, quota) (aijailer_snapshot_quota_used / aijailer_snapshot_quota_limit) > 0.9`.
+Cardinality is tenants x 4 quotas; there is deliberately no per-cell label.
+
+#### Operator API: per-tenant quota overrides (`/v1/admin/tenants/{tenant_id}/quotas`)
+
+Platform-operator only, authenticated by `Authorization: Bearer <ADMIN_TOKEN>`, **not** by tenant API keys (a tenant's
+own owner/admin must not be able to raise the limits that bound them; their keys get 401). Disabled (404) when
+`ADMIN_TOKEN` is unset; hidden from the OpenAPI schema. Unknown tenant: `404 tenant_not_found`.
+
+- `GET` returns `limits`, platform `defaults`, `usage` (snapshots, bytes), `over_limit` and `warnings`.
+- `PATCH` changes any subset of `max_snapshot_count` (default 100), `max_snapshots_per_cell` (10),
+  `max_snapshot_storage_gb` (50), `max_snapshot_storage_per_cell_gb` (10). Strict integers 0..1,000,000 (storage
+  0..10,000,000, a typo guard); `0` forbids new snapshots; unknown fields, nulls, strings, floats and booleans are
+  rejected (400/422) and change nothing. Effective on the next request, and the metrics follow on the next scrape.
+- `DELETE` resets all four to the defaults.
+- `GET .../quotas/audit` is the change history, newest first: `events[]` with `id`, `timestamp` (UTC), `action`
+  (`quota_override_set` / `quota_override_reset`), `actor`, `from`/`to` (only the fields that changed) and the
+  `previous_hash`/`event_hash` chain links. Query: `limit` (1-500, default 50), `before` (exclusive ISO timestamp; pass the
+  previous page's `next_before`, which is `null` on the last page) and `action`. The tenant's hash-chained audit log is
+  verified on every call: `chain_intact: false` means the stored history was altered or truncated and the entries must not
+  be trusted. `durable: false` means the audit store is in-memory (`AUDIT_BACKEND=memory`, the default in dev), so history from before the
+  last restart is not available; with the database backend (the default outside dev, see AUDIT_SYSTEM.md) it is `true`. Pages use the timestamp as a cursor, so events written in the same
+  microsecond could straddle a page boundary.
+
+Lowering a limit below current usage is allowed: existing snapshots stay, new ones get 429 until usage drops (reported
+in `over_limit`). Per-cell limits above the tenant totals are allowed but listed in `warnings` (the totals win).
+Every change is audited (action `quota_override_set` / `quota_override_reset`, severity warning, with the before/after
+values); no-op requests are not. Changes take the same tenant row lock as snapshot reservations, so they cannot
+interleave with one.
+
+**Durability.** The new limits and their audit record are written in **one database transaction** and committed
+*before* the response is sent: a `200` means both are durable; any failure (including a failed commit) returns an error
+with neither applied, so there is never a change without its record, or a record of a change that did not happen. With
+`AUDIT_BACKEND=memory` (dev) the audit event cannot join the transaction and is not durable (`durable: false`).
+
+#### GET /v1/snapshots/quota
+
+`{"data": {"count": 3, "max_count": 100, "bytes_used": 1073741824, "max_bytes": 53687091200}}`
+Add `?cell_id=<id>` to also get `cell_count`, `max_per_cell`, `cell_bytes` and `max_bytes_per_cell` for that cell (404 for a cell that is not yours).
+
+#### DELETE /v1/snapshots/{snapshot_id}
+
+Delete a snapshot and its stored data (204); frees quota. `409 snapshot_not_available` while it is still being created.
+`500 snapshot_delete_failed` (row kept, so the storage stays accounted) if the files could not be removed.
 
 #### GET /v1/cells/{cell_id}/snapshots
 
@@ -328,21 +397,29 @@ List snapshots for a cell.
 
 #### POST /v1/cells/{cell_id}/restore
 
-Restore a cell from a snapshot.
-
-**Request Body**:
+Restore the cell from one of **its own** snapshots. **Destructive and synchronous**: the cell's current VM (and
+everything done in it since the snapshot) is replaced; the response is the final status (`running`).
 
 ```json
-{
-  "snapshot_id": "snap_abc123"
-}
+{ "snapshot_id": "snap_abc123" }
 ```
+
+- The guest keeps its saved network address, so the snapshot's /30 must be free: otherwise `409 snapshot_address_in_use`.
+- The cell's **current** security policy, bandwidth and environment are kept (restoring never resurrects an older, looser policy).
+- Checked before anything is destroyed: snapshot exists / is `available` / belongs to this cell (`400 snapshot_cell_mismatch`),
+  cell state (`409`), address, bundle integrity (`422 snapshot_corrupt`).
+- If the restore itself fails after the old VM was replaced, the cell is left in `error` (`502 restore_failed`).
+- Restored guests resume with their saved RNG state; established vsock connections are reset.
 
 #### POST /v1/snapshots/{snapshot_id}/clone
 
-Create a new cell from a snapshot.
+Create a new cell from a snapshot. The clone keeps the snapshot's machine (`resources` is rejected: `400 invalid_clone`)
+and its guest address, so it only works while no other cell holds that address (typically after the source cell is
+gone; otherwise `409 snapshot_address_in_use`). `security_policy_id` defaults to the source cell's policy and must still
+be usable. A clone shares the snapshot's saved RNG state: do not treat clones as independent for keys or nonces.
+Returns `201` with the new cell's `id` and `status` (`error` if the restore failed).
 
-**Request Body**:
+**Request Body** (`resources` shown for completeness; it must be omitted):
 
 ```json
 {
@@ -670,10 +747,142 @@ X-RateLimit-Reset: 1705312260
 | `execution_timeout` | 408 | Command exceeded its timeout |
 | `policy_violation` | 403 | Action blocked by security policy |
 | `resource_limit_exceeded` | 429 | Cell or tenant resource quota exceeded |
-| `snapshot_failed` | 500 | Snapshot creation failed |
+| `snapshot_failed` | 502 | Snapshot creation failed |
+| `tenant_not_found` | 404 | Operator API: no such tenant |
+| `invalid_quota` | 400 | Operator API: invalid quota change (nothing applied) |
+| `snapshot_delete_failed` | 500 | Snapshot files could not be removed (row kept) |
+| `snapshot_unsupported` | 501 | The isolation backend cannot snapshot |
+| `snapshot_not_found` | 404 | No such snapshot for this tenant |
+| `snapshot_not_available` | 409 | Snapshot is not in `available` state |
+| `snapshot_address_in_use` | 409 | The snapshot's guest address is held by another cell |
+| `snapshot_cell_mismatch` | 400 | Snapshot belongs to a different cell (use clone) |
+| `snapshot_corrupt` | 422 | Snapshot data is missing or fails its checksums |
+| `restore_failed` | 502 | Restore failed after the old VM was replaced; cell is `error` |
+| `invalid_clone` | 400 | Clone request tried to change the snapshot's resources |
 | `image_not_found` | 404 | Specified base image does not exist |
 | `invalid_policy` | 400 | Policy definition is invalid |
 | `spending_cap_reached` | 402 | Tenant spending cap exceeded |
 | `rate_limited` | 429 | Too many requests |
 | `unauthorized` | 401 | Invalid or missing authentication |
 | `forbidden` | 403 | Insufficient permissions for this action |
+
+
+## Secrets (`/v1/secrets`)
+
+Write-only credentials the egress broker injects into outbound requests, so a cell never holds them.
+Roles: owner/admin write; owner/admin/auditor read metadata. Values are never returned.
+
+```
+POST   /v1/secrets        {"name":"gh","value":"ghp_...","hosts":["api.github.com"],"expires_at":null}
+GET    /v1/secrets        metadata list
+GET    /v1/secrets/{name} metadata
+PUT    /v1/secrets/{name} {"value":"..."} (rotate) and/or {"hosts":[...]} / {"expires_at":...} / {"clear_expiry":true}
+DELETE /v1/secrets/{name}
+```
+
+Response (`value` is never present): `name, version, hosts, expires_at, created_at, updated_at, rotated_at, placeholder`.
+Inside a cell, send the placeholder instead of the secret, e.g. through the cell's `http_proxy`:
+`GET http://api.github.com/user` with header `Authorization: Bearer {{secret:gh}}`.
+`hosts` are exact names, `*.suffix` (two or more labels after `*.`) or IPv4 literals; a secret is only ever sent to them.
+Changes apply to running cells immediately. Errors: 400 `invalid_secret`, 404 `secret_not_found`, 409 `secret_conflict`,
+429 `secret_limit` (100 per tenant), 503 `secret_store_unavailable` (no `SECRETS_MASTER_KEYS`).
+
+
+## Cell bandwidth (`/v1/cells/{id}/bandwidth`)
+
+```
+GET    /v1/cells/{id}/bandwidth   configured (database) and enforced (kernel read-back) limits
+PUT    /v1/cells/{id}/bandwidth   {"down_kbit": 4000, "up_kbit": 16000}   owner/admin
+DELETE /v1/cells/{id}/bandwidth   drop the override, back to resources.network_bandwidth_mbps   owner/admin
+```
+
+`down_kbit` is host -> guest, `up_kbit` is guest -> host. Both are required integers; `null` (unlimited) is rejected.
+Range: 64 kbit/s up to `MAX_CELL_BANDWIDTH_MBPS` (default 10000, also applied when creating a cell).
+Running/paused/ready cells are changed immediately; stopped cells keep the override for their next start;
+creating/stopping/destroying/destroyed/error cells return 409.
+Response: `{configured: {down_kbit, up_kbit}, source: "default"|"override", enforced: {...}|null, min_kbit, max_kbit}`
+(`enforced` is null when the cell currently has no network). Errors: 400 `invalid_bandwidth`, 404, 409 `invalid_state_transition`,
+502 `bandwidth_apply_failed` (nothing was persisted), 503 `cell_network_unavailable`.
+
+## Peer links (`/v1/peer-links`)
+
+Attested, end-to-end encrypted cell-to-cell channels with two-sided consent. Full description, wire
+protocol and threat model: PEER_LINKS.md. All routes need `PEER_ATTESTATION_SECRET` (else 503
+`peer_links_disabled`). Writers: owner/admin; readers: owner/admin/auditor.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/peer-links` | body `{cell_id, peer_cell_id, ttl_seconds?, purpose?}`; 201; `pending` unless both cells are yours |
+| GET | `/v1/peer-links` | links you are a party to; `?include_inactive=true` adds revoked/expired |
+| GET | `/v1/peer-links/{id}` | 404 for non-parties |
+| POST | `/v1/peer-links/{id}/accept` | responder cell's tenant only |
+| DELETE | `/v1/peer-links/{id}` | either party; cuts a live session |
+| GET | `/v1/peer-links/attestation-key` | platform Ed25519 public key (base64 raw) |
+
+Error codes: `peer_link_not_found` 404, `peer_link_invalid` 400, `peer_link_conflict` 409,
+`peer_link_limit` 429, `peer_links_disabled` 503.
+
+### Example workload: private set intersection (no platform endpoints)
+
+PSI adds **no REST routes and no platform state**. The platform only provides the peer link above; the
+computation is the reference program `examples/psi/psi.py` (see `examples/psi/README.md` and the
+"Example workload" section of PEER_LINKS.md), which runs inside the two cells and talks to its peer through
+`aijailer-peer` on a local socket. To use it: propose and accept a peer link, read `link_id` from the
+response, then start `aijailer-peer --link <link_id> --listen 127.0.0.1:7000` and `psi.py ... --context
+<link_id> --connect 127.0.0.1:7000` in each cell.
+
+The wire format between the two `psi.py` processes (carried inside the link's TLS, never seen by the
+platform in the clear) is a sequence of frames: `version (1 byte, =1) | kind (1 byte) | count (4 bytes,
+big-endian) | count x 256-byte big-endian group elements`.
+
+| Kind | Name | Direction | Count must be |
+|---|---|---|---|
+| 1 | blinded items | receiver -> sender | at most the item limit |
+| 2 | doubly blinded items | sender -> receiver | exactly the number of items the receiver sent |
+| 3 | sender's blinded set | sender -> receiver | at most the item limit |
+
+Every element must be a quadratic residue in the RFC 3526 2048-bit group other than 1 and p-1; a frame
+with a wrong version or kind, an over-limit or mismatched count, an invalid element or a truncated body
+ends the run with a `psi_error` status line and exit code 1. The item limit defaults to 50,000
+(`--max-items`). Command-line exit codes: 0 success, 1 protocol or I/O error. Status goes to stderr as JSON
+(`psi_done` with set sizes, plus `intersection` on the receiver, or `psi_error`); the receiver prints the
+intersection to stdout, one item per line.
+
+Limits: semi-honest security only, demo-grade, about 0.1 s per item pair. See the README for what it does
+not protect (notably, low-entropy identifiers can be enumerated by the receiver).
+
+### Loopback inside a cell (no endpoints)
+
+Loopback adds **no routes, fields or error codes**. It is part of the environment commands run in, through
+`POST /v1/cells/{cell_id}/exec` and `/exec/script`.
+
+- **`127.0.0.1` works inside a cell.** The guest init (`aijailer-agent`) brings the loopback interface up at
+  boot, so a command, and any process it starts, can run a local server and connect to it. `localhost` means
+  *that* cell only; it never reaches the host or another cell. A freshly booted kernel starts with `lo` down
+  (connections to `127.0.0.1` then fail with `Network is unreachable`), so a cell whose base image contains an
+  `aijailer-agent` built **before** this fix needs the image rebuilt (`make -C guest-agent rootfs-install`, or
+  `scripts/e2e/build-rootfs.sh`). See NETWORKING.md and PEER_LINKS.md ("Local hand-off and loopback").
+- **In-guest only.** Loopback traffic never leaves the guest kernel, so the cell's network policy, bandwidth
+  limits and network audit events do not apply to it, and it is not visible to the platform. Only what leaves the
+  cell (through the egress broker or a peer link) is policed and audited. Details: SECURITY_MODEL.md, "Loopback
+  inside the cell".
+- **HTTP clients and the proxy variables.** Cells get `http_proxy`/`HTTP_PROXY`/`https_proxy`/`HTTPS_PROXY`
+  pointing at the egress broker, and `NO_PROXY`/`no_proxy` set to `127.0.0.1,localhost` (both spellings, because
+  clients differ in which they read), so proxy-aware clients such as `curl` and Python's `urllib` connect to
+  `http://127.0.0.1:PORT/` locally instead of sending it to the broker. Only those two names bypass the proxy:
+  any other destination, including other loopback addresses such as `127.0.0.2`, still goes through it. These
+  variables are a hint to clients; what a cell can actually reach is enforced by the host firewall. Go's standard
+  library is documented to skip the proxy for loopback addresses anyway (not tested here), and plain TCP sockets
+  are never affected (the PSI example talks to its local helper this way).
+
+  Cells created before this default (and any custom image or init that sets its own variables) can have an
+  **empty** `NO_PROXY`; then even local HTTP requests go to the broker, which blocks private addresses and so
+  refuses them. Set the bypass inline in the command:
+
+      NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost curl -s http://127.0.0.1:8080/
+
+- **Known gap: the `environment` field of `/exec` has no effect today.** The request's `environment` and
+  `working_directory` are stored with the execution record but are not passed to the guest (the engine call
+  takes only the command, timeout and user), so variables set there (for example a different `NO_PROXY`) do nothing. The cell-creation
+  `environment` cannot override the platform's proxy variables either (the platform's values win). Until that is
+  fixed, set variables inline in the command as shown above.

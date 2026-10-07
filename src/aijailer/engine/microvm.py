@@ -22,6 +22,17 @@ class VMStatus(str, Enum):
     ERROR = "error"
 
 
+@dataclass(frozen=True)
+class VMNetwork:
+    """The cell's one controlled link (see netpolicy/). Absent => the VM gets NO NIC."""
+
+    tap_name: str
+    guest_ip: str
+    host_ip: str
+    prefix: int = 30
+    netns_path: str | None = None  # the VMM must run inside this namespace (jailer --netns)
+
+
 @dataclass
 class VMConfig:
     """Configuration for a new microVM."""
@@ -34,6 +45,7 @@ class VMConfig:
     network_bandwidth_mbps: int = 100
     environment: dict = field(default_factory=dict)
     network_policy: dict = field(default_factory=dict)
+    network: VMNetwork | None = None
 
 
 @dataclass
@@ -57,10 +69,37 @@ class ExecResult:
     duration_ms: int
     cpu_ms: int = 0
     memory_peak_mb: int = 0
+    timed_out: bool = False
+    output_truncated: bool = False
+
+
+@dataclass
+class EngineSweepReport:
+    """What one engine reconciliation pass found and did (see FirecrackerEngine.reconcile)."""
+
+    adopted: list[uuid.UUID] = field(default_factory=list)    # live cell, VMM survived a restart
+    orphans_killed: list[uuid.UUID] = field(default_factory=list)  # VMM with no live cell
+    leftovers_removed: list[uuid.UUID] = field(default_factory=list)  # jail/cgroup, no VMM
+    dead: list[uuid.UUID] = field(default_factory=list)       # live cell whose VMM is gone
+    unresponsive: list[uuid.UUID] = field(default_factory=list)  # live cell, VMM not answering
+    skipped_young: list[uuid.UUID] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    aborted: bool = False
+
+    @property
+    def broken(self) -> list[uuid.UUID]:
+        return [*self.dead, *self.unresponsive]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.adopted or self.orphans_killed or self.leftovers_removed or self.dead)
 
 
 class MicroVMEngine(ABC):
     """Abstract interface for MicroVM management."""
+
+    isolation = "unknown"
+    needs_network = False  # True when the engine attaches a real NIC that must be firewalled
 
     @abstractmethod
     async def create_vm(self, config: VMConfig) -> VMInfo:
@@ -92,12 +131,31 @@ class MicroVMEngine(ABC):
     ) -> ExecResult:
         """Execute a command inside a microVM via the cell agent."""
 
+    async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
+        """Pause + dump memory/device state. Optional capability."""
+        raise NotImplementedError(f"{type(self).__name__} does not support snapshots")
+
+    async def restore_vm(self, config: "VMConfig", snapshot_dir: str) -> "VMInfo":
+        raise NotImplementedError(f"{type(self).__name__} does not support restore")
+
+    async def check_snapshot(self, snapshot_dir: str) -> None:
+        """Cheap, side-effect-free validation of a snapshot bundle (raises if unusable). Callers
+        run it BEFORE destroying the VM they are about to replace."""
+
     @abstractmethod
     async def get_vm_info(self, cell_id: uuid.UUID) -> VMInfo:
         """Get current status and info for a microVM."""
 
+    async def reconcile(self, live: dict[uuid.UUID, dict], protected: set[uuid.UUID],
+                        grace: float = 120.0) -> "EngineSweepReport | None":
+        """Make the host's VMM processes/files match the set of cells the database says are live
+        (``live`` maps cell id -> guest environment). Engines with no host state return None."""
+        return None
+
 
 class SimulatedMicroVMEngine(MicroVMEngine):
+    isolation = "none"
+
     """Simulated MicroVM engine for development and testing.
 
     Tracks VM state in-memory without actually creating Firecracker processes.
@@ -151,6 +209,14 @@ class SimulatedMicroVMEngine(MicroVMEngine):
     async def destroy_vm(self, cell_id: uuid.UUID) -> None:
         self._vms.pop(cell_id, None)
 
+    async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
+        if cell_id not in self._vms:
+            raise KeyError(f"unknown cell {cell_id}")
+        return {"state": None, "memory": None, "disk": None}      # nothing real to store
+
+    async def restore_vm(self, config: VMConfig, snapshot_dir: str) -> VMInfo:
+        return await self.create_vm(config)
+
     async def exec_command(
         self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
     ) -> ExecResult:
@@ -171,12 +237,34 @@ class SimulatedMicroVMEngine(MicroVMEngine):
         return info
 
 
-# Singleton for MVP
+class EngineUnavailable(RuntimeError):
+    """The configured isolation backend cannot provide real isolation here."""
+
+
 _engine: MicroVMEngine | None = None
+
+
+def build_engine(backend: str, environment: str) -> MicroVMEngine:
+    """Select an engine. Fails CLOSED: never silently downgrades isolation."""
+    if backend == "simulated":
+        if environment != "dev":
+            raise EngineUnavailable(
+                "ENGINE_BACKEND=simulated provides no isolation and is only allowed "
+                "when AIJAILER_ENV=dev"
+            )
+        return SimulatedMicroVMEngine()
+    if backend == "firecracker":
+        from aijailer.engine.firecracker import FirecrackerEngine
+
+        return FirecrackerEngine()
+    raise EngineUnavailable(f"unknown engine backend '{backend}'")
 
 
 def get_microvm_engine() -> MicroVMEngine:
     global _engine
     if _engine is None:
-        _engine = SimulatedMicroVMEngine()
+        from aijailer.core.config import get_settings
+
+        s = get_settings()
+        _engine = build_engine(s.engine_backend, s.environment)
     return _engine

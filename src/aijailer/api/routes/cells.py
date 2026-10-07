@@ -5,14 +5,17 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aijailer.api.middleware.auth import AuthContext, authenticate
+from aijailer.api.middleware.auth import AuthContext, authenticate, require_role
 from aijailer.db.base import get_db
 from aijailer.schemas.cells import (
+    BandwidthLimits,
+    BandwidthResponse,
     CellListResponse,
     CellResponse,
     CreateCellRequest,
     NetworkInfo,
     ResourcesRequest,
+    SetBandwidthRequest,
     StopCellRequest,
 )
 from aijailer.schemas.common import ApiResponse
@@ -155,3 +158,39 @@ async def destroy_cell(
 ):
     svc = CellService(db)
     await svc.destroy_cell(cell_id, auth.tenant_id, destroy_persistent)
+
+
+def _limits(b) -> BandwidthLimits | None:
+    return None if b is None else BandwidthLimits(down_kbit=b.down_kbit, up_kbit=b.up_kbit)
+
+
+def _bw_response(v) -> BandwidthResponse:
+    return BandwidthResponse(configured=_limits(v.configured), source=v.source,
+                             enforced=_limits(v.enforced), min_kbit=v.min_kbit,
+                             max_kbit=v.max_kbit)
+
+
+@router.get("/{cell_id}/bandwidth", response_model=ApiResponse[BandwidthResponse])
+async def get_bandwidth(cell_id: uuid.UUID, auth: AuthContext = Depends(authenticate),
+                        db: AsyncSession = Depends(get_db)):
+    """Configured limits (database) and enforced limits (read back from the kernel)."""
+    return ApiResponse(data=_bw_response(await CellService(db).get_bandwidth(
+        cell_id, auth.tenant_id)))
+
+
+@router.put("/{cell_id}/bandwidth", response_model=ApiResponse[BandwidthResponse])
+async def set_bandwidth(cell_id: uuid.UUID, body: SetBandwidthRequest,
+                        auth: AuthContext = Depends(require_role("owner", "admin")),
+                        db: AsyncSession = Depends(get_db)):
+    """Change a cell's per-direction limits. Applies immediately to a running cell."""
+    return ApiResponse(data=_bw_response(await CellService(db).set_bandwidth(
+        cell_id, auth.tenant_id, body.down_kbit, body.up_kbit, actor=auth.api_key_id)))
+
+
+@router.delete("/{cell_id}/bandwidth", response_model=ApiResponse[BandwidthResponse])
+async def reset_bandwidth(cell_id: uuid.UUID,
+                          auth: AuthContext = Depends(require_role("owner", "admin")),
+                          db: AsyncSession = Depends(get_db)):
+    """Remove the override and return to the cell's default symmetric limit."""
+    return ApiResponse(data=_bw_response(await CellService(db).reset_bandwidth(
+        cell_id, auth.tenant_id, actor=auth.api_key_id)))

@@ -36,3 +36,5 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+test_output.txt
+guest-agent/dist/

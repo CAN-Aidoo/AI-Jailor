@@ -206,6 +206,8 @@ limit rate 20/second burst 5 packets accept
 
 By default, cells cannot communicate with each other. For use cases that require inter-cell communication (e.g., multi-agent systems), explicit configuration is required:
 
+> **Status: design sketch, not implemented.** Nothing in `src/` implements `cell_links` or IP-level connectivity between cells, and the implemented firewall drops all cell-to-cell forwarding (see "Host enforcement" below). The implemented way for two cells to exchange data is a consented, relayed **peer link**; see "Peer links and the PSI example" at the end of this file and PEER_LINKS.md.
+
 ### Linked Cells
 
 ```json
@@ -306,3 +308,159 @@ Heuristic-based detection for:
 - **Beacon behavior**: Periodic connections to the same destination at regular intervals (potential C2 communication).
 
 Anomalies are logged as audit events with severity "warning" and optionally trigger webhook notifications.
+
+## Host enforcement (implemented): `src/aijailer/netpolicy/`
+
+Per cell: one TAP, one /30 (host `.1`, guest `.2`), no default route, no host forwarding.
+Static nftables table `inet aijailer` (hooks at priority -100), filtering by interface-name
+prefix `aj*` so an unregistered or stale cell interface is **denied, never open**:
+
+| hook | rule |
+|---|---|
+| input from `aj*` | accept only `(iface, guest_ip, host_ip, broker_port)` (rate-limited `ct new`); everything else counted + rate-limited log + drop (spoofed source, IPv6, ICMP, UDP, every other host service) |
+| forward | drop anything from or to `aj*` (no internet, no cell-to-cell, no inbound) |
+| output | drop NEW connections from the host into `aj*` |
+
+The broker listens per cell on `host_ip:broker_port` (`agentsec/proxy.py`); cell identity is the listener,
+not a source address. Cell-side config: static IP via kernel cmdline, `http_proxy=http://<host_ip>:<port>`.
+Verified with real packets in network namespaces (`tests/netpolicy/`).
+
+### Lifecycle (implemented in `CellService` + `netpolicy/cell_network.py`)
+
+| event | network action |
+|---|---|
+| create | firewall entry -> TAP + address + sysctl hardening -> per-cell proxy -> **then** boot VM with NIC, static `ip=` and `http_proxy` env. Any failure: undo in reverse, no VM is booted |
+| stop / destroy | revoke firewall -> stop proxy -> delete TAP -> release /30 (address stays reserved if a step failed) |
+| start (from stopped) | rebuild as for create |
+| pause / resume | unchanged (VM frozen, link kept) |
+| service start | install ruleset; refuse to start if it fails; watchdog verifies/repairs |
+
+`NETWORK_ENFORCEMENT=auto|required|off`: engines that attach a NIC (Firecracker) can never run with `off`.
+The simulated engine has no NIC and gets none. Egress comes from the cell's network policy
+(domains and single IPs over TCP; CIDR/UDP rules are skipped and reported, never widened).
+
+### Per-cell namespace (jailer `--netns`)
+
+```
+ root netns                         cell netns /run/netns/aj<id>  (jailer --netns)
+ aj<id> host_ip  <-- veth pair -->  vc0 --[ br0 ]-- tap0 <--> Firecracker/guest
+```
+The VMM runs inside its own namespace and sees only `tap0`, the bridge and the veth peer: a compromised VMM
+has no route to host services, other cells' links or the internet. The bridge makes guest NIC and host veth one
+L2 segment, so the firewall (`iifname "aj*"`, guest/host /30, source match) and the broker apply unchanged.
+`setup_link` waits until both veth ends are operationally UP (carrier changes are applied asynchronously, up to
+~1 s, and the bridge will not forward until then), recovers a stale namespace left by a crash, and rolls back
+completely on any failure. TAP is persistent and owned by the jailer uid so Firecracker attaches unprivileged.
+
+### Bandwidth shaping (`netpolicy/shaping.py`)
+
+Both limits are **egress** shapers (they queue, so TCP backs off on delay rather than loss):
+
+| direction | where | note |
+|---|---|---|
+| download (host -> guest) | host veth `aj<id>` egress | root namespace |
+| upload (guest -> host) | `vc0` egress inside the cell namespace | outside the guest, unreachable from it |
+
+`tbf`, burst = 100 ms of traffic (min 32 KiB), queue bounded by 50 ms latency. Range 64 kbit/s to 10 Gbit/s,
+`None` = unlimited per direction. `cell.network_bandwidth_mbps` is applied symmetrically at provisioning;
+if shaping fails the whole network is rolled back. Because the broker is the cell's only path off the box,
+bounding this link bounds the cell's total network use. Applied with netlink (no `tc` binary).
+
+### Reconciliation (`netpolicy/reconciler.py`)
+
+Every `RECONCILE_INTERVAL_SECONDS` (30, +/-10 % jitter) and once **before the service takes traffic**:
+
+| kernel (`aj<12 hex>`) | DB status | action |
+|---|---|---|
+| present, registered here | ready/running/paused | keep (flag `broken` if veth/namespace vanished -> cell marked `error`) |
+| present, not registered | ready/running/paused | **adopt** (restart recovery): rebuild registry from the veth address, re-grant firewall tuple, restart proxy, re-assert bandwidth |
+| present | creating/stopping/destroying | never touched; after `RECONCILE_STUCK_SECONDS` (600) the cell is marked `error` and the network is cleaned |
+| present, registered here | anything else | delete once older than `RECONCILE_GRACE_SECONDS` (120; the DB commit can lag provisioning) |
+| present, not registered | anything else / unknown | delete (orphan) |
+
+Safety: unreadable DB -> no changes; a sweep removing more than 5 networks **and** more than half of everything present aborts
+(`aborted` in the report, logged); names not matching `^aj[0-9a-f]{12}$` are never touched, even if the scanner returns
+them; subnets of resources we cannot adopt stay reserved so a new cell can never share a /30 with them.
+After a restart the freshly installed ruleset has no tuples, so cells are cut off (fail closed) until the first sweep adopts them.
+
+Changing limits at runtime (`PUT /v1/cells/{id}/bandwidth`): applied to the kernel first, then persisted, so a failed apply
+never leaves the database claiming a limit the cell does not have. If the persist fails after a successful apply, or anyone
+alters the qdiscs by hand, the reconciler compares `read_shaping` with the database every sweep and restores the database's
+value (`shaping_repaired` in the sweep report). The database is the single source of truth.
+
+### Engine-side reconciliation (`FirecrackerEngine.reconcile`)
+
+Jailed VMMs outlive the control plane, but the engine's in-memory `_vms` does not. The same reconciler pass
+(after the network sweep, same DB snapshot) therefore also compares the **host's VMMs and jails** with the cells the
+database calls live. Identity comes only from what we can prove: a jail directory named exactly `<uuid>` under
+`<JAILER_CHROOT_BASE>/<exec name>/`, and a process whose `argv[0]` is the Firecracker binary with `--id <uuid>`
+(pid reuse cannot fool it: the argv is re-checked before every kill). Anything else is never touched.
+
+| Found | DB says | Action |
+|---|---|---|
+| VMM (+jail) | live, VMM answers (API state + agent ping) | **adopted**: handle rebuilt with the cell's env (DB environment + proxy env) |
+| VMM | live, no answer / not started | reported `unresponsive`, cell marked `error`; reaped as an orphan next pass |
+| nothing running | live | reported `dead`, cell marked `error`, jail removed |
+| managed VMM exited | live | same as dead |
+| VMM and/or jail/cgroup | not live (stopped-in-DB, error, destroyed, unknown) | SIGKILL, wait, remove jail + cgroup |
+| anything | creating/stopping/destroying, or `create_vm` in flight here | never touched |
+| jail younger than `RECONCILE_GRACE_SECONDS` | not live | skipped (may be another process's launch) |
+
+A STOPPED VM this process still manages is kept until `destroy_cell`. Removing more than 5 VMs that are also more than
+half of everything present aborts the pass (a bad DB read must not look like a mass leak). Verified against the real jailer +
+Firecracker (`tests/engine/test_real_jailer.py`): a fresh engine finds the VMM from its argv, refuses to adopt one that never
+started, and kills it and removes its jail once the cell is not live. Not verified without KVM: adopting a *running* guest
+(agent ping over vsock). `restore_vm` remains unimplemented.
+
+### Peer links and the PSI example (implemented)
+
+A peer link (PEER_LINKS.md) gives two consenting cells an encrypted channel **without any packet ever
+flowing between them**. The reference PSI workload (`examples/psi/`) is the worked example. At the network
+layer:
+
+    cell A: psi.py ──127.0.0.1:P──> aijailer-peer ──TCP──> host_ip:broker_port ─┐
+                                                                                ├─ CellProxy ─ PeerHub ─ CellProxy
+    cell B: psi.py ──127.0.0.1:P──> aijailer-peer ──TCP──> host_ip:broker_port ─┘      (inside the host process)
+
+- **Same single allowed destination.** Each cell connects only to its own `host_ip:broker_port`, the one
+  destination the `aj*` input rule already accepts. There are **no new nftables rules, no new ports and no
+  new listeners**; `forward` still drops everything from or to `aj*`. Cells still cannot reach each other's
+  IPs. The relay pairs two connections inside the host process.
+- **Identity is the listener**, as for all broker traffic: a cell can only attach as itself.
+- **The name is never resolved.** The workload sends `CONNECT <link-id>.peer.aijailer.invalid:443` to the
+  proxy; `.invalid` is reserved and has no DNS entry. The proxy diverts it before DNS resolution and before
+  the egress allowlist, so neither DNS policy nor allowlists apply to it (and none are needed). The egress
+  broker's content and credential checks do not see the traffic, which is end-to-end TLS 1.3 between the
+  cells (see SECURITY_MODEL.md, "Peer links and the PSI example workload").
+- **Environment.** When `PEER_ATTESTATION_SECRET` is set the cell also receives
+  `AIJAILER_PEER_ATTEST_PUBKEY` next to the usual proxy variables; `NO_PROXY` and `no_proxy` are
+  `127.0.0.1,localhost`, so loopback stays local (a proxy-aware client would otherwise send even
+  `http://127.0.0.1:PORT/` to the broker, which refuses it); nothing else is configured to bypass the proxy,
+  and what a cell can reach is enforced by the nftables rules, not by these variables.
+- **Accounting.** The session crosses the cell's TAP like all other traffic, so by construction the cell's tc
+  shaping and the broker-port connection-rate rule apply to it. I have not tested peer traffic under shaping.
+  Sessions are bounded by the relay itself: lifetime (default 1 h), idle time (5 min) and bytes (1 GiB), and are
+  cut at once when the link is revoked or either cell loses its network. Each session is one `network`
+  audit event with the bytes moved each way.
+
+**What PSI adds at the network layer: nothing.** `psi.py` talks to `aijailer-peer` over **loopback inside the
+guest** (`--connect 127.0.0.1:P`), and the only traffic that leaves the cell is the helper's TLS stream to the
+host proxy described above. The PSI frames are about 256 bytes per element, so the relay byte counts roughly
+reveal set sizes to anyone who can read the audit log.
+
+**Guest requirement: loopback must be up.** The local hand-off between `psi.py` and `aijailer-peer` needs the
+guest's `lo` interface to be up. A freshly booted kernel starts with `lo` down, and the boot arguments
+configure only `eth0` (`ip=<guest>::<host>:<mask>::eth0:off`), so a TCP connection to `127.0.0.1` fails
+with `Network is unreachable`. The guest init (`guest-agent/init_linux.go`, `setupInit`) therefore brings
+`lo` up with an ioctl (`bringUpLoopback`; no `ip` binary needed in the image). Verified: unit tests in a fresh
+network namespace (loopback unreachable before, reachable after, idempotent, and an error is reported when
+the ioctl is not permitted); and the real agent binary run as PID 1 in fresh PID, mount and network
+namespaces inside the guest rootfs, where a workload running as the unprivileged `agent` user could connect
+to `127.0.0.1`, whereas the agent built from the commit before the change reproduced `Network is
+unreachable`. The helper's `--stdio` mode never needed loopback.
+
+**Verified / not verified.** Verified: the relay path with real sockets through the real proxy and hub, and PSI
+end to end over it (host network; also with both programs running in the guest rootfs's userland as the
+unprivileged `agent` user, in a chroot, which shares the host's network and has no firewall). Not verified: a
+booted Firecracker cell, the nftables rules in front of a real peer session, shaping of peer traffic, and
+loopback inside a real guest.

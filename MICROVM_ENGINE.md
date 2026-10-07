@@ -303,3 +303,28 @@ Total: ~50-200ms depending on snapshot size
 - Per cell: CPU usage, memory usage, disk I/O, network I/O, uptime, command count.
 - Per node: Total capacity, used capacity, cell count, Firecracker process count.
 - Per cluster: Total cells, total nodes, warm pool fill rate, snapshot storage used.
+
+
+## Snapshot bundles and `restore_vm` (Firecracker engine)
+
+`snapshot_vm` pauses the guest, has Firecracker write `vm.snap` + `vm.mem` inside the jail, moves them out and copies the
+cell's `rootfs.ext4`, then writes `meta.json`: image, vCPUs, memory, the guest network identity (IP/prefix) and a sha256 of
+every file. `restore_vm(config, snapshot_dir)`:
+
+1. validates the bundle **before spawning anything** (metadata, all three files, hashes, and that the new cell is given the
+   **same guest address**: IP/MAC/routes live in guest memory, so a different /30 cannot work; `SnapshotError` otherwise);
+2. builds a fresh jail with *private copies* of disk, memory and state (owned by the jailer uid; the bundle stays pristine and
+   can be restored again, each restore with an independent disk), and no kernel (the guest carries it);
+3. starts the jailer into the cell's netns, **without** the configure calls, then `PUT /snapshot/load` with
+   `resume_vm: true` and `network_overrides` mapping `eth0` to the new cell's TAP;
+4. registers a normal managed VM (pause/snapshot/destroy/reconcile all work); any failure tears the jail down.
+
+Machine shape comes from the snapshot, not the request. Sharp edges: the guest resumes with its old RNG/entropy state, so
+several restores of one snapshot are *clones* and must not be treated as independent for keys/nonces; established vsock
+connections are reset (the agent must accept new ones); hashes detect corruption, not a hostile writer, so keep snapshot
+storage write-protected; the control-plane routes now call the engine (`services/snapshot_service.py`; see API_DOCUMENTATION.md): restore
+claims the snapshot's exact /30 (`NetAllocator.claim`) and is refused with 409 if another cell holds it, which also means a
+clone only works once the source cell no longer holds that address.
+Verified with real Firecracker (no KVM): the jailer-uid VMM opens our jail-relative snapshot file and parses our
+`/snapshot/load` request (it rejects a bogus snapshot by CRC, not by request shape). Not verified: an actual restore of a
+running guest, and `network_overrides` (processed after state load).
