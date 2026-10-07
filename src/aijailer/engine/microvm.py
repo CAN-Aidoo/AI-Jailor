@@ -59,6 +59,10 @@ class VMInfo:
     vsock_path: str | None = None
 
 
+class AgentError(RuntimeError):
+    """The guest agent refused or failed a request (it replied {"error": ...})."""
+
+
 @dataclass
 class ExecResult:
     """Result from executing a command inside a microVM."""
@@ -127,9 +131,12 @@ class MicroVMEngine(ABC):
 
     @abstractmethod
     async def exec_command(
-        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
+        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent",
+        env: dict[str, str] | None = None, cwd: str | None = None,
     ) -> ExecResult:
-        """Execute a command inside a microVM via the cell agent."""
+        """Execute a command inside a microVM via the cell agent. ``env`` is the per-command environment,
+        applied over the cell's own, and ``cwd`` the directory to start in (None: the user's home);
+        callers validate both first (``core.exec_env``)."""
 
     async def snapshot_vm(self, cell_id: uuid.UUID, snapshot_dir: str) -> dict:
         """Pause + dump memory/device state. Optional capability."""
@@ -218,7 +225,8 @@ class SimulatedMicroVMEngine(MicroVMEngine):
         return await self.create_vm(config)
 
     async def exec_command(
-        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent"
+        self, cell_id: uuid.UUID, command: str, timeout: int = 30, user: str = "agent",
+        env: dict[str, str] | None = None, cwd: str | None = None,
     ) -> ExecResult:
         """Simulate command execution."""
         return ExecResult(

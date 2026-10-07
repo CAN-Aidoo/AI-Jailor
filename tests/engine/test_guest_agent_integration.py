@@ -104,3 +104,39 @@ async def test_file_put_get_binary_safe(vm, tmp_path):
 async def test_get_missing_file_is_agent_error(vm):
     with pytest.raises(fc.AgentError):
         await fc.agent_get_file(vm, 5000, "/definitely/not/here")
+
+
+@pytest.mark.asyncio
+async def test_exec_environment_reaches_the_real_agent_through_the_python_client(vm):
+    r = await fc.agent_exec(vm, 5000, "/usr/bin/env", 10, "agent",
+                            env={"FOO": "bar baz", "PATH": "/usr/bin:/bin", "EMPTY": ""})
+    lines = dict(line.split("=", 1) for line in r.stdout.strip().splitlines() if "=" in line)
+    assert lines["FOO"] == "bar baz" and lines["PATH"] == "/usr/bin:/bin" and lines["EMPTY"] == ""
+    assert "AGENT_SECRET" not in lines
+
+
+@pytest.mark.asyncio
+async def test_a_bad_exec_environment_is_refused_by_the_real_agent(vm):
+    with pytest.raises(fc.AgentError, match="invalid environment variable name"):
+        await fc.agent_exec(vm, 5000, "true", 10, "agent", env={"A=B": "x"})
+    with pytest.raises(fc.AgentError, match="HOME"):
+        await fc.agent_exec(vm, 5000, "true", 10, "agent", env={"HOME": "/"})
+
+
+@pytest.mark.asyncio
+async def test_exec_working_directory_reaches_the_real_agent(vm, tmp_path):
+    r = await fc.agent_exec(vm, 5000, "pwd -P", 10, "agent", cwd=str(tmp_path))
+    assert r.stdout.strip() == os.path.realpath(tmp_path) and r.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_a_bad_working_directory_is_reported_naming_the_directory(vm, tmp_path):
+    with pytest.raises(fc.AgentError) as missing:
+        await fc.agent_exec(vm, 5000, "true", 10, "agent", cwd="/definitely/not/here")
+    assert "/definitely/not/here" in str(missing.value) and "/bin/sh" not in str(missing.value)
+    plain = tmp_path / "plain-file"
+    plain.write_text("x")
+    with pytest.raises(fc.AgentError, match="not a directory"):
+        await fc.agent_exec(vm, 5000, "true", 10, "agent", cwd=str(plain))
+    with pytest.raises(fc.AgentError, match="absolute"):
+        await fc.agent_exec(vm, 5000, "true", 10, "agent", cwd="relative/dir")
