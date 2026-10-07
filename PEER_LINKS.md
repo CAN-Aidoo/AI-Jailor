@@ -68,6 +68,34 @@ checks happen in the helper. Status goes to stderr as JSON lines (`listening`, `
 peer's attested cell/tenant and certificate hashes, `closed`, `error`). Exit codes: 0 ok, 2 usage,
 3 platform refused, 4 attestation rejected, 5 TLS failed, 6 other.
 
+### Local hand-off and loopback
+
+In `--listen` mode the workload reaches the helper over TCP on the guest's loopback interface, so `lo` must
+be up inside the cell. `--stdio` mode needs no loopback.
+
+A freshly booted kernel starts with `lo` **down**, and the boot arguments configure only `eth0`
+(`ip=<guest>::<host>:<mask>::eth0:off`). With `lo` down, a connection to `127.0.0.1` fails with
+`Network is unreachable`. The guest init (`aijailer-agent`, `bringUpLoopback` in
+`guest-agent/init_linux.go`) now brings `lo` up at boot, so nothing is needed on the standard image. It was
+verified with unit tests in a fresh network namespace and by running the real agent as PID 1 in fresh PID,
+mount and network namespaces inside the guest rootfs (an unprivileged workload reached `127.0.0.1`; the agent
+from before the fix reproduced the failure). Not verified: a booted Firecracker cell.
+
+If you see `Network is unreachable` connecting to the helper:
+- **`listening` does not prove it is reachable.** Binding to `127.0.0.1` succeeds even while `lo` is down (the
+  helper logs `listening`, then the workload's connect fails), so check the workload's error, not just the
+  helper's status.
+- Check that the cell runs an `aijailer-agent` that includes the loopback fix. On a **custom image or init**,
+  bring `lo` up yourself before starting the helper (for example `ip link set lo up`); it needs
+  `CAP_NET_ADMIN`, which workloads do not have.
+
+Security notes for the local socket:
+- The helper serves **one** local connection and does not authenticate it: the first process in the cell to
+  connect becomes the channel's endpoint. Bind loopback only (`127.0.0.1`, not `0.0.0.0`), start the workload
+  right after the `listening` event, or use `--stdio` from a parent process so there is no listening socket.
+- Everything in the cell can reach the loopback socket, which is consistent with the trust model: the peer link
+  authenticates the *cell*, not individual processes inside it.
+
 ## What this does and does not protect
 
 Protected:
