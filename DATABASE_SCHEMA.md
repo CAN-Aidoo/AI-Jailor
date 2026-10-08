@@ -566,6 +566,19 @@ One row per consented cell-to-cell link: `id`, `initiator_tenant_id`/`initiator_
 Check: initiator and responder cells differ. Indexes on both tenants and both cells. Expiry is evaluated
 at read time and at every relay attach; there is no cleanup dependency. See PEER_LINKS.md.
 
+### executions.environment redaction (migration 009)
+
+Data-only, no schema change. Rewrites every existing `executions.environment` to the variable names with each
+value replaced by `[redacted]`, matching what the service now stores. Rows that are empty, NULL, not a JSON
+object, or already redacted are skipped, so it can run twice. It works in batches of 1000 by primary key and
+uses plain SELECT/UPDATE (no Postgres-only SQL), one UPDATE per row that needs it.
+
+- **Irreversible.** The old values are overwritten and `downgrade` is a no-op. Back up first if you need them.
+- **It does not purge copies.** Backups, replicas and WAL made before the upgrade still hold the old values, as
+  do `Cell.environment` (a separate store, unchanged) and the command text and output of past runs.
+- The values may already have been exposed to whoever could read the table; if they were real credentials,
+  rotating them is the actual fix. Running the migration only stops the table holding them from now on.
+
 ### Private set intersection (no schema)
 
 The reference PSI workload (`examples/psi/`, see PEER_LINKS.md) adds **no tables, columns or migrations**

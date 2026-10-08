@@ -208,7 +208,9 @@ That does not make `environment` a place for credentials:
   credentials at the egress broker so they never enter the cell;
 - the command text and its output (`stdout`, `stderr`) are stored as given, so do not write a secret into the
   command or print one;
-- executions recorded before the values were redacted keep what they were stored with.
+- executions recorded before the values were redacted keep what they were stored with until migration `009` is
+  applied (`alembic upgrade head`), which rewrites them to names only. It is irreversible and does not reach
+  database backups or replicas made earlier (see DATABASE_SCHEMA.md).
 
 **`working_directory`** is where the command starts. It must be an absolute path (starting with `/`) of at most
 1,024 characters with no NUL byte, otherwise `400 invalid_working_directory` (nothing runs or is stored). When
