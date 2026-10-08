@@ -355,6 +355,24 @@ For cloud deployments, cell nodes can be auto-scaled:
 - Migration applied before new code deploys (database-first, code-second).
 - Rollback: deploy previous code version (no reverse migrations needed if forward-compatible).
 
+**Migration 009 (redacts `executions.environment` on existing rows)** is a data rewrite, not a schema change, and the
+one exception to the rollback line above: it is irreversible (the old values are overwritten; `downgrade` does nothing),
+so take a database backup first. It runs as part of `alembic upgrade head`.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `AIJAILER_REDACT_BATCH` | `1000` | Rows read and rewritten per batch. A positive integer; anything else aborts before any row is touched. |
+
+This is an **environment variable, not an `alembic` command-line flag** (Alembic cannot pass options into a migration):
+
+```bash
+AIJAILER_REDACT_BATCH=200 alembic upgrade head
+```
+
+It limits memory per read, not the transaction: on PostgreSQL the whole migration runs in one transaction, so a smaller
+batch does not shorten locks. Try it on a copy of production data first. See DATABASE_SCHEMA.md for what it does and does
+not remove (backups, replicas and WAL made earlier keep the old values).
+
 ## Monitoring and Alerting
 
 ### Monitoring Stack
