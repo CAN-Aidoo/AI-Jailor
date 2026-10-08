@@ -90,3 +90,16 @@ def validate_working_directory(path: str | None) -> str | None:
         raise AiJailerError("working_directory must be an absolute path (start with /)",
                             code="invalid_working_directory")
     return path
+
+
+REDACTED = "[redacted]"
+
+
+def redact_environment(env: dict[str, str] | None) -> dict[str, str]:
+    """What the execution record keeps of a command's environment: the names, never the values.
+
+    The values go to the guest and nowhere else. Every value is replaced, not just those whose name looks
+    secret: a name heuristic (TOKEN, KEY, ...) misses `DB_URL`, `AUTH`, `X` and anything unconventional, and
+    the names alone are what an audit needs ("which variables did this command run with?").
+    """
+    return {name: REDACTED for name in (env or {})}

@@ -81,6 +81,18 @@ AI Jailer provides microVM-based isolation where every agent session runs in its
 - Firecracker data plane: controller implemented and unit-tested against a fake VMM; **not yet validated on real KVM hardware**. The simulated engine is refused outside `AIJAILER_ENV=dev`.
 - See [RESEARCH_ALIGNMENT.md](./RESEARCH_ALIGNMENT.md) for what we adopt from existing standards (Firecracker, in-toto/DSSE, Cedar, K8s agent-sandbox) versus build (flow control, egress broker, execution gate).
 
+## Upgrading the database: migration 009 batch size
+
+Migration `009_redact_execution_environment` rewrites the `environment` stored on existing `executions` rows so they keep variable names but not values. It runs with the rest of `alembic upgrade head`, and it **cannot be undone**, so back up first.
+
+Rows are rewritten in batches of 1000 by default. To change that, set `AIJAILER_REDACT_BATCH` to a positive integer. It is an environment variable, not an `alembic` flag:
+
+```bash
+AIJAILER_REDACT_BATCH=200 alembic upgrade head
+```
+
+Anything that is not a positive integer aborts the upgrade before any row is touched. The setting limits memory per read, not the transaction: on PostgreSQL all batches commit or roll back together. Details and limits (backups and replicas keep the old values) are in [DEPLOYMENT.md](./DEPLOYMENT.md) and [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md).
+
 ## Documentation Index
 
 | Document | Description |

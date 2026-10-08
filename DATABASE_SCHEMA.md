@@ -376,7 +376,7 @@ CREATE TABLE executions (
     interpreter VARCHAR(255),
     working_directory VARCHAR(1024),
     user_context VARCHAR(63) DEFAULT 'agent',
-    environment JSONB DEFAULT '{}',
+    environment JSONB DEFAULT '{}',  -- variable NAMES only; every value is stored as "[redacted]"
 
     -- Results
     exit_code INTEGER,
@@ -565,6 +565,28 @@ One row per consented cell-to-cell link: `id`, `initiator_tenant_id`/`initiator_
 `purpose` (<= 64), `created_at`, `accepted_at`, `expires_at`, `revoked_at`, `revoked_by_tenant_id`.
 Check: initiator and responder cells differ. Indexes on both tenants and both cells. Expiry is evaluated
 at read time and at every relay attach; there is no cleanup dependency. See PEER_LINKS.md.
+
+### executions.environment redaction (migration 009)
+
+Data-only, no schema change. Rewrites every existing `executions.environment` to the variable names with each
+value replaced by `[redacted]`, matching what the service now stores. Rows that are empty, NULL, not a JSON
+object, or already redacted are skipped, so it can run twice. It works in batches by primary key (1000 by
+default; set `AIJAILER_REDACT_BATCH=<positive integer>` to change it, e.g. `AIJAILER_REDACT_BATCH=200 alembic upgrade head`;
+anything else aborts before any row is touched) and
+uses plain SELECT/UPDATE (no Postgres-only SQL), one UPDATE per row that needs it.
+
+Tested on SQLite (`tests/services/test_redact_migration.py`) and on a real PostgreSQL 16 through the whole Alembic chain
+(`tests/services/test_redact_migration_postgres.py`: JSONB, UUID keyset paging over 2,500 rows, the real foreign keys).
+The PostgreSQL test uses `AIJAILER_TEST_PG_URL` if set, else starts a throwaway local cluster from the installed
+server binaries, else skips. It has not been run on a production-sized table or on managed Postgres.
+
+- **The batch size bounds memory per read, not the transaction.** Alembic runs the migration in one transaction on
+  PostgreSQL, so all batches commit or roll back together; a smaller batch does not shorten locks.
+- **Irreversible.** The old values are overwritten and `downgrade` is a no-op. Back up first if you need them.
+- **It does not purge copies.** Backups, replicas and WAL made before the upgrade still hold the old values, as
+  do `Cell.environment` (a separate store, unchanged) and the command text and output of past runs.
+- The values may already have been exposed to whoever could read the table; if they were real credentials,
+  rotating them is the actual fix. Running the migration only stops the table holding them from now on.
 
 ### Private set intersection (no schema)
 
