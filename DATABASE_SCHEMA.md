@@ -573,6 +573,11 @@ value replaced by `[redacted]`, matching what the service now stores. Rows that 
 object, or already redacted are skipped, so it can run twice. It works in batches of 1000 by primary key and
 uses plain SELECT/UPDATE (no Postgres-only SQL), one UPDATE per row that needs it.
 
+Tested on SQLite (`tests/services/test_redact_migration.py`) and on a real PostgreSQL 16 through the whole Alembic chain
+(`tests/services/test_redact_migration_postgres.py`: JSONB, UUID keyset paging over 2,500 rows, the real foreign keys).
+The PostgreSQL test uses `AIJAILER_TEST_PG_URL` if set, else starts a throwaway local cluster from the installed
+server binaries, else skips. It has not been run on a production-sized table or on managed Postgres.
+
 - **Irreversible.** The old values are overwritten and `downgrade` is a no-op. Back up first if you need them.
 - **It does not purge copies.** Backups, replicas and WAL made before the upgrade still hold the old values, as
   do `Cell.environment` (a separate store, unchanged) and the command text and output of past runs.
