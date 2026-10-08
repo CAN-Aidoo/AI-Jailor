@@ -182,3 +182,27 @@ def test_downgrade_then_upgrade_again_is_harmless_on_postgres(db):
     command.upgrade(cfg, "head")
     assert env_of(url, rid) == {"A": "[redacted]"}
     assert run_sql(url, "SELECT version_num FROM alembic_version") == [("009_redact_execution_environment",)]
+
+
+def test_batch_size_env_is_honoured_through_alembic_on_postgres(db, monkeypatch):
+    url, cfg = db
+    command.upgrade(cfg, "008_peer_links")
+    parents = seed_parents(url)
+    run_sql(url, "INSERT INTO executions (id, cell_id, tenant_id, command, environment) "
+                 "SELECT gen_random_uuid(), :c, :t, 'bulk', "
+                 f"jsonb_build_object('K', '{SECRET}-' || g) FROM generate_series(1, 25) g",
+            {"c": parents[1], "t": parents[0]})
+    monkeypatch.setenv("AIJAILER_REDACT_BATCH", "7")               # 7 + 7 + 7 + 4
+    command.upgrade(cfg, "head")
+    assert run_sql(url, "SELECT count(*) FROM executions WHERE environment = '{\"K\": \"[redacted]\"}'::jsonb") == [(25,)]
+
+
+def test_a_bad_batch_size_fails_the_upgrade_and_leaves_the_data_alone_on_postgres(db, monkeypatch):
+    url, cfg = db
+    command.upgrade(cfg, "008_peer_links")
+    rid = insert(url, seed_parents(url), f"CAST('{json.dumps({'A': SECRET})}' AS jsonb)")
+    monkeypatch.setenv("AIJAILER_REDACT_BATCH", "0")
+    with pytest.raises(ValueError, match="AIJAILER_REDACT_BATCH"):
+        command.upgrade(cfg, "head")
+    assert env_of(url, rid) == {"A": SECRET}
+    assert run_sql(url, "SELECT version_num FROM alembic_version") == [("008_peer_links",)]   # not stamped

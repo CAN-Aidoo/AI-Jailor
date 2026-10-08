@@ -570,7 +570,9 @@ at read time and at every relay attach; there is no cleanup dependency. See PEER
 
 Data-only, no schema change. Rewrites every existing `executions.environment` to the variable names with each
 value replaced by `[redacted]`, matching what the service now stores. Rows that are empty, NULL, not a JSON
-object, or already redacted are skipped, so it can run twice. It works in batches of 1000 by primary key and
+object, or already redacted are skipped, so it can run twice. It works in batches by primary key (1000 by
+default; set `AIJAILER_REDACT_BATCH=<positive integer>` to change it, e.g. `AIJAILER_REDACT_BATCH=200 alembic upgrade head`;
+anything else aborts before any row is touched) and
 uses plain SELECT/UPDATE (no Postgres-only SQL), one UPDATE per row that needs it.
 
 Tested on SQLite (`tests/services/test_redact_migration.py`) and on a real PostgreSQL 16 through the whole Alembic chain
@@ -578,6 +580,8 @@ Tested on SQLite (`tests/services/test_redact_migration.py`) and on a real Postg
 The PostgreSQL test uses `AIJAILER_TEST_PG_URL` if set, else starts a throwaway local cluster from the installed
 server binaries, else skips. It has not been run on a production-sized table or on managed Postgres.
 
+- **The batch size bounds memory per read, not the transaction.** Alembic runs the migration in one transaction on
+  PostgreSQL, so all batches commit or roll back together; a smaller batch does not shorten locks.
 - **Irreversible.** The old values are overwritten and `downgrade` is a no-op. Back up first if you need them.
 - **It does not purge copies.** Backups, replicas and WAL made before the upgrade still hold the old values, as
   do `Cell.environment` (a separate store, unchanged) and the command text and output of past runs.
