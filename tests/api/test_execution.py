@@ -253,3 +253,78 @@ async def test_a_command_whose_result_never_arrives_is_a_408_not_a_silent_succes
     history = await _history(client, cell_id)
     assert [h["status"] for h in history] == ["timeout"]
     assert history[0]["execution_id"] == r.json()["error"]["details"]["execution_id"]
+
+
+# ---------------------------------------------------------------- the execution record keeps names, not values
+# A distinctive but obviously fake marker (plain words, so secret scanners have no reason to flag it).
+SENTINEL = "sentinel-value-that-must-never-be-stored"
+
+
+async def _stored_executions(db_session):
+    from sqlalchemy import select
+
+    from aijailer.models.execution import Execution
+    return list((await db_session.execute(select(Execution))).scalars())
+
+
+def _everything(row) -> str:
+    """Every column of a stored execution, as text."""
+    return " ".join(str(getattr(row, c.name)) for c in row.__table__.columns)
+
+
+@pytest.fixture
+def recorded_logs(monkeypatch):
+    """Replace the execution service's logger with a recorder (the app caches structlog loggers, which
+    would make structlog's own capture helper silently capture nothing)."""
+    from aijailer.services import execution_service
+    events = []
+
+    class Recorder:
+        def __getattr__(self, level):
+            return lambda event, **kw: events.append((level, event, kw))
+    monkeypatch.setattr(execution_service, "logger", Recorder())
+    return events
+
+
+@pytest.mark.asyncio
+async def test_the_secret_value_reaches_the_guest_but_is_stored_nowhere(
+        client: AsyncClient, db_session, captured_exec, recorded_logs):
+    cell_id = await _running_cell(client)
+    r = await client.post(f"/v1/cells/{cell_id}/exec",
+                          json={"command": "run", "environment": {"API_TOKEN": SENTINEL, "DEBUG": "true"}})
+    assert r.status_code == 200
+    assert captured_exec[0]["env"] == {"API_TOKEN": SENTINEL, "DEBUG": "true"}      # the guest gets the real values
+
+    rows = await _stored_executions(db_session)
+    assert len(rows) == 1
+    assert rows[0].environment == {"API_TOKEN": "[redacted]", "DEBUG": "[redacted]"}   # names kept, values not
+    assert SENTINEL not in _everything(rows[0]) and "true" not in rows[0].environment.values()
+
+    assert any(event == "execution.started" for _, event, _ in recorded_logs)         # the recorder works...
+    assert SENTINEL not in repr(recorded_logs)                                          # ...and saw no value
+
+    audit = await client.get("/v1/audit/events", params={
+        "start_time": "2020-01-01T00:00:00", "end_time": "2100-01-01T00:00:00", "cell_id": cell_id})
+    assert audit.status_code == 200 and audit.json()["data"]["events"]               # events exist, so this means something
+    assert SENTINEL not in audit.text
+
+
+@pytest.mark.asyncio
+async def test_a_failed_run_stores_no_value_either(client: AsyncClient, db_session, monkeypatch, recorded_logs):
+    from aijailer.engine.microvm import AgentError
+    _engine_raises(monkeypatch, AgentError("cannot start in working directory \"/nope\": no such file or directory"))
+    cell_id = await _running_cell(client)
+    r = await client.post(f"/v1/cells/{cell_id}/exec",
+                          json={"command": "run", "environment": {"API_TOKEN": SENTINEL}, "working_directory": "/nope"})
+    assert r.status_code == 400 and SENTINEL not in r.text                              # not echoed in the error either
+    rows = await _stored_executions(db_session)
+    assert [row.status for row in rows] == ["failed"]
+    assert rows[0].environment == {"API_TOKEN": "[redacted]"} and SENTINEL not in _everything(rows[0])
+    assert SENTINEL not in repr(recorded_logs)
+
+
+@pytest.mark.asyncio
+async def test_no_environment_stores_an_empty_one(client: AsyncClient, db_session, captured_exec):
+    cell_id = await _running_cell(client)
+    assert (await client.post(f"/v1/cells/{cell_id}/exec", json={"command": "true"})).status_code == 200
+    assert (await _stored_executions(db_session))[0].environment == {}

@@ -198,9 +198,17 @@ Rules, enforced with `400 invalid_environment` before anything runs or is stored
 - `HOME` and `USER` are set by the guest agent from the account the command runs as and cannot be set.
 
 The rules are a guard against confusion, not a security boundary: a command can always export whatever it likes
-itself, and what a cell can reach is enforced by the host firewall. **Do not put secrets in `environment`:** the
-request's environment is stored as given in the execution record (no application-level encryption or redaction). Use the secret store (`/v1/secrets`),
-which injects credentials at the egress broker so they never enter the cell.
+itself, and what a cell can reach is enforced by the host firewall.
+
+**The values are not stored.** The execution record keeps only the variable names, each with the value
+`[redacted]` (every value, not just those whose names look secret, since `AUTH` or `DB_URL` would slip past a
+name check). The values go to the guest and nowhere else: they are not logged or put in the audit trail either.
+That does not make `environment` a place for credentials:
+- the code running in the cell can read every value, so use the secret store (`/v1/secrets`), which injects
+  credentials at the egress broker so they never enter the cell;
+- the command text and its output (`stdout`, `stderr`) are stored as given, so do not write a secret into the
+  command or print one;
+- executions recorded before the values were redacted keep what they were stored with.
 
 **`working_directory`** is where the command starts. It must be an absolute path (starting with `/`) of at most
 1,024 characters with no NUL byte, otherwise `400 invalid_working_directory` (nothing runs or is stored). When

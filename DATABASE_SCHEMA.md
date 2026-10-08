@@ -376,7 +376,7 @@ CREATE TABLE executions (
     interpreter VARCHAR(255),
     working_directory VARCHAR(1024),
     user_context VARCHAR(63) DEFAULT 'agent',
-    environment JSONB DEFAULT '{}',
+    environment JSONB DEFAULT '{}',  -- variable NAMES only; every value is stored as "[redacted]"
 
     -- Results
     exit_code INTEGER,
