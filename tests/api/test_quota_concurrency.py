@@ -19,6 +19,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from tests import pgserver
 
 from aijailer.api.app import create_app
 from aijailer.db.base import Base, get_db
@@ -39,22 +40,31 @@ async def _build(tmp_path, monkeypatch, audit_kind):
     would wait on the request that is waiting for it. On PostgreSQL those touch different rows and
     never block each other, so this is emulation plumbing, not application behaviour."""
     monkeypatch.setenv("ADMIN_TOKEN", "op-secret")
-    path = f"sqlite+aiosqlite:///{tmp_path}/c.db"
-    eng = create_async_engine(path, connect_args={"timeout": 60})
+    pg_url = await pgserver.new_database("quota_conc") if pgserver.use_postgres() else None
+    if pg_url:
+        # The real thing: plain PostgreSQL READ COMMITTED, no emulation. Row locks (FOR UPDATE) must do the work.
+        eng = create_async_engine(pg_url, pool_size=20, max_overflow=40)
+        audit_eng = create_async_engine(pg_url, pool_size=10, max_overflow=20)
+        _PG_URLS[id(eng)] = pg_url
+        async with eng.begin() as c:
+            await c.run_sync(Base.metadata.create_all)
+    else:
+        path = f"sqlite+aiosqlite:///{tmp_path}/c.db"
+        eng = create_async_engine(path, connect_args={"timeout": 60})
 
-    @event.listens_for(eng.sync_engine, "connect")
-    def _no_implicit_begin(dbapi_connection, _):
-        dbapi_connection.isolation_level = None            # we issue BEGIN ourselves
+        @event.listens_for(eng.sync_engine, "connect")
+        def _no_implicit_begin(dbapi_connection, _):
+            dbapi_connection.isolation_level = None        # we issue BEGIN ourselves
 
-    @event.listens_for(eng.sync_engine, "begin")
-    def _begin_immediate(conn):
-        conn.exec_driver_sql("BEGIN IMMEDIATE")            # take the write lock up front
+        @event.listens_for(eng.sync_engine, "begin")
+        def _begin_immediate(conn):
+            conn.exec_driver_sql("BEGIN IMMEDIATE")        # take the write lock up front
 
-    async with eng.begin() as c:
-        await c.run_sync(Base.metadata.create_all)
-        await c.exec_driver_sql("PRAGMA journal_mode=WAL")
+        async with eng.begin() as c:
+            await c.run_sync(Base.metadata.create_all)
+            await c.exec_driver_sql("PRAGMA journal_mode=WAL")
+        audit_eng = create_async_engine(path, connect_args={"timeout": 60})
     sf = async_sessionmaker(eng, expire_on_commit=False)
-    audit_eng = create_async_engine(path, connect_args={"timeout": 60})
     if audit_kind == "db":
         audit = asv.AuditService(signer=Ed25519Signer.from_secret("k"),
                                  store=DbAuditStore(async_sessionmaker(audit_eng, expire_on_commit=False)))
@@ -88,14 +98,24 @@ async def _build(tmp_path, monkeypatch, audit_kind):
     return sf, audit, tid, client, (eng, audit_eng)
 
 
+_PG_URLS: dict[int, str] = {}                       # engine -> its throwaway database (PostgreSQL runs)
+
+
+async def _teardown(client, engines):
+    await client.aclose()
+    for e in engines:
+        await e.dispose()
+    url = _PG_URLS.pop(id(engines[0]), None)
+    if url:
+        await pgserver.drop_database(url)
+
+
 @pytest.fixture
 async def world(tmp_path, monkeypatch):
     """Quota changes with the database audit log."""
     sf, audit, tid, client, engines = await _build(tmp_path, monkeypatch, "db")
     yield sf, audit, tid, client
-    await client.aclose()
-    for e in engines:
-        await e.dispose()
+    await _teardown(client, engines)
 
 
 @pytest.fixture
@@ -103,9 +123,7 @@ async def world_mem(tmp_path, monkeypatch):
     """Snapshot admission under concurrent limit changes (in-memory audit log, see _build)."""
     sf, audit, tid, client, engines = await _build(tmp_path, monkeypatch, "memory")
     yield sf, audit, tid, client
-    await client.aclose()
-    for e in engines:
-        await e.dispose()
+    await _teardown(client, engines)
 
 
 def qurl(tid):

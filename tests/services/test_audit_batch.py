@@ -7,6 +7,7 @@ import uuid
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from tests import pgserver
 
 from aijailer.db.base import Base
 from aijailer.models.audit import EventType, Severity
@@ -34,12 +35,16 @@ class SpyStore(DbAuditStore):
 
 @pytest.fixture
 async def sf(tmp_path):
-    eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/b.db", connect_args={"timeout": 30})
+    pg_url = await pgserver.new_database("audit_batch") if pgserver.use_postgres() else None
+    eng = (create_async_engine(pg_url) if pg_url
+           else create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/b.db", connect_args={"timeout": 30}))
     async with eng.begin() as c:
         await c.run_sync(lambda s: Base.metadata.create_all(
             s, tables=[AuditEventRow.__table__, AuditCheckpointRow.__table__]))
     yield async_sessionmaker(eng, expire_on_commit=False)
     await eng.dispose()
+    if pg_url:
+        await pgserver.drop_database(pg_url)
 
 
 def svc(sf, **kw):
