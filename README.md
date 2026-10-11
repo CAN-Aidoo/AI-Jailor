@@ -88,6 +88,10 @@ Migration `009_redact_execution_environment` rewrites the `environment` stored o
 Rows are rewritten in batches of 1000 by default. To change that, set `AIJAILER_REDACT_BATCH` to a positive integer. It is an environment variable, not an `alembic` flag:
 
 ```bash
+# default: 1000 rows per batch
+alembic upgrade head
+
+# smaller batches (200 rows)
 AIJAILER_REDACT_BATCH=200 alembic upgrade head
 ```
 
