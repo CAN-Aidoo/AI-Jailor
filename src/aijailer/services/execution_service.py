@@ -12,7 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aijailer.core.config import get_settings
-from aijailer.core.exec_env import validate_exec_environment, validate_working_directory
+from aijailer.core.exec_env import (
+    redact_environment,
+    validate_exec_environment,
+    validate_working_directory,
+)
 from aijailer.core.exceptions import (
     AiJailerError,
     CellNotRunningError,
@@ -92,7 +96,7 @@ class ExecutionService:
             timeout_seconds=timeout_seconds,
             user_context=user,
             working_directory=working_directory or cell.working_directory,
-            environment=environment or {},
+            environment=redact_environment(environment),    # the values go to the guest, not the database
             api_key_id=api_key_id,
             request_id=request_id,
             status="running",

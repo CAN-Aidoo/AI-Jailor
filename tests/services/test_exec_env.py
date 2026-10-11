@@ -9,7 +9,9 @@ from aijailer.core.exec_env import (
     MAX_VALUE_BYTES,
     MAX_VARS,
     MAX_CWD_LEN,
+    REDACTED,
     managed_reason,
+    redact_environment,
     validate_exec_environment,
     validate_working_directory,
 )
@@ -105,3 +107,33 @@ def test_nul_and_overlong_paths_are_refused():
     assert "NUL" in cwd_refused("/tmp/a\x00b")
     validate_working_directory("/" + "a" * (MAX_CWD_LEN - 1))
     assert str(MAX_CWD_LEN) in cwd_refused("/" + "a" * MAX_CWD_LEN)
+
+
+# ---------------------------------------------------------------- redaction for the execution record
+def test_redaction_keeps_every_name_and_drops_every_value():
+    env = {"API_TOKEN": "s3cr3t", "DEBUG": "true", "X": "", "DB_URL": "postgres://u:p@h/db", "naïve": "☃"}
+    out = redact_environment(env)
+    assert set(out) == set(env)
+    assert set(out.values()) == {REDACTED}
+    for value in env.values():
+        if value:
+            assert value not in str(out)
+
+
+def test_redaction_covers_names_a_secret_heuristic_would_miss():
+    """Why every value goes, not just those named TOKEN/KEY/SECRET."""
+    assert redact_environment({"AUTH": "Bearer abc", "X": "hunter2"}) == {"AUTH": REDACTED, "X": REDACTED}
+
+
+def test_redaction_of_nothing_is_an_empty_dict_and_never_aliases_the_input():
+    assert redact_environment(None) == {} and redact_environment({}) == {}
+    env = {"A": "1"}
+    out = redact_environment(env)
+    out["B"] = "2"
+    assert env == {"A": "1"}
+
+
+def test_redaction_leaves_its_input_untouched_so_the_guest_still_gets_the_real_values():
+    env = {"API_TOKEN": "s3cr3t"}
+    redact_environment(env)
+    assert env == {"API_TOKEN": "s3cr3t"}
