@@ -386,6 +386,17 @@ writers never fork or lose a chain). Each append is its own short transaction on
 survives a request that later rolls back, and never depends on one. A failed append raises: the operation that needed
 the record is not silently unaudited.
 
+**Contention on one chain (PostgreSQL).** On PostgreSQL every append first takes a transaction-scoped advisory lock for its
+chain (`pg_advisory_xact_lock` on a hash of tenant and cell), so writers to the same chain queue instead of racing on the
+unique constraint. Before this, writers all read the same head, all inserted at head+1 and all but one failed and retried
+(12 attempts, 0 to 5 ms back-off); with about 30 concurrent writers on one chain an unlucky one ran out of attempts and the
+request failed with `AuditWriteError: ... (contention)` (about 1 run in 30 in the quota concurrency test). The lock is
+released at commit or rollback, so for `session=` appends it is held for the rest of the caller's transaction. A batch locks
+all the chains it touches in one sorted order so two batches over the same chains cannot deadlock. A caller that appends to
+several chains in one transaction should do so in a consistent order for the same reason (PostgreSQL would abort one of two
+deadlocking transactions with a deadlock error). The unique `(tenant, cell, seq)` constraint and the retry loop remain as the
+backstop, and are the only mechanism on SQLite, which has no advisory locks (its writer lock already serialises writers).
+
 **Append-only.** On PostgreSQL the migration installs `BEFORE UPDATE OR DELETE` triggers that reject any change to
 `audit_events` and `audit_checkpoints`, even from the application role. Retention or erasure therefore needs a deliberate
 privileged procedure (disable the trigger, re-anchor the chain, record that you did). *Not exercised by the test suite*
