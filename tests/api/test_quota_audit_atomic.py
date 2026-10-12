@@ -10,6 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from tests import pgserver
 
 from aijailer.api.app import create_app
 from aijailer.db.base import Base, get_db
@@ -38,7 +39,9 @@ class FlakyCommitSession(AsyncSession):
 async def world(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "op-secret")
     FlakyCommitSession.fail_commits = 0
-    eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/q.db", connect_args={"timeout": 30})
+    pg_url = await pgserver.new_database("quota_atomic") if pgserver.use_postgres() else None
+    eng = (create_async_engine(pg_url) if pg_url
+           else create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/q.db", connect_args={"timeout": 30}))
     async with eng.begin() as c:
         await c.run_sync(Base.metadata.create_all)
     sf = async_sessionmaker(eng, expire_on_commit=False, class_=FlakyCommitSession)
@@ -68,6 +71,8 @@ async def world(tmp_path, monkeypatch):
     yield sf, audit, store, tid, client
     await client.aclose()
     await eng.dispose()
+    if pg_url:
+        await pgserver.drop_database(pg_url)
 
 
 async def limits(sf, tid):

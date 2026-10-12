@@ -588,6 +588,13 @@ server binaries, else skips. It has not been run on a production-sized table or 
 - The values may already have been exposed to whoever could read the table; if they were real credentials,
   rotating them is the actual fix. Running the migration only stops the table holding them from now on.
 
+### tenant_secrets.key_id widened (migration 010)
+
+`key_id` was `VARCHAR(64)`, but the KMS provider stores the key's full ARN (about 76 characters, up to 2048 by AWS's
+limits). PostgreSQL refuses such a value; SQLite does not enforce the length, so it only showed when the test suite was
+run on PostgreSQL. Migration 010 widens the column to `VARCHAR(2048)` (a metadata-only change on PostgreSQL). `downgrade`
+narrows it again and fails if a stored value is longer than 64 characters. Deployments using only local keys are unaffected.
+
 ### Private set intersection (no schema)
 
 The reference PSI workload (`examples/psi/`, see PEER_LINKS.md) adds **no tables, columns or migrations**

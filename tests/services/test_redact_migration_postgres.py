@@ -22,6 +22,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -181,7 +182,7 @@ def test_downgrade_then_upgrade_again_is_harmless_on_postgres(db):
     assert env_of(url, rid) == {"A": "[redacted]"}
     command.upgrade(cfg, "head")
     assert env_of(url, rid) == {"A": "[redacted]"}
-    assert run_sql(url, "SELECT version_num FROM alembic_version") == [("009_redact_execution_environment",)]
+    assert run_sql(url, "SELECT version_num FROM alembic_version") == [(ScriptDirectory.from_config(cfg).get_current_head(),)]
 
 
 def test_batch_size_env_is_honoured_through_alembic_on_postgres(db, monkeypatch):
@@ -206,3 +207,26 @@ def test_a_bad_batch_size_fails_the_upgrade_and_leaves_the_data_alone_on_postgre
         command.upgrade(cfg, "head")
     assert env_of(url, rid) == {"A": SECRET}
     assert run_sql(url, "SELECT version_num FROM alembic_version") == [("008_peer_links",)]   # not stamped
+
+
+def test_a_full_kms_key_arn_fits_the_migrated_tenant_secrets_table(db):
+    """tenant_secrets.key_id was VARCHAR(64); the KMS provider stores the full key ARN (about 76 characters).
+    SQLite does not enforce VARCHAR lengths, so only PostgreSQL shows it."""
+    url, cfg = db
+    command.upgrade(cfg, "head")
+    assert run_sql(url, "SELECT character_maximum_length FROM information_schema.columns "
+                        "WHERE table_name = 'tenant_secrets' AND column_name = 'key_id'") == [(2048,)]
+    tenant, _cell = seed_parents(url)
+    arn = "arn:aws:kms:eu-central-1:123456789012:key/" + str(uuid.uuid4())
+    assert len(arn) > 64
+    run_sql(url, "INSERT INTO tenant_secrets (id, tenant_id, name, version, hosts, ciphertext, nonce, wrapped_dek, key_id) "
+                 "VALUES (:i, :t, 's', 1, '[]', 'x', 'n', 'w', :k)", {"i": uuid.uuid4(), "t": tenant, "k": arn})
+    assert run_sql(url, "SELECT key_id FROM tenant_secrets") == [(arn,)]
+
+
+def test_the_key_id_migration_is_reversible_while_the_values_still_fit(db):
+    url, cfg = db
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "009_redact_execution_environment")
+    assert run_sql(url, "SELECT character_maximum_length FROM information_schema.columns "
+                        "WHERE table_name = 'tenant_secrets' AND column_name = 'key_id'") == [(64,)]

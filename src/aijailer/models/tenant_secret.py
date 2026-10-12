@@ -30,7 +30,8 @@ class TenantSecret(Base):
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     nonce: Mapped[bytes] = mapped_column(LargeBinary(12), nullable=False)
     wrapped_dek: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    key_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # The KEK's identifier. For AWS KMS that is the full key ARN (up to 2048 characters), not a short id.
+    key_id: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
 
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

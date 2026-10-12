@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import delete, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from tests import pgserver
 
 from aijailer.db.base import Base
 from aijailer.models.audit import EventType
@@ -27,12 +28,16 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture
 async def sf(tmp_path):
     # A FILE database: several real connections, like production (the in-memory test DB shares one).
-    eng = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/audit.db", connect_args={"timeout": 30})
+    pg_url = await pgserver.new_database("audit_db") if pgserver.use_postgres() else None
+    eng = (create_async_engine(pg_url) if pg_url
+           else create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/audit.db", connect_args={"timeout": 30}))
     async with eng.begin() as c:
         await c.run_sync(lambda sync: Base.metadata.create_all(
             sync, tables=[AuditEventRow.__table__, AuditCheckpointRow.__table__]))
     yield async_sessionmaker(eng, expire_on_commit=False)
     await eng.dispose()
+    if pg_url:
+        await pgserver.drop_database(pg_url)
 
 
 def service(sf, signer=None):

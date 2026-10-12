@@ -10,13 +10,24 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from aijailer.api.app import create_app
 from aijailer.db.base import Base, get_db
 from aijailer.models.tenant import ApiKey, Tenant
+from sqlalchemy.pool import NullPool
 
-# Use SQLite for tests (in-memory)
+from tests import pgserver
+
+# SQLite (in-memory) by default; AIJAILER_TEST_DB=postgres runs the suite on PostgreSQL (see tests/pgserver.py)
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 
 @pytest.fixture
 async def db_engine():
+    if pgserver.use_postgres():
+        # One database with the schema, emptied after every test (cheaper than create/drop per test).
+        url = await pgserver.shared_database(Base.metadata)
+        engine = create_async_engine(url, echo=False, poolclass=NullPool)
+        yield engine
+        await pgserver.empty_all_tables(engine, Base.metadata)
+        await engine.dispose()
+        return
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
