@@ -73,14 +73,16 @@ async def test_used_and_limit_gauges_track_snapshots(client: AsyncClient, test_t
 
 @pytest.mark.asyncio
 async def test_failed_deleted_and_stuck_snapshots_are_not_counted(client: AsyncClient, test_tenant, db_engine):
+    import uuid
     from datetime import datetime, timedelta, timezone
 
     from aijailer.models.snapshot import Snapshot
     cell = await _cell(client)
     snap = (await client.post(f"/v1/cells/{cell}/snapshots", json={})).json()["data"]["id"]
     async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
-        s.add(Snapshot(tenant_id=test_tenant.id, cell_id=test_tenant.id, status="error", cell_config={}))
-        s.add(Snapshot(tenant_id=test_tenant.id, cell_id=test_tenant.id, status="creating", cell_config={},
+        # a real cell: snapshots.cell_id is a foreign key
+        s.add(Snapshot(tenant_id=test_tenant.id, cell_id=uuid.UUID(cell), status="error", cell_config={}))
+        s.add(Snapshot(tenant_id=test_tenant.id, cell_id=uuid.UUID(cell), status="creating", cell_config={},
                        created_at=datetime.now(timezone.utc) - timedelta(hours=5)))
         await s.commit()
     tid = str(test_tenant.id)

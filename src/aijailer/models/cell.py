@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from aijailer.db.types import INET, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -13,9 +13,11 @@ from aijailer.db.base import Base
 
 class Cell(Base):
     __tablename__ = "cells"
+    __table_args__ = (Index("ix_cells_tenant_status", "tenant_id", "status"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     name: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="creating")
     error_message: Mapped[str | None] = mapped_column(Text)

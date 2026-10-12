@@ -205,7 +205,7 @@ async def test_authorize_attach_says_no_for_every_kind_of_no(two):
     assert await authorize_attach(lid, str(two["ca"])) is None
     assert await authorize_attach(lid, str(two["cb"])) is None
     await set_cell(two["cb"], status="running")
-    await set_cell(two["ca"], tenant_id=uuid.uuid4())                           # no longer owned as agreed
+    await set_cell(two["ca"], tenant_id=two["tb"].id)                           # no longer owned as agreed (a real tenant: FK)
     assert await authorize_attach(lid, str(two["cb"])) is None
     await set_cell(two["ca"], tenant_id=two["ta"].id)
     assert await authorize_attach(lid, str(two["ca"])) is not None
