@@ -613,10 +613,24 @@ existing rows backfilled with `[]`) and `monthly_generation_limit` (nullable int
 
 **`downgrade` drops all five tables and the three columns, with their data.** Back up first if any of it matters.
 
-Not fixed by this migration (tolerated and listed by `tests/services/test_migrations_vs_models_postgres.py`): older
-tables where the models say `NOT NULL` but the migrations left the column nullable (mostly timestamps), and foreign keys
-and indexes that the migrations create but the models do not declare. A new table, column, or type/length difference
-between the models and the migrated schema fails that test.
+### NOT NULL now matches the models (migration 012) and the models declare their foreign keys and indexes
+
+Migration 012 sets `NOT NULL` on 30 columns the models call non-optional but the migrations had left nullable (mostly
+`created_at`/`updated_at`, plus `cells.environment/tags/working_directory`, `executions.environment/user_context/started_at`,
+`nodes.labels`, `persistent_volumes.used_mb`, `snapshots.retention_policy`, `webhooks.consecutive_failures`). Each column
+has a server default, so an existing NULL is first replaced with that same default and then `NOT NULL` is set; rows written
+through the application never had NULLs, so this normally changes no data. `downgrade` only drops the `NOT NULL`.
+
+`SET NOT NULL` takes an ACCESS EXCLUSIVE lock and scans the table: quick on small tables, a blocking scan on a large one
+(`executions` is the likeliest to be large). Run it in a maintenance window if so.
+
+The four foreign keys (`cells.tenant_id`, `executions.cell_id`, `snapshots.cell_id`, `webhooks.tenant_id`) and three indexes
+(`ix_cells_tenant_status`, `ix_executions_cell_started`, `ix_snapshots_cell_created`) already existed in the database from
+migration 001; the **models** did not declare them. They do now (no migration needed). Consequence for tests: with the
+foreign keys in the model schema, a PostgreSQL test run enforces them, so tests must create real parent rows.
+
+`tests/services/test_migrations_vs_models_postgres.py` now tolerates **no** difference between the migrated schema and the
+models (tables, columns, types, lengths, nullability, foreign keys, indexes). Server defaults are not compared.
 
 ### Private set intersection (no schema)
 

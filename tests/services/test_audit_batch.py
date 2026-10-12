@@ -87,9 +87,11 @@ async def test_a_batch_is_written_when_full_and_otherwise_after_the_delay(sf):
     t0 = time.monotonic()
     for i in range(5):
         sub(s, t, c, i)
-    while store.batches == [] and time.monotonic() - t0 < 2:
+    while s.batch_metrics()["flushes_total"] == 0 and time.monotonic() - t0 < 2:
         await asyncio.sleep(0.01)
     assert store.batches == [5] and time.monotonic() - t0 < 0.35          # size trigger, not delay
+    # `batches` is appended when the write STARTS; wait until it has finished, otherwise an event submitted
+    # now is picked up by the flush still in progress (by design) and the delay below is never exercised.
     sub(s, t, c, 99)
     await asyncio.sleep(0.1)
     assert s.batch_metrics()["pending"] == 1                              # waiting for the delay

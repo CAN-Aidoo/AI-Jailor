@@ -21,11 +21,10 @@ from tests.pgmigrate import admin_url, db, run_sql  # noqa: F401  (fixtures)
 NEW_TABLES = {"certified_components", "constraints", "attack_patterns", "generation_log", "security_certificates"}
 NEW_TENANT_COLUMNS = {"compliance_requirements", "custom_constraints", "monthly_generation_limit"}
 
-# Differences that are known and harmless, and that this check deliberately tolerates:
-#  - modify_nullable: timestamp/JSON columns the models call NOT NULL but older migrations left nullable
-#  - remove_fk / remove_index: foreign keys and indexes the migrations create that the models do not declare
-# Anything else (a missing table or column, a changed type or length) is drift that matters and fails.
-TOLERATED = {"modify_nullable", "remove_fk", "remove_index"}
+# There is no tolerated drift: the migrated schema must match the models in tables, columns, types, lengths,
+# nullability, foreign keys and indexes. (It used to tolerate NOT NULL / foreign-key / index differences on older
+# tables; migration 012 and the model fixes removed them.)
+TOLERATED: set[str] = set()
 
 
 def _flatten(diffs):
@@ -73,11 +72,11 @@ def test_the_migrated_schema_has_every_table_and_column_the_models_declare(db):
     assert missing == []
 
 
-def test_no_drift_beyond_the_known_harmless_kinds(db):
+def test_the_migrated_schema_has_no_drift_from_the_models(db):
     url, cfg = db
     command.upgrade(cfg, "head")
     bad = [d for d in model_diffs(url) if d[0] not in TOLERATED]
-    assert bad == [], [(d[0], _table_of(d)) for d in bad]
+    assert bad == [], [(d[0], _table_of(d), d[3] if d[0].startswith("modify_") else None) for d in bad]
 
 
 def test_the_tables_added_by_011_match_their_models_exactly(db):
@@ -156,3 +155,51 @@ def test_011_downgrade_drops_exactly_what_it_added_and_upgrade_restores_it(db):
     tables = {r[0] for r in run_sql(url, "SELECT table_name FROM information_schema.tables "
                                          "WHERE table_schema = 'public'")}
     assert NEW_TABLES <= tables
+
+
+def test_012_backfills_nulls_with_the_column_defaults_and_enforces_not_null(db):
+    url, cfg = db
+    command.upgrade(cfg, "011_codeimmune_tables")
+    tid, pid, cid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    # rows with explicit NULLs in columns that are about to become NOT NULL
+    run_sql(url, "INSERT INTO tenants (id, name, slug, created_at, updated_at) VALUES (:t, 'T', 'tt', NULL, NULL)", {"t": tid})
+    run_sql(url, "INSERT INTO security_policies (id, name, network_policy, filesystem_policy, syscall_policy, "
+                 "resource_policy, capability_policy, created_at) VALUES (:p, 'p', '{}', '{}', '{}', '{}', '{}', NULL)",
+            {"p": pid})
+    run_sql(url, "INSERT INTO cells (id, tenant_id, image, security_policy_id, environment, tags, working_directory, "
+                 "created_at) VALUES (:c, :t, 'img', :p, NULL, NULL, NULL, NULL)", {"c": cid, "t": tid, "p": pid})
+    run_sql(url, "INSERT INTO executions (id, cell_id, tenant_id, command, environment, user_context, started_at) "
+                 "VALUES (:i, :c, :t, 'x', NULL, NULL, NULL)", {"i": uuid.uuid4(), "c": cid, "t": tid})
+
+    command.upgrade(cfg, "head")
+
+    assert run_sql(url, "SELECT created_at IS NOT NULL, updated_at IS NOT NULL FROM tenants") == [(True, True)]
+    assert run_sql(url, "SELECT environment::text, tags::text, working_directory, created_at IS NOT NULL FROM cells") \
+        == [("{}", "{}", "/home/agent", True)]
+    assert run_sql(url, "SELECT environment::text, user_context, started_at IS NOT NULL FROM executions") \
+        == [("{}", "agent", True)]
+    with pytest.raises(Exception, match="null value in column"):
+        run_sql(url, "UPDATE tenants SET created_at = NULL")
+    with pytest.raises(Exception, match="null value in column"):
+        run_sql(url, "UPDATE cells SET tags = NULL")
+
+
+def test_012_downgrade_relaxes_not_null_again_and_keeps_the_values(db):
+    url, cfg = db
+    command.upgrade(cfg, "head")
+    tid = uuid.uuid4()
+    run_sql(url, "INSERT INTO tenants (id, name, slug) VALUES (:t, 'T', 'tt')", {"t": tid})
+    command.downgrade(cfg, "011_codeimmune_tables")
+    run_sql(url, "UPDATE tenants SET created_at = NULL")             # allowed again
+    command.upgrade(cfg, "head")                                      # and re-tightened
+    assert run_sql(url, "SELECT created_at IS NOT NULL FROM tenants") == [(True,)]
+
+
+def test_the_foreign_keys_and_indexes_the_models_declare_exist_in_the_migrated_schema(db):
+    url, cfg = db
+    command.upgrade(cfg, "head")
+    fks = {r[0] for r in run_sql(url, "SELECT conname FROM pg_constraint WHERE contype = 'f'")}
+    assert {"cells_tenant_id_fkey", "executions_cell_id_fkey", "snapshots_cell_id_fkey",
+            "webhooks_tenant_id_fkey"} <= fks
+    idx = {r[0] for r in run_sql(url, "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'")}
+    assert {"ix_cells_tenant_status", "ix_executions_cell_started", "ix_snapshots_cell_created"} <= idx

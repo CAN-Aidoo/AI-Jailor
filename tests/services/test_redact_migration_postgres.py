@@ -69,7 +69,7 @@ def test_full_chain_on_postgres_redacts_existing_rows(db):
     before_others = run_sql(url, "SELECT id::text, environment::text FROM executions WHERE id = ANY(:ids)",
                             {"ids": [done, empty, null, json_null, listy]})
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "009_redact_execution_environment")       # this test is about 009; 012 later backfills NULLs
 
     assert env_of(url, plain) == {"API_TOKEN": "[redacted]", "X": "[redacted]", "DB_URL": "[redacted]"}
     assert env_of(url, unicode_) == {"ÜBER": "[redacted]"}
