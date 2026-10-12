@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from aijailer.models.audit import AuditEvent, EventType, Severity
@@ -146,6 +146,24 @@ class DbAuditStore:
         return (await self.append_batch([(tenant_id, cell_id, build)]))[0]
 
     @staticmethod
+    async def _lock_chains(s, keys) -> None:
+        """PostgreSQL only: serialise appenders to the same chain(s) with a transaction-scoped advisory lock.
+
+        Without it, writers to one hot chain all read the same head, all insert at head+1 and all but one
+        lose the unique (tenant, cell, seq) race; with enough writers an unlucky one exhausted its retries
+        (``AuditWriteError ... contention``). With the lock they queue instead of colliding. The lock is
+        released by the session's commit or rollback, so it spans exactly the read-head-then-insert window
+        (and, for ``append_in_session``, the caller's transaction, which is what keeps head+1 valid until the
+        row commits). Several chains are locked in one global (sorted) order so two batches that touch the same
+        chains in opposite orders cannot deadlock. Two different chains that hash alike only share a lock, which
+        costs a little parallelism, never correctness; the unique constraint stays as the backstop.
+        Other dialects (SQLite) keep the optimistic insert-and-retry path."""
+        if s.get_bind().dialect.name != "postgresql":
+            return
+        for key in sorted({f"{t}:{c}" for t, c in keys}):
+            await s.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"), {"k": key})
+
+    @staticmethod
     async def _read_head(s, tenant_id, cell_id) -> tuple[int, str]:
         last = (await s.execute(
             select(AuditEventRow.seq, AuditEventRow.event_hash)
@@ -168,6 +186,7 @@ class DbAuditStore:
         record are atomic (neither can exist without the other). Each attempt runs in a SAVEPOINT,
         so losing the (tenant, cell, seq) race to another writer only retries this insert and
         leaves the caller's other work in the transaction intact."""
+        await self._lock_chains(session, [(tenant_id, cell_id)])        # held until the caller's commit/rollback
         for attempt in range(self.ATTEMPTS):
             seq, prev = await self._read_head(session, tenant_id, cell_id)
             e = build(prev)
@@ -191,6 +210,7 @@ class DbAuditStore:
         the batch is rebuilt on the new heads and retried. All-or-nothing."""
         for attempt in range(self.ATTEMPTS):
             async with self._sf() as s:
+                await self._lock_chains(s, [(t, c) for t, c, _ in items])
                 heads: dict[tuple, tuple[int, str]] = {}
                 built: list[AuditEvent] = []
                 for tenant_id, cell_id, build in items:
