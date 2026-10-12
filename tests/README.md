@@ -20,7 +20,8 @@ The shared engine fixture (`db_engine`) uses one database with the model schema 
 test. Tests that build their own engine (audit store, quota concurrency) get a fresh database per test; the quota
 concurrency tests run on plain PostgreSQL there, with no `BEGIN IMMEDIATE` emulation.
 
-`tests/services/test_redact_migration_postgres.py` always uses PostgreSQL (it runs the real Alembic chain) and skips
-when no server is available.
+`tests/services/test_redact_migration_postgres.py` and `tests/services/test_migrations_vs_models_postgres.py` always use
+PostgreSQL (they run the real Alembic chain; the second compares the migrated schema with the models) and skip when no
+server is available. Their shared helpers are in `tests/pgmigrate.py`.
 
 Not covered by either mode: anything that needs `/dev/kvm`, real jailer assets, or a booted Firecracker cell (those tests skip).

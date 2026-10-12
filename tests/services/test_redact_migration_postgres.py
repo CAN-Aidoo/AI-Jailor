@@ -7,102 +7,16 @@ Where the server comes from:
     on PATH), starts a private throwaway cluster on a free local port (as the `postgres` user when run as root);
   * otherwise the tests skip.
 """
-import asyncio
-import glob
 import json
-import os
-import pathlib
-import shutil
-import socket
-import subprocess
-import tempfile
 import uuid
 
 import pytest
-import sqlalchemy as sa
 from alembic import command
-from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy.ext.asyncio import create_async_engine
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+from tests.pgmigrate import admin_url, db, run_sql  # noqa: F401  (fixtures)
+
 SECRET = "sentinel-value-that-must-never-be-stored"
-ENV_URL = os.environ.get("AIJAILER_TEST_PG_URL", "")
-
-
-def _bindir() -> str | None:
-    found = sorted(glob.glob("/usr/lib/postgresql/*/bin/initdb"))
-    if found:
-        return str(pathlib.Path(found[-1]).parent)
-    w = shutil.which("initdb")
-    return str(pathlib.Path(w).parent) if w else None
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture(scope="module")
-def admin_url():
-    if ENV_URL:
-        yield ENV_URL
-        return
-    bindir = _bindir()
-    if not bindir:
-        pytest.skip("no PostgreSQL server: set AIJAILER_TEST_PG_URL or install postgresql")
-    root = tempfile.mkdtemp(prefix="aijailer-pg-")
-    os.chmod(root, 0o755)
-    prefix = []
-    if os.geteuid() == 0:                       # postgres refuses to run as root
-        import pwd
-        try:
-            pwd.getpwnam("postgres")
-        except KeyError:
-            shutil.rmtree(root, ignore_errors=True)
-            pytest.skip("running as root and there is no `postgres` user to run the server as")
-        shutil.chown(root, "postgres")
-        prefix = ["runuser", "-u", "postgres", "--"]
-    data, port = f"{root}/data", _free_port()
-    try:
-        subprocess.run([*prefix, f"{bindir}/initdb", "-D", data, "-A", "trust", "-U", "postgres"],
-                       check=True, capture_output=True)
-        subprocess.run([*prefix, f"{bindir}/pg_ctl", "-D", data, "-w", "-l", f"{root}/log", "-o",
-                        f"-p {port} -k {root} -c listen_addresses=127.0.0.1", "start"],
-                       check=True, capture_output=True)
-    except (subprocess.CalledProcessError, OSError) as e:
-        shutil.rmtree(root, ignore_errors=True)
-        pytest.skip(f"could not start a throwaway PostgreSQL: {getattr(e, 'stderr', e)!r}")
-    try:
-        yield f"postgresql+asyncpg://postgres@127.0.0.1:{port}/postgres"
-    finally:
-        subprocess.run([*prefix, f"{bindir}/pg_ctl", "-D", data, "-m", "immediate", "stop"], capture_output=True)
-        shutil.rmtree(root, ignore_errors=True)
-
-
-def run_sql(url, sql, params=None):
-    async def go():
-        engine = create_async_engine(url, isolation_level="AUTOCOMMIT")
-        try:
-            async with engine.connect() as c:
-                r = await c.execute(sa.text(sql), params or {})
-                return [tuple(x) for x in r.fetchall()] if r.returns_rows else None
-        finally:
-            await engine.dispose()
-    return asyncio.run(go())
-
-
-@pytest.fixture
-def db(admin_url):
-    name = "t_" + uuid.uuid4().hex[:12]
-    run_sql(admin_url, f'CREATE DATABASE "{name}"')
-    url = admin_url.rsplit("/", 1)[0] + "/" + name
-    cfg = Config(str(ROOT / "alembic.ini"))
-    cfg.set_main_option("script_location", str(ROOT / "migrations"))
-    cfg.set_main_option("sqlalchemy.url", url)
-    yield url, cfg
-    run_sql(admin_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
 def seed_parents(url):
