@@ -595,6 +595,29 @@ limits). PostgreSQL refuses such a value; SQLite does not enforce the length, so
 run on PostgreSQL. Migration 010 widens the column to `VARCHAR(2048)` (a metadata-only change on PostgreSQL). `downgrade`
 narrows it again and fails if a stored value is longer than 64 characters. Deployments using only local keys are unaffected.
 
+### CodeImmune tables (migration 011)
+
+These had ORM models but no migration, so a database created with `alembic upgrade head` lacked them (the test suite
+builds its schema from the models and did not notice). Migration 011 creates them to match the models exactly:
+
+| Table | Purpose | Notes |
+|---|---|---|
+| `certified_components` | Pre-verified building blocks (auth, crypto, data access) | `compliance_certs` and `cve_coverage` are JSONB lists, default `[]`; `status` default `active` |
+| `constraints` | Secure-generation rules | `applies_when` and `rules` JSONB; `is_active` default true |
+| `attack_patterns` | Observed attack signatures | `generated_constraint_id` references `constraints(id)`; `occurrence_count` default 1 |
+| `generation_log` | One row per generation request, allowed or blocked | `constraints_applied` and `components_used` are `UUID[]`; index on `tenant_id`; **no foreign key** to `tenants` (as modelled) |
+| `security_certificates` | Certificate issued for a generation | `generation_id` references `generation_log(id)`; index on `tenant_id`; `revoked` default false |
+
+Also adds three columns to `tenants`: `compliance_requirements` and `custom_constraints` (JSONB lists, `NOT NULL`,
+existing rows backfilled with `[]`) and `monthly_generation_limit` (nullable integer).
+
+**`downgrade` drops all five tables and the three columns, with their data.** Back up first if any of it matters.
+
+Not fixed by this migration (tolerated and listed by `tests/services/test_migrations_vs_models_postgres.py`): older
+tables where the models say `NOT NULL` but the migrations left the column nullable (mostly timestamps), and foreign keys
+and indexes that the migrations create but the models do not declare. A new table, column, or type/length difference
+between the models and the migrated schema fails that test.
+
 ### Private set intersection (no schema)
 
 The reference PSI workload (`examples/psi/`, see PEER_LINKS.md) adds **no tables, columns or migrations**
